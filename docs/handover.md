@@ -202,8 +202,8 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 | **数据接管 + 回滚** | 未设计。插件直接读写 `agents.yaml` 与 `data/`，升级中途失败无退路 | 原地接管 + 一次性备份 + 回滚入口 + 「接管失败可回滚」用例 | L-05 / G-5；前置 **L-22** `core_settings` 拆分；known-issues #39 |
 | **性能基线** | 50ms/32token 合并、首字延迟差 ≤50ms 均未测 | 固定脚本压测，与迁移前数据对比并落文档 | L-06 / G-6；known-issues #40 |
 | **本地 zip 安装** | 只有仓库安装通道，无本地端点/UI 入口 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
-| **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面（开关一开就稳定失败，压缩整段回退内置） | 按 Q-5 定方向后：点位表领域族清零并把族名让给实现方认领（或调用方全改自建站名），并补一条「申报的每个命令在真实接线下都有能跑的挂载位置」门禁 | **L-25 Q-5**；known-issues **#43** |
-| **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径）；**代码未动**：`code` 八字段链路、`tree_protocol` 码表、§5 门禁五条断言都还在纸面上 | 文档 §6 片 2~5 全部落地，门禁跑绿 | L-25 |
+| **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面。**桌面侧已收口（2026-10-31 片 1）**：点位表领域族清零（36 → 28 点位、29 → 9 命令）、撤 `tool.` / `agent.` 前缀禁令、落盘空壳读侧对账、两处门禁；插件侧认领与换口未做 ⇒ 这些命令目前仍显式失败（原因变成「暂无挂载位置」） | 接着做片 2（执行器改名 + 能力补齐 + `local.lease.register`）→ 片 3（撤核心租约簿记）→ 片 4（tree.agent / compact / sample 换口） | **L-25 Q-5**；known-issues **#43**；契约 §8.4 落地状态 |
+| **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径 + §8 已拍板统一口径）；**片 1（点位表让名）已合**；`code` 八字段链路、`tree_protocol` 码表、§5 门禁其余断言都还在纸面上 | 文档 §6 片 2~5 全部落地，门禁跑绿 | L-25 |
 | **插件仓 CI** | 脚本 `tool/check_plugin_repo_contract.dart` 已可跑（`--selftest` 5/5），未接进 tree-plugins CI | 插件仓流水线跑同一脚本 | L-21 |
 | **发版工程** | 见 §6，全部未执行 | push + tag + setup/zip 资产 | — |
 

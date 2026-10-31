@@ -378,8 +378,86 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 
 | # | 问题 | 选项 |
 | --- | --- | --- |
-| Q-1 | 本机要不要补齐 SSH 的四个增强（`details` / `append` / `rename` / `raw` 分块读） | 补齐（调用方一套代码打天下）／不补（本机走 `result_path`，另开一条 L 项） |
-| Q-2 | 两套租约系统（核心 `workspace/register` vs 插件 `ssh.lease.register`）要不要统一 | 统一成核心侧／保持两套只统一码（推荐：后者，动租约归属是大改） |
-| Q-3 | 非 UTF-8 读取的**内联 base64**（§2.2 末行）与交接文档 §8「大文件不许塞进 JSON」的张力 | 加尺寸上限＋超限改走 `result_path`／维持现状并写明上限 |
-| Q-4 | `FileRouteError.read` 把 message 塞进 `code` 的旧口径（REST 面） | 一并收成 `{status, code, message}` 三件齐／REST 面另开片 |
-| Q-5 | **20 条内置命令的定位**：它们既是 §2.4 那张"必然失败"的表，也是 §2.1 那 8 个"假别名"的根源，还是 compact 四条命令失败的原因——**先定方向才谈得上清** | **A（推荐）删点位表 + 让名**：领域族从 `StationPoints.executes` 摘掉，`_checkExecuteCommands` 的内置名拦截随之失去对象，族名由真正实现了它们的插件认领（`llm.*`/`tool.*`/`agent.*`/`session.rename` ⇒ tree.agent，`fs.*`/`terminal.*` ⇒ local_executor）。compact 的四个名字**零改动**即复活。代价：已落盘的内置执行站实例仍带旧白名单，需要一次"点位表是唯一来源"的对账（`stations.load()` 恢复的实例要按新表收敛）。<br>**B 保留现状 + 改调用方**：这 20 条继续躺着，compact / sample / tree.agent 全部改用插件自建站的名字，文档把"这些名字必失败"写清楚。代价最小，但功能缺口仍在，且 `/api/meta` 会一直对外申报一批点不动的命令 |
+| Q-1 | 本机要不要补齐 SSH 的四个增强（`details` / `append` / `rename` / `raw` 分块读） | **已拍板 → §8**：四条全补，本机与 SSH 的 payload 键集必须相同 |
+| Q-2 | 两套租约系统（核心 `workspace/register` vs 插件 `ssh.lease.register`）要不要统一 | **已拍板 → §8**：统一到**插件侧**（`local.lease.register`），核心撤掉租约簿记与 `root` 注入；随之必须搬走「租约只能登记方自己用」那道 fail-closed |
+| Q-3 | 非 UTF-8 读取的**内联 base64**（§2.2 末行）与交接文档 §8「大文件不许塞进 JSON」的张力 | 加尺寸上限＋超限改走 `result_path`／维持现状并写明上限（**未拍板**） |
+| Q-4 | `FileRouteError.read` 把 message 塞进 `code` 的旧口径（REST 面） | 一并收成 `{status, code, message}` 三件齐／REST 面另开片（**未拍板**） |
+| Q-4b | 本机 REST 面把 `StateError` 一律映射成 **404**（`local_executor_plugin.dart:197-198`），而 SSH 侧同类"租约/会话不存在或已存在"是 **409**（`terminal_sessions.dart:117,259,271`） | **已拍板 → §8**：本机收成 409（404 在不变量里是"插件没装"的语义，不能兼作资源冲突） |
+| Q-5 | **20 条内置命令的定位**：它们既是 §2.4 那张"必然失败"的表，也是 §2.1 那 8 个"假别名"的根源，还是 compact 四条命令失败的原因——**先定方向才谈得上清** | **已拍板：走 A（删点位表 + 让名）**，2026-10-31。领域八族从 `StationPoints.executes` 整体摘掉，族名让给真正的实现方（`llm.*` / `tool.*` / `agent.*` / `session.*` / `usage.*` ⇒ tree.agent，`fs.*` / `terminal.*` ⇒ 由要做的人带着实现申报，本期不保留假可用）。让名同时必须撤 `_checkExecuteCommands` 的 `tool.` / `agent.` 前缀禁令，否则插件认不进来 |
+| Q-6 | 两个执行器的命令名要不要对称 | **已拍板 → §8**：本机改 `local.file.*` / `local.exec.command`，与 `ssh.*` 同后缀；限定词直接取 `StationModeKey` 的两个值 |
+
+---
+
+## 8. 已拍板的统一口径（2026-10-31 补，覆盖 §2.1 / §2.2 / Q-1 / Q-2 / Q-4b / Q-5）
+
+三条决定，都落在"两个执行器行为对称 + 核心不认识具体执行器"这条线上。
+
+### 8.1 命令名对称：限定词取 `StationModeKey`
+
+目标命令表**两边各 10 条，后缀逐字相同**，只换限定词：
+
+| 操作 | 本机（改后） | SSH（今天已是） |
+| --- | --- | --- |
+| 租约登记 | `local.lease.register` | `ssh.lease.register` |
+| 读 / 写 / 列 / 检索 / 删 / 建目录 / 写字节 / 改名 | `local.file.read` `…write` `…list` `…grep` `…delete` `…mkdir` `…writeBytes` `…rename` | `ssh.file.*` 同名八条 |
+| 执行命令 | `local.exec.command` | `ssh.exec.command` |
+
+限定词不是新造词：`local` / `ssh` 正是 `StationScope.modeKey` 的两个取值
+（`station_scope.dart:32-44`，`StationModeKey.all = {local, ssh}`）。所以
+"选哪个命令名"与"目标 agent 是哪个模式"是同一个词的两次使用，`/api/meta` 里
+不再出现"一侧带限定词、一侧不带"的半吊子形状。
+
+连带撤销：`executor.dart:26-53` 的 8 个 `fs.*` 分支（§2.1 那条"假别名"）与
+`agent_runtime.dart:61-76` 那张逐条映射表 ⇒ 换成一条规则"前缀 `local.` 换 `ssh.`"，
+参数键同步（`local_lease_id` ↔ `ssh_lease_id`）。
+
+### 8.2 能力差抹平（本机补齐四条）
+
+本机补 `file.list` 的 `details`、`file.rename`、`writeBytes` 的 `append`、`file.read`
+的 `raw` 分块通道。补齐的理由不是"本机也想要这功能"，而是**只有键集相同，§5 那条
+"同一操作两侧形状对齐"的门禁才写得出来**；否则门禁只能对两侧各写一份、各绿各的。
+
+### 8.3 租约统一到插件侧，fail-closed 跟着搬过去
+
+本机改成像 SSH 那样由执行器自己登记（`local.lease.register`），核心撤掉
+`_workspaces` 表、`root` 注入与 `workspace/register` 这条 RPC。
+
+**必须一起搬的是这一条**：核心今天替本机看着"租约只能登记方自己用"
+（`plugin_bus.dart:5087-5095`，不一致就 fail-closed 拒）。改成插件侧之后，这个判断只剩
+一个落点——而依据是在路上的：核心把执行站命令转给执行器插件时，`meta` 里带着
+`source_plugin_id`（`plugin_bus.dart:2698`）。所以口径写死成两条：
+
+1. 两个执行器登记租约时**记下登记方的 `source_plugin_id`**；每条命令进来先比对，
+   不一致 ⇒ 拒并给码（新增码 `lease_denied`）；
+2. `root` 只能由插件按租约自己查出来；arguments 里出现的 `root` / `workspace_root`
+   一律忽略（核心 `sanitizeStationArguments` 那道剥离保留，`plugin_bus.dart:5028-5032`）。
+
+⚠ **SSH 侧今天其实没做第 1 条**（`exec_station.dart:282` 只按 `ssh_lease_id` 查自己的表，
+不看是谁在问）。这不是新加的要求，是本来就缺的一半——不补上，"两侧行为一致"这句话
+在安全这一栏是空的，而且比核心侧那套更容易被猜出句柄的插件滥用。
+
+### 8.4 切片顺序（取代 §6 里"先码后形状"的排法）
+
+| 片 | 内容 | 仓 | 依赖 |
+| --- | --- | --- | --- |
+| 1 | 点位表删八族（Q-5 A）+ 撤 `tool.` / `agent.` 前缀禁令 + 落盘空壳对账 + §5 门禁 + 文档口径 | 桌面 | 无 |
+| 2 | 执行器改名（§8.1）+ 四条能力补齐（§8.2）+ `local.lease.register` + 两侧补 `source_plugin_id` 比对（§8.3） | 插件 | 片 1 先合（否则名字被内置点位表挡着） |
+| 3 | 撤协议面 `workspace/register` 与核心租约簿记（§8.3） | 桌面 | **片 2 已上线**，两片之间不能发版断档 |
+| 4 | 调用方换口：tree.agent / compact / sample + 清 `reconnectSsh` 死代码 | 插件 | 片 2 |
+| 5+ | 已拍板的 `code` 字段链路（§4），码表新增 `lease_denied` | 两仓 | 片 1 |
+
+**落地状态（2026-10-31）**：
+
+- **片 1 已合（桌面仓）**：`StationPoints.executes` 现在只有 `plugin` / `station` 两个
+  点位（内置点位 36 → 28，执行站命令 29 → 9）；`StationHubIds` 里八个领域点位常量删除、
+  id 进 `retiredExecutePoints`；`_checkExecuteCommands` 撤掉 `tool.` / `agent.` 前缀禁令
+  （`plugin.` / `station.` 保留）；`StationHub.load` 新增落盘对账（内置实例的 id 不在点位
+  表里 ⇒ 读侧丢掉并写回一次，幂等）；门禁两处——`station_points_test` 的「表里每条命令
+  都得被 `ExecuteStationMounts.handles` 认下」＋ `plugin_hot_restart_station_test` 的
+  「按全表核对挂载位置」；`plugin-development.md` §3.1 / §4 / §5.6 / §6.1 / §11 与
+  `agent_pluginization.md` 的过渡期说明同步收口。
+- **片 1 留下一条已知不一致**：`builtin_plugins.dart:230` 的示例插件描述仍在讲
+  `fs.read / llm.call / tool.call / session.rename` 四个演示开关——那四条命令在片 2 换名
+  之前确实没有承接方。文字随片 2 一起改（改在核心侧，改早了会与还没动的插件产物更不符）。
+- **片 2 / 3 / 4 / 5 未开始**。片 2 落地前，领域命令在真机上下不中，报「暂无挂载位置」
+  （以前报「已不在核心平台面」）——两者都是显式失败，不是静默。

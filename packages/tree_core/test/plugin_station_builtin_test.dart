@@ -13,12 +13,15 @@ import 'package:tree_core/tree_core.dart';
 /// **每次交互携带的信封**（消息 scope）与**订阅声明**，只在投递时用于匹配订阅者。
 ///
 /// 这个文件锁住六条语义：
-/// 1. **就位**：32 个内置点位一次建齐（广播 10 + 执行 10 + 中转 12），id = 点位常量；
+/// 1. **就位**：全部内置点位一次建齐（广播 / 执行 / 中转，逐个点位一个实例），
+///    id = 点位常量；条数**从点位表推导**（硬写的数字只会在表变化时静默失去覆盖，
+///    类型分布与总数由 `station_points_test.dart` 那两条专门钉住）；
 /// 2. **与 team / agent 无关**：站点数不随团队或 agent 数量变化；
 /// 3. **幂等**：重复调用不产生重复实例，也不重复落盘；
 /// 4. **持久化**：第二次启动从 stations.yaml 恢复，数量与 id 不变、不再新建；
 /// 5. **迁移**：旧 `baseId@team@mode` 条目归并到点位 id；**退役 id**（`system.relay` /
-///    `system.execute`）按点位化规则迁移（幂等，只写回一次）；
+///    `system.execute`）按点位化规则迁移（幂等，只写回一次）；表里删掉的内置点位
+///    （#43 的领域八族）在盘上剩的空壳**读侧直接丢掉**，不会复活成内置站；
 /// 6. **取舍**：**不预建收集站**（schema 属于具体接入点，空 schema 没有意义）。
 void main() {
   late Directory temp;
@@ -54,13 +57,16 @@ void main() {
           .toList()
         ..sort();
 
-  test('空存储：32 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
+  /// 预建点位的**条数**（从表推导；改表不需要回来改这里的数字）。
+  int prebuiltCount() => expectedPrebuilt().length;
+
+  test('空存储：24 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
     final StationHub hub = StationHub(storePath: storePath);
     expect(hub.stationList(), isEmpty, reason: '预建之前确实是空的（懒创建的世界）');
 
     final List<String> created = hub.ensureBuiltinStations();
 
-    expect(created, hasLength(32), reason: '广播 10 + 执行 10 + 中转 12；每个点位是一个独立实例');
+    expect(created, hasLength(prebuiltCount()), reason: '广播 / 执行 / 中转三类逐个点位一个实例，收集站不预建');
     // stationList() 按 id 字典序（输出稳定）
     expect(idsOf(hub), expectedPrebuilt());
     for (final StationInstance station in hub.stationList()) {
@@ -71,9 +77,9 @@ void main() {
         reason: '点位 id 不含 team×mode 后缀（点位化的核心）',
       );
     }
-    // 每个**点位**都是一条独立实例：按类型数是 10 / 10 / 12（不是四种类型各一个）
+    // 每个**点位**都是一条独立实例：按类型数是 10 / 2 / 12（不是四种类型各一个）
     expect(hub.stationList().whereType<BroadcastStation>(), hasLength(10));
-    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(10));
+    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(2));
     expect(hub.stationList().whereType<RelayStation>(), hasLength(12));
 
     // 面板快照口径（前端卡片直接渲染这几个字段）：中文名 / 内置 / 订阅数 / 分组
@@ -91,7 +97,7 @@ void main() {
     final StationHub hub = StationHub(storePath: storePath);
     hub.ensureBuiltinStations();
     final List<String> baseline = idsOf(hub);
-    expect(baseline, hasLength(32));
+    expect(baseline, hasLength(prebuiltCount()));
 
     // 模拟"团队变多 / 新 agent 出现"：这些在收敛后**不再**是站点的输入。
     // 反复调用预建（核心在启动接线处与任何补建点都可能调）必须一字不变。
@@ -110,7 +116,7 @@ void main() {
       isEmpty,
       reason: '没有接入点就没有输入格式，空 schema 的收集站没有意义',
     );
-    expect(idsOf(hub), hasLength(32));
+    expect(idsOf(hub), hasLength(prebuiltCount()));
 
     // 接入点需要时现建（「插件定义 tool」的首个接入点），预建不会碰它
     final CollectStation collect = hub.toolDefineStationFor()!;
@@ -119,7 +125,7 @@ void main() {
     // 再来一次拿到的必须是同一个实例（全局唯一），而不是又建一个
     expect(hub.toolDefineStationFor(), same(collect));
     expect(hub.ensureBuiltinStations(), isEmpty);
-    expect(idsOf(hub), hasLength(33));
+    expect(idsOf(hub), hasLength(prebuiltCount() + 1));
     expect(hub.stationList().whereType<CollectStation>().single.id, collect.id);
   });
 
@@ -127,7 +133,7 @@ void main() {
     final _CountingStationStore counting = _CountingStationStore(storePath);
     final StationHub hub = StationHub(storePath: storePath, store: counting);
 
-    expect(hub.ensureBuiltinStations(), hasLength(32));
+    expect(hub.ensureBuiltinStations(), hasLength(prebuiltCount()));
     expect(counting.saves, 1, reason: '一批预建合并成一次落盘（不是每站一次）');
     final String after = File(storePath).readAsStringSync();
 
@@ -135,7 +141,7 @@ void main() {
     expect(hub.ensureBuiltinStations(), isEmpty);
     expect(hub.ensureBuiltinStations(), isEmpty);
     expect(counting.saves, 1);
-    expect(idsOf(hub), hasLength(32), reason: '不产生重复实例');
+    expect(idsOf(hub), hasLength(prebuiltCount()), reason: '不产生重复实例');
     expect(File(storePath).readAsStringSync(), after, reason: '磁盘内容一字不差');
   });
 
@@ -150,8 +156,8 @@ void main() {
     );
 
     final List<String> created = hub.ensureBuiltinStations();
-    // 预建按**点位表顺序**（广播 10 → 执行 10 → 中转 12）：通用主题点位已存在 ⇒
-    // 本轮只新建其余 31 个点位（已存在的既不新建也不覆盖）
+    // 预建按**点位表顺序**（广播 → 执行 → 中转）：通用主题点位已存在 ⇒
+    // 本轮只新建其余点位（已存在的既不新建也不覆盖）
     expect(
       created,
       StationPoints.all
@@ -162,9 +168,9 @@ void main() {
           )
           .map((StationPointSpec spec) => spec.id)
           .toList(),
-      reason: '广播站·通用主题已存在 ⇒ 只补其余 31 个点位',
+      reason: '广播站·通用主题已存在 ⇒ 只补其余点位',
     );
-    expect(created, hasLength(31));
+    expect(created, hasLength(prebuiltCount() - 1));
     expect(hub.station(broadcast.id), same(broadcast));
     expect(hub.station(broadcast.id)!.subscribers, hasLength(1));
     // 订阅者的 team 视角由一个全局站承载（面板据此分组）
@@ -175,7 +181,7 @@ void main() {
 
   test('持久化：第二次启动从 stations.yaml 恢复，数量与 id 不变且不再新建', () {
     final StationHub first = StationHub(storePath: storePath);
-    expect(first.ensureBuiltinStations(), hasLength(32));
+    expect(first.ensureBuiltinStations(), hasLength(prebuiltCount()));
     final List<String> baseline = idsOf(first);
     expect(File(storePath).existsSync(), isTrue, reason: '内置站必须落盘');
 
@@ -389,6 +395,62 @@ stations:
     final String text = File(storePath).readAsStringSync();
     expect(text.contains('system.relay.tool.pre'), isTrue);
     expect(text.contains('system.relay.tool.post'), isTrue);
+  });
+
+  test('落盘对账（#43）：点位表里已删掉的内置执行站，读侧直接丢掉空壳', () {
+    // 老磁盘上留着领域八族的内置实例（点位表已经不认它们了）。留着不会让命令
+    // 路由错（分发按表 + 自建站扫描），但它照样进 station.list 与面板，看上去
+    // 像"这个内置站还在、只是没命令"——读侧必须把它当退役实例清掉。
+    File(storePath).parent.createSync(recursive: true);
+    File(storePath).writeAsStringSync('''
+version: 1
+stations:
+  - id: system.execute.fs
+    kind: execute
+    description: 执行站·文件操作族（曾经的内置点位）
+    builtin: true
+    created_at: 90
+  - id: system.execute.usage
+    kind: execute
+    description: 执行站·用量族（曾经的内置点位）
+    builtin: true
+    created_at: 91
+  - id: system.execute.plugin
+    kind: execute
+    description: 执行站·插件族（现役）
+    builtin: true
+    created_at: 92
+  - id: plugin.demo.execute.fs
+    kind: execute
+    description: 插件自建的执行站（认领 fs.*）
+    builtin: false
+    created_at: 93
+''');
+
+    final _CountingStationStore counting = _CountingStationStore(storePath);
+    final StationHub hub = StationHub(storePath: storePath, store: counting);
+    hub.load();
+
+    expect(
+      idsOf(hub),
+      <String>[
+        'plugin.demo.execute.fs',
+        StationHubIds.executePlugin,
+      ],
+      reason: '退役内置点位丢掉；现役点位与插件自建站原样保留',
+    );
+    expect(hub.station('system.execute.fs'), isNull);
+    expect(hub.station('system.execute.usage'), isNull);
+    // 自建站不受影响：它本来就不在点位表里，白名单由建站插件重新申报
+    expect(hub.station('plugin.demo.execute.fs')!.builtin, isFalse);
+    expect(counting.saves, 1, reason: '对账结果写回一次');
+
+    // 幂等：再起一次不再对账、不再写盘
+    final _CountingStationStore again = _CountingStationStore(storePath);
+    final StationHub restarted = StationHub(storePath: storePath, store: again);
+    restarted.load();
+    expect(again.saves, 0, reason: '文件里已经没有退役 id ⇒ 第二次启动不动盘');
+    expect(idsOf(restarted), idsOf(hub));
   });
 
   test('迁移：无法判定类型的旧条目被丢弃，不产生半截站点', () {

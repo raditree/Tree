@@ -2406,7 +2406,10 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
 
 ## #43 A5 撤了领域实现，没撤点位表：20 条内置命令"申报了、路由得到、执行必失败"，随包插件 compact 四条全踩在上面
 
-**状态**：未修复，**待拍板**（方向见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5）。
+**状态**：**片 1（桌面侧）已修，2026-10-31**；插件侧认领（片 2）未开始 ⇒ 领域命令在真机上
+仍是显式失败，只是失败原因从「已不在核心平台面」变成「暂无挂载位置」，且插件现在**认得进**
+这些名字了。方向已拍板走 A，见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5
+与 §8.4 落地状态。
 **影响**：不是纸面漂移——`compact` 是核心内置插件条目之一（`builtin_plugins.dart:247`），
 它的总结调用、必读文件读取、todo 快照三条功能**在 A5 之后就是稳定失败**。
 **发现时间**：2026-10-31，做 L-25 契约登记时逐条对照命令表撞出来的。
@@ -2462,3 +2465,32 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
   代价：已落盘的内置执行站实例仍带旧白名单，要做一次「点位表是唯一来源」的对账。
 - **B 保表 + 改调用方**：20 条继续躺着，compact / sample / tree.agent 全部改用插件自建站的名字，
   文档与提示语写清"这些名字必失败"。改动最小，但功能缺口留着，`/api/meta` 会继续对外申报一批点不动的命令。
+
+### 片 1 收口记录（2026-10-31，桌面仓）
+
+拍板走 A，并且**不再保留 `fs.*` / `terminal.*` 这两个旧名**（用户追加的两条统一决定，
+见 [exec_station_contract.md](exec_station_contract.md) §8）：本机侧命令名统一成
+`local.file.*` / `local.exec.command`，与 `ssh.*` 对称，限定词直接取 `StationModeKey` 的
+两个值。所以 A 的「compact 四个名字零改动即复活」这句**不成立了**——那四个名字同样要让给
+真正的实现方，compact 换口在片 4。
+
+桌面侧做了五件事：
+
+1. `StationPoints.executes` 删掉八族（内置点位 36 → 28，执行站命令 29 → 9），
+   `StationHubIds` 的八个常量随之删除、id 进 `retiredExecutePoints`（`retired` 并集）；
+2. `_checkExecuteCommands` 撤 `tool.` / `agent.` 前缀禁令（`plugin.` / `station.` 保留）
+   ——不撤，tree.agent 就认不进它本来就是唯一实现方的那几族；
+3. `StationHub.load` 补落盘对账：**内置实例的 id 不在点位表里 ⇒ 读侧丢掉、写回一次**。
+   不丢的话它会以 `commands: []` 的空壳继续进 `station.list` 与面板，看上去"这个内置站
+   还在、只是没命令"——正是本条 issue 前半段那种"表与实现各说各话"的下一版；
+4. 补上那条本该存在的门禁（两处）：`station_points_test` 要求表里每条命令都被
+   `ExecuteStationMounts.handles` 认下（`implementedPrefixes` 成为"核心实现到哪一族"的
+   唯一出处），`plugin_hot_restart_station_test` 按**全表**核对挂载位置；
+5. 口径同步：`plugin-development.md` §3.1（点位表 + 顶注）/ §4（执行类命令的闸门挪到
+   执行器那一侧）/ §5.6（`station/call` + `system.execute.tool` 的错误示例）/ §6.1
+   （两类命令分开读）/ §11，以及 `agent_pluginization.md` 那句"A5 删除"的过渡期说明。
+
+**没做**：`workspace/register` 与核心租约簿记仍在（片 3，协议破坏性改动，必须整片落）；
+`builtin_plugins.dart:230` 示例插件描述里的四个演示开关仍写旧名（随片 2 一起改，改早了
+会与还没动的插件产物更不符）。
+

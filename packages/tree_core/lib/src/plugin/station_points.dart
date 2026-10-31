@@ -108,13 +108,14 @@ abstract final class StationPoints {
       label: '工具运行超时',
       description:
           '广播站·工具运行超时：一次工具运行**跨过阈值（默认 120s）时广播一次**'
-          '（单向通知；载荷含 handle / tool / command / elapsed_ms，可用执行站 '
-          'tool.close 显式关闭）',
+          '（单向通知；载荷含 handle / tool / command / elapsed_ms，可下 `tool.close`'
+          '显式关闭，该命令由认领工具族的执行器插件提供）',
       alias: 'tool.timeout',
       readme:
           '工具运行**跨过超时阈值（默认 120s）时广播一次**：不是周期心跳，一次运行最多一条。'
           '载荷含 handle / tool / command / elapsed_ms。收到它可以做什么：提醒用户、记录长任务，'
-          '或用执行站工具族的 `tool.close`（带 handle）**显式关闭**这次运行。'
+          '或下工具族命令 `tool.close`（带 handle）**显式关闭**这次运行——`tool.*` 由实际跑工具的'
+          '执行器插件认领（核心不执行它，见执行站段注释），所以关得掉的前提是那个插件在位。'
           '核心不会因为超阈值自己杀进程——关闭必须有人显式下令。',
     ),
     StationPointSpec(
@@ -218,125 +219,11 @@ abstract final class StationPoints {
 
   /// 执行站点位（按命令族）。
   static const List<StationPointSpec> executes = <StationPointSpec>[
-    StationPointSpec(
-      id: StationHubIds.executeFs,
-      kind: StationKind.execute,
-      label: '文件操作',
-      description: '执行站·文件操作族：fs.read / fs.write / fs.list / fs.grep / fs.delete / fs.mkdir / fs.writeBytes',
-      alias: 'fs',
-      readme:
-          '文件操作族（fs.read / fs.write / fs.list / fs.grep）：**执行站不订阅、不触发插件**，'
-          '它是插件主动下命令的入口。命令按目标 agent 落到它的工作空间（本地目录或远端），'
-          '因此不需要自己拼路径，也不能跨 team 访问（scope 不成立会被显拒）。'
-          '白名单外的命令一律报错，不会“看起来执行了”。',
-      commands: <String>[
-        'fs.read',
-        'fs.write',
-        'fs.list',
-        'fs.grep',
-        'fs.delete',
-        'fs.mkdir',
-        'fs.writeBytes',
-      ],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeTerminal,
-      kind: StationKind.execute,
-      label: '终端执行',
-      description:
-          '执行站·终端族：terminal.exec（含后台任务 hook 模式）+ 后台任务的'
-          '结构化问口与控口（terminal.listRuns / stopRun / log）',
-      alias: 'terminal',
-      readme:
-          '终端族（terminal.exec / terminal.listRuns / terminal.stopRun / terminal.log）：'
-          'exec 在目标 agent 的工作空间执行命令，前台等结果或以 hook 模式转后台任务；'
-          '它与内置工具走同一条执行链，所以长任务同样会收到超时广播（广播站 tool.timeout），'
-          '也可以用工具族的 `tool.close` 显式关闭。后三条是给后台（hook）任务的'
-          '**结构化读口与控口**：`exec` 的 `hook_action=status` 回的是给人看的文案，'
-          '而转发型插件要的是行（task_id / 状态 / 退出码 / 日志路径 / 远端 pid）。'
-          '触发时机：插件调 `station/command` 时（执行站不可订阅）。'
-          '回包口径：`listRuns` 回 `{agent_id, total, count, runs:[{task_id, command, '
-          'session_id, running, exit_code, elapsed_seconds, started_at, log_relative, '
-          'remote, detached, cancelled, pid, fail_streak}]}`；`stopRun` 收 `task_id` 并回 '
-          '`{task_id, requested, running, exit_code}`（`requested=false` 必带 `reason`，'
-          '远端杀不掉就如实说杀不掉）；`log` 收 `task_id`（可选 `tail_chars`）回'
-          '`{task_id, log_relative, remote_log, tail: true, text}`——text 是**尾部**。'
-          '限制：① 只看/只动**目标 agent 自己**的任务（四元组隔离，任务表是全进程一份，'
-          '不按 agent 过滤就等于泄别人的命令）；② `exit_code` / `pid` 拿不到时写 null '
-          '而不省略键（省略就分不出“已结束正常退出码 0”与“根本没读到”）；'
-          '③ 终止**不保证成功**：会话失联转的、远端没拿到 pid 的都杀不掉；'
-          '④ 日志读取上限由核心的 `maxTailChars` 量级决定，超出部分不递（尾部口径）。',
-      commands: <String>[
-        'terminal.exec',
-        'terminal.listRuns',
-        'terminal.stopRun',
-        'terminal.log',
-      ],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeAgent,
-      kind: StationKind.execute,
-      label: 'Agent 操作',
-      description:
-          '执行站·Agent 族：agent.message / agent.stop / agent.compact（发起上下文压缩）',
-      alias: 'agent',
-      readme:
-          'Agent 族（agent.message / agent.stop / agent.compact）：往会话里投一条消息、停下来、'
-          '或显式发起一次上下文压缩。压缩结果仍由会话自已有：本站只负责“下令”，不直接改写历史。'
-          '需要接管压缩本身（自己产出新上下文）请订中转站的 context.compact。',
-      commands: <String>['agent.message', 'agent.stop', 'agent.compact'],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeLlm,
-      kind: StationKind.execute,
-      label: 'LLM 调用',
-      description: '执行站·LLM 族：llm.call（站点处硬设 API 返回形式为 json，复用目标 agent 的模型）',
-      alias: 'llm',
-      readme:
-          'LLM 族（llm.call）：复用目标 agent 的模型发一次调用，站点处硬把返回形式设成 JSON。'
-          '它与中转站的 llm.handle 区别在这里：**llm.call 是插件主动问一次**，'
-          'llm.handle 是插件接管会话本身的那一跳。调用失败会把原文带回来（payload），'
-          '便于本地修复重试，而不是丢掉已经付过费的那一次。',
-      commands: <String>['llm.call'],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeTool,
-      kind: StationKind.execute,
-      label: '工具调用',
-      description:
-          '执行站·工具族：tool.call（执行任意工具：内置 / MCP / 插件工具同一入口）、'
-          'tool.close（显式关闭一次正在执行的工具运行，args {handle}）',
-      alias: 'tool',
-      readme:
-          '工具族（tool.call / tool.close）：tool.call 执行**任意**工具（内置 / MCP / 插件工具'
-          '同一个入口），tool.close 按 handle 显式关闭一次正在跑的工具运行。'
-          '这是“工具”能力给插件的唯一入口：不要自己拼子进程去跑内置工具，'
-          '否则权限与工作空间归属都绕过核心。关闭**不自动发生**，超阈值只广播警告。',
-      commands: <String>['tool.call', 'tool.close'],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeSession,
-      kind: StationKind.execute,
-      label: '会话重命名',
-      description: '执行站·会话族：session.rename（与 REST 同一 store 实现）',
-      alias: 'session',
-      readme:
-          '会话族（session.rename）：改一个会话的标题，与 REST 端点是同一个 store 实现。'
-          '它只改名字，不动消息历史；找不到会话时显式报错。',
-      commands: <String>['session.rename'],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeSsh,
-      kind: StationKind.execute,
-      label: '链路重连',
-      description: '执行站·SSH 族：ssh.reconnect（重建目标 agent 的远端链路；args {agent_id?}；与 REST 端点同一实现）',
-      alias: 'ssh',
-      readme:
-          '链路族（ssh.reconnect）：重建目标 agent 的远端链路（可选 args {agent_id}）。'
-          '口径与“心跳判活”分得很清楚：判死只认连续 N 拍心跳丢失，重连是判死**之后**的动作，'
-          '不引入任何新的时长上限。不是 SSH 工作空间 / 配置不完整 ⇒ 直接拒并给原因。',
-      commands: <String>['ssh.reconnect'],
-    ),
+    // **2026-10-31（known-issues #43）**：fs / terminal / agent / llm / tool /
+    // session / ssh / usage 八族整体移出本表。A5（`258a28c`）撤掉核心的领域实现后，
+    // 这 20 条命令只剩「路由得到、执行必失败」，而内置名拦截又让插件认领不了——
+    // 于是随包插件 compact 的四条命令长期失败。删表就是把族名让给真正的实现方
+    // （tree.agent / local_executor / ssh_executor）；核心只保留 plugin / station 两族。
     StationPointSpec(
       id: StationHubIds.executePlugin,
       kind: StationKind.execute,
@@ -388,31 +275,6 @@ abstract final class StationPoints {
           '`station/subscribe` 那一条（那里已有 replace 与唯一订阅者规则），这里不开第二条路；'
           '③ team 证明不了就拒（fail-closed，与 plugin 族控制面同口径）。',
       commands: <String>['station.list', 'station.state'],
-    ),
-    StationPointSpec(
-      id: StationHubIds.executeUsage,
-      kind: StationKind.execute,
-      label: '用量查询',
-      description: '执行站·用量族：usage.query（按会话取逐调用用量账本）',
-      alias: 'usage',
-      readme:
-          '用量族（usage.query）：回答「这个会话的 token 花在哪一类调用上」。'
-          '它存在的理由是**读取范围**：逐调用用量落在数据根下的 `<会话目录>/usage.jsonl`，'
-          '而插件的 `fs.read` 只在工作空间作用域内——永远够不到那一份账。核心能同时'
-          '够到两端，所以这里开一个只问不做的口（计费/预算类插件的地基）。'
-          '触发时机：插件调 `station/command` 时。'
-          '回包口径：`{agent_id, session_id, usage_file, count, skipped, calls:[…], '
-          'summary:{calls, prompt_tokens, completion_tokens, cached_tokens, by_source}}`；'
-          '`calls` 的行形状与 `usage.jsonl` **逐字一致**（`UsageCall.toJson()` 是字段表的'
-          '唯一出处，不在别处另拼一份键），`summary` 是核心已经算好的聚合（插件不必'
-          '自己重算也不会算出两套）。会话口径与其他命令同一条：`session_id` 参数 → '
-          '站点 scope → 默认会话，回包 **echo 生效值**。'
-          '限制：① 一次只查**一个会话**（账本本来就是按会话分文件，跨会话聚合请自己'
-          '逐会话问，免得一不小心把整库读走）；② 只读**尾部**（账本随会话增长，'
-          '上限与面板同源），`skipped` 是读不到/坏行的行数；③ `estimated=true` 的行'
-          '是本地估算值，**不得当计费依据**（这个标记本来就是为了区分端点真值）；'
-          '④ 文件不存在回空账本而不报错（老会话本来就没有它），但不假装读过。',
-      commands: <String>['usage.query'],
     ),
   ];
 
@@ -627,7 +489,8 @@ abstract final class StationPoints {
       readme:
           '工具定义收集站：核心刷新工具表时向**全部订阅者**发一次采集请求（附带信息可选），'
           '每个订阅者按站点 schema 回自己的工具定义。产出不过 schema 校验的只丢掉那一个并显式列出，'
-          '不影响其他人（部分结果语义）。工具真正被执行时走执行站工具族的 tool.call。',
+          '不影响其他人（部分结果语义）。工具真正被执行时走 `tool.call`（由认领工具族的执行器'
+          '插件自建执行站承接，核心不执行它）。',
       alias: '',
     ),
     StationPointSpec(

@@ -47,6 +47,10 @@ typedef StationTopologyQuery = Future<Map<String, dynamic>> Function({
 /// - `plugin.*`：插件热重启控制面 + 执行器挂载 + 工具/快照转发；
 /// - `station.*`：站点拓扑只读查询。
 ///
+/// **[implementedPrefixes] 是"核心到底实现到哪一族"的唯一出处**：点位表里出现了
+/// 这两个前缀之外的命令，就是 #43 那个形状（路由得到、执行必失败），
+/// `station_points_test.dart` 的门禁会因此失败。
+///
 /// 依赖没接线时**不做静默降级**：命令以「未接线」的可读原因失败。
 class ExecuteStationMounts {
   ExecuteStationMounts({this.pluginManager, this.topologyQuery, this.log});
@@ -61,6 +65,18 @@ class ExecuteStationMounts {
   final StationTopologyQuery? topologyQuery;
 
   final void Function(String message)? log;
+
+  /// 本层实现了哪些命令前缀（= 核心仍然自己执行的族）。
+  static const String pluginPrefix = 'plugin.';
+  static const String stationPrefix = 'station.';
+  static const List<String> implementedPrefixes = <String>[
+    pluginPrefix,
+    stationPrefix,
+  ];
+
+  /// 这条命令本层有没有实现（点位表与门禁都读它，不再各处另数一遍前缀）。
+  static bool handles(String command) =>
+      implementedPrefixes.any(command.startsWith);
 
   /// 把本点位拥有的命令挂到该执行站；返回 null = 全部成功，否则是可读原因（不静默）。
   ///
@@ -96,7 +112,7 @@ class ExecuteStationMounts {
     }
     // **插件族不靠 agent 工作空间归属证明身份**，闸门是「发起者是谁的快照」与
     // 「能不能证明 team」（见 [_pluginCommand]）。
-    if (command.startsWith('plugin.')) {
+    if (command.startsWith(pluginPrefix)) {
       try {
         return await _pluginCommand(context, command);
       } catch (error) {
@@ -105,14 +121,16 @@ class ExecuteStationMounts {
     }
     // `station.*` 也不靠 agent 工作空间归属证明身份（看站点拓扑本来就没有目标
     // agent），闸门同样只有「能不能证明 team」（见 [_stationCommand]）。
-    if (command.startsWith('station.')) {
+    if (command.startsWith(stationPrefix)) {
       try {
         return await _stationCommand(context, command);
       } catch (error) {
         return StationCommandOutcome.failed('命令 $command 执行异常：$error');
       }
     }
-    // A5：领域执行命令已随核心领域目录一起移除，由插件自建执行站承接。
+    // 走到这里 = 点位表里出现了一条本层没实现前缀的命令。门禁
+    // （station_points_test：每条命令都要被 [handles] 认下）会先把它拦下来；
+    // 这条兜底只负责"真发生了也别静默"（不变量 6：失败必须可读）。
     return StationCommandOutcome.failed(
       '命令 $command 已不在核心平台面（A5 起由 local_executor / ssh_executor / '
       'tree.agent 等插件自建执行站承接）',

@@ -212,7 +212,7 @@ tree.agent ──执行站命令(lease_id + relpath/argv)──> local_executor 
 UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行器插件
 ```
 
-- **执行站归属**：`exec.command` / `file.*` / `terminal.*` 这些执行站**由 `local_executor` / `ssh_executor` 在插件内部自行定义**（`plugin.json` 声明 + 站点注册），**不是核心内置**。核心只做路由、身份透传与响应校验；**交接完成后**不实现执行语义（过渡期仍保留 `system.execute.fs/terminal` legacy 点位，见下方说明，A5 删除）。
+- **执行站归属**：`exec.command` / `file.*` / `terminal.*` 这些执行站**由 `local_executor` / `ssh_executor` 在插件内部自行定义**（`plugin.json` 声明 + 站点注册），**不是核心内置**。核心只做路由、身份透传与响应校验；**交接完成后**不实现执行语义（过渡期曾保留 `system.execute.fs/terminal` legacy 点位，A5 删掉了执行器、2026-10-31 删掉点位本身，见 [known-issues #43](../known-issues.md)）。
 - **本地 vs 远端由 `tree.agent` 决定**：它拥有 agent → workspace 的领域映射；核心不判断。
 - **路径安全**：执行器只接受「租约内的相对路径」。`workspace/register {lease_id, dir}` 在核心登记的是**纯字符串映射**（`lease_id → dir`），无 agent/team 语义；执行器校验「解析后的绝对路径仍在租约根内」。
 - **PTY 流（2026-10-25 定案并已实现）**：**不做新的核心数据面**，也不要求核心提供通用流中继。
@@ -235,10 +235,15 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
   详见 [known-issues #37](../known-issues.md#37-集成终端迁移后无承接方pty-数据面延后)。
 - **崩溃影响**：执行器崩溃会带走其 PTY 会话与在途命令；由看门狗重启插件，UI 收到 `closed` 并提示。这是把能力下沉必须接受的代价。
 
-> **过渡期说明（2026-10-25）**：local_executor / tree.agent 已走**插件自建执行站**
-> （`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`），不再经
-> `plugin.mount`。核心仍保留 `system.execute.fs` / `system.execute.terminal` 两个
-> **legacy 点位**给无租约旧调用方（UI / 其它插件），A5 随核心领域执行器一起删除。
+> **过渡期说明（2026-10-25，2026-10-31 收口）**：local_executor / tree.agent 已走
+> **插件自建执行站**（`plugin.local_executor.execute.local`，命令 `file.*` / `exec.command`），
+> 不再经 `plugin.mount`。核心那侧曾为无租约旧调用方保留 `system.execute.fs` /
+> `system.execute.terminal` 两个 **legacy 点位**：A5（`258a28c`）删掉了领域执行器、
+> 点位本身却一直留在表里，于是这些名字「路由得到、执行必失败」，而内置名拦截又让插件
+> 认领不了（known-issues #43）。**2026-10-31 点位表已删干净**：内置执行站只剩
+> `system.execute.plugin` / `system.execute.station` 两族，本机侧命令名按
+> [exec_station_contract.md](../exec_station_contract.md) §8 统一成 `local.file.*` /
+> `local.exec.command`，由 `local_executor` 自建站承接。
 
 ### 4.6.1 L-24 落地记录（2026-10-25）
 

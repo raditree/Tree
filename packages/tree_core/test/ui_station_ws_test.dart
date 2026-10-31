@@ -299,7 +299,7 @@ plugins:
 
       for (final String stationId in <String>[
         StationHubIds.relayToolPre,
-        StationHubIds.executeTool,
+        StationHubIds.executePlugin,
         StationHubIds.collect,
       ]) {
         ws.send(<String, dynamic>{
@@ -600,12 +600,22 @@ plugins:
       );
 
       // 站点发现面只允许广播站：内置中转 / 执行 / 收集都不得出现。
+      // 判据按**类型**而不是点名字（点位表会增减；#43 之后内置执行站只剩两个，
+      // 逐个点名的断言只会在表变化时静默失去覆盖）。
       final List<String> ids = (after.json['stations'] as List<dynamic>)
           .map((dynamic s) => (s as Map<String, dynamic>)['station_id'] as String)
           .toList();
       expect(ids, contains('system.broadcast'));
+      expect(
+        ids.where(
+          (String id) =>
+              bus.stations.station(id)?.kind != StationKind.broadcast,
+        ),
+        isEmpty,
+        reason: '发现面出现了非广播站点位：$ids',
+      );
       expect(ids, isNot(contains(StationHubIds.relayToolPre)));
-      expect(ids, isNot(contains(StationHubIds.executeTool)));
+      expect(ids, isNot(contains(StationHubIds.executePlugin)));
       expect(ids, isNot(contains(StationHubIds.collect)));
     });
 

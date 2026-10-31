@@ -557,18 +557,20 @@ void main() {
     expect(restored.boardLimit, 2);
   });
 
-  test('执行站·文件操作点位：白名单 + 隔离 + 挂载位置；不订阅、不触发插件', () async {
+  test('执行站·插件管理点位：白名单 + 挂载位置；不订阅、不触发插件', () async {
     final StationHub h = hub();
     final StationScope scope = team('team-1');
-    final ExecuteStation execute = h.executePointFor(StationHubIds.executeFs)!;
-    // 白名单由**点位**决定：本点位只有 fs.* 一族；全命令并集仍可从 builtinCommands 取
-    expect(execute.commands, contains('fs.read'));
-    expect(ExecuteStation.builtinCommands, contains('fs.read'));
+    final ExecuteStation execute = h.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
+    // 白名单由**点位**决定：本点位只有 plugin.* 一族；全命令并集仍可从 builtinCommands 取
+    expect(execute.commands, contains('plugin.list'));
+    expect(ExecuteStation.builtinCommands, contains('plugin.list'));
     expect(execute.kind.subscribable, isFalse);
 
     // 未挂载：显式错误（不是静默成功）
     final StationCommandResult noMount = await execute.execute(
-      command: 'fs.read',
+      command: 'plugin.list',
       scope: scope,
     );
     expect(noMount.ok, isFalse);
@@ -577,7 +579,7 @@ void main() {
     // 挂载位置（「执行器只是站点的一种挂载位置」）
     expect(
       execute.mount(
-        command: 'fs.read',
+        command: 'plugin.list',
         mountId: 'test.frontend',
         handler: (StationCommandContext context) async =>
             StationCommandOutcome.ok(<String, dynamic>{
@@ -589,7 +591,7 @@ void main() {
       isNull,
     );
     final StationCommandResult read = await execute.execute(
-      command: 'fs.read',
+      command: 'plugin.list',
       scope: scope,
       arguments: <String, dynamic>{'path': '/a.txt'},
     );
@@ -613,12 +615,22 @@ void main() {
     // 别的点位的命令也挂不上（命令族之间互不干扰：这是点位化的直接收益）
     expect(
       execute.mount(
-        command: 'terminal.exec',
+        command: 'station.list',
         mountId: 'x',
         handler: (StationCommandContext context) async =>
             const StationCommandOutcome.ok(),
       ),
-      contains(StationHubIds.executeFs),
+      contains(StationHubIds.executePlugin),
+    );
+    // 领域命令名不再属于任何内置点位（#43：由插件自建执行站认领）
+    expect(
+      execute.mount(
+        command: 'fs.read',
+        mountId: 'x',
+        handler: (StationCommandContext context) async =>
+            const StationCommandOutcome.ok(),
+      ),
+      contains('不属于点位'),
     );
     final StationCommandResult denied = await execute.execute(
       command: 'shell.rm',
@@ -629,9 +641,9 @@ void main() {
 
     // 站点不再持有 scope（全局唯一），因此**站点层不做隔离拒绝**：scope 原样交给
     // 挂载位置。真正的跨 team / 跨模式 fail-closed 落点在两处（都另有专项测试）：
-    // ① 插件总线下命令前的 `_resolveCommandScope`；② 挂载位置的 `_resolveTarget`。
+    // ① 插件总线下命令前的 `_resolveCommandScope`；② 执行器插件自己那一侧。
     final StationCommandResult crossMode = await execute.execute(
-      command: 'fs.read',
+      command: 'plugin.list',
       scope: team('team-1', mode: StationModeKey.ssh),
     );
     expect(crossMode.ok, isTrue, reason: '站点层只透传 scope');
@@ -646,9 +658,9 @@ void main() {
 
     // 命令的 team 允许为空 = **通配所有 team**（用户定稿：为空默认作用于所有 team）。
     // 站点层只透传 scope；需要落到实处的命令由挂载位置自己拒绝
-    // （execute_mounts._resolveTarget：缺 team / agent 解析不出 / 模式对不上都拒）。
+    // （执行器插件按目标 agent 解析不出工作空间就显式失败）。
     final StationCommandResult noTeam = await execute.execute(
-      command: 'fs.read',
+      command: 'plugin.list',
       scope: const StationScope(modeKey: StationModeKey.local),
     );
     expect(noTeam.ok, isTrue, reason: '站点层不再替挂载位置兜底：空 team = 通配');
@@ -656,7 +668,7 @@ void main() {
 
     // mode 非法（拼错）⇒ 站点层就拒：命令必须能落到某个工作面上才谈得上执行
     final StationCommandResult badMode = await execute.execute(
-      command: 'fs.read',
+      command: 'plugin.list',
       scope: const StationScope(teamId: 'team-1', modeKey: 'local-typo'),
     );
     expect(badMode.ok, isFalse);
@@ -894,7 +906,9 @@ void main() {
     final BroadcastStation broadcast = h.broadcastFor()!;
     final RelayStation relay = h.relayPointFor(StationHubIds.relayToolPre)!;
     final CollectStation collect = h.toolDefineStationFor()!;
-    final ExecuteStation execute = h.executePointFor(StationHubIds.executeFs)!;
+    final ExecuteStation execute = h.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
 
     // 默认启用（缺键 = 启用），describe 带着它给面板
     expect(broadcast.enabled, isTrue);

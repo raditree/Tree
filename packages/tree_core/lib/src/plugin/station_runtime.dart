@@ -352,7 +352,7 @@ class StationCommandContext {
     this.sourcePluginId = '',
   });
 
-  /// 命令名（白名单内，如 fs.read / tool.call）。
+  /// 命令名（白名单内，如 plugin.list / station.state）。
   final String command;
 
   /// 命令参数（插件给的原始 JSON 对象）。

@@ -875,7 +875,7 @@ class StationCommandMount {
   /// 命令名（白名单内）。
   final String command;
 
-  /// 挂载位置 id（如 core.execute.fs.read / frontend / system）。
+  /// 挂载位置 id（如 core.execute.plugin.list / plugin.local_executor / system）。
   final String mountId;
 
   /// 处理器。

@@ -92,33 +92,14 @@ abstract final class StationHubIds {
       'system.broadcast.config.changed';
 
   // ── 执行站（插件主动下命令；按命令族拆点位） ────────────────────────────
-
-  /// 执行站·文件操作族：`fs.read` / `fs.write` / `fs.list` / `fs.grep`。
-  static const String executeFs = 'system.execute.fs';
-
-  /// 执行站·终端族：`terminal.exec` + `terminal.listRuns` / `stopRun` / `log`。
-  ///
-  /// 20261015-hot-restart 阶段 6（A 级点位批）扩后三条：后台（hook）任务的台账与
-  /// 任务表已经在核心里跨重启存活，`exec` 的 `hook_action=status` 也早就存在——但那是
-  /// **写给模型看的散文**。要做转发/看护的插件要的是行（task_id / 退出码 / 日志路径 /
-  /// 远端 pid），而工具族的 `tool.close` 只按 handle 关一次运行、拿不到这些读数。
-  static const String executeTerminal = 'system.execute.terminal';
-
-  /// 执行站·Agent 族：`agent.message` / `agent.stop` / `agent.compact`。
-  static const String executeAgent = 'system.execute.agent';
-
-  /// 执行站·LLM 族：`llm.call`（硬设 JSON 返回形式，复用目标 agent 的模型）。
-  static const String executeLlm = 'system.execute.llm';
-
-  /// 执行站·工具族：`tool.call`（执行任意工具）。
-  static const String executeTool = 'system.execute.tool';
-
-  /// 执行站·会话族：`session.rename`（会话重命名）。
-  static const String executeSession = 'system.execute.session';
-
-  /// 执行站·SSH 族：`ssh.reconnect`（重建目标 agent 的远端链路）。
-  static const String executeSsh = 'system.execute.ssh';
-
+  //
+  // **2026-10-31（known-issues #43，Q-5 走 A）**：`fs` / `terminal` / `agent` /
+  // `llm` / `tool` / `session` / `ssh` / `usage` 八族的点位 id 整体删除——A5
+  // (`258a28c`) 撤掉核心的领域实现后，那 20 条命令只剩「路由得到、执行必失败」，
+  // 而内置名拦截又让真正的实现方认领不了。执行站只剩 `plugin` / `station` 两族：
+  // 它们是核心**确实自己执行**的生命周期与控制面命令。领域族名让给插件
+  // （`tree.agent` / `local_executor` / `ssh_executor`），申报口径见
+  // `docs/exec_station_contract.md` §8。
   /// 执行站·插件族：`plugin.list` / `plugin.restart` / `plugin.suspend` /
   /// `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`。
   ///
@@ -139,15 +120,6 @@ abstract final class StationHubIds {
   /// team 可见**（别人的站里写着别人的 topic 与配置）；本族只读，接管权易手仍然
   /// 只走 `station/subscribe` 那一条（不在这里开第二条口子）。
   static const String executeStation = 'system.execute.station';
-
-  /// 执行站·用量族：`usage.query`（按会话取逐调用用量账本；阶段 6 新增）。
-  ///
-  /// 这一族存在的理由是**读取范围**：`<会话目录>/usage.jsonl` 在数据根下，而插件的
-  /// `fs.read` 只在工作空间作用域内——它永远够不到那一份账（压缩中转载荷里那
-  /// 「最近 N 行」只服务压缩，不是一个可以按会话主动问的读口）。计费/预算类插件
-  /// 需要它，而核心只是把已有的容错读取递出去：只读一个会话、只读尾部、行形状与
-  /// `UsageCall.toJson()` 逐字一致（不在别处再拼一套键）。
-  static const String executeUsage = 'system.execute.usage';
 
   // ── 中转站（拦截-回填；每个点位各自唯一订阅者） ──────────────────────────
 
@@ -257,6 +229,24 @@ abstract final class StationHubIds {
   /// 退役：旧执行站（九条命令共用）。执行站不可订阅，所以**没有订阅需要迁移**。
   static const String legacyExecute = 'system.execute';
 
+  /// 退役（2026-10-31 known-issues #43）：领域八族曾经的内置点位 id。
+  ///
+  /// 它们不是「改名」也不是「别名」——A5 撤掉核心的领域实现后，这些命令在核心里
+  /// 只剩一条「路由得到、执行必失败」的死路，于是点位整体从表里删掉、族名让给真正的
+  /// 实现方（`docs/exec_station_contract.md` §8）。列在这里是为了让**落盘实例的对账**
+  /// 认出「这是一个曾经存在过的内置站」并把它丢掉（见 `StationHub.load`），
+  /// 而不会留一个空命令的内置壳在面板上假装还在。
+  static const List<String> retiredExecutePoints = <String>[
+    'system.execute.fs',
+    'system.execute.terminal',
+    'system.execute.agent',
+    'system.execute.llm',
+    'system.execute.tool',
+    'system.execute.session',
+    'system.execute.ssh',
+    'system.execute.usage',
+  ];
+
   /// 全部**内置点位 id**（含收集站）。
   ///
   /// **新增内置点位必须加进来**：`PluginBus._subscribeToStation` 用它判定"这是内置站，
@@ -272,16 +262,8 @@ abstract final class StationHubIds {
     broadcastTurnError,
     broadcastAskPaused,
     broadcastConfigChanged,
-    executeFs,
-    executeTerminal,
-    executeAgent,
-    executeLlm,
-    executeTool,
-    executeSession,
-    executeSsh,
     executePlugin,
     executeStation,
-    executeUsage,
     relayToolPre,
     relayToolPost,
     relayLlmHandle,
@@ -301,7 +283,11 @@ abstract final class StationHubIds {
   };
 
   /// 退役 id 集合（迁移判定用；它们不再出现在 [all] 里）。
-  static const Set<String> retired = <String>{legacyRelay, legacyExecute};
+  static const Set<String> retired = <String>{
+    legacyRelay,
+    legacyExecute,
+    ...retiredExecutePoints,
+  };
 
   /// 自建站 `name` 名段校验（返回 null = 合法）。
   ///

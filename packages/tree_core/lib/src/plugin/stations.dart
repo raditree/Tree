@@ -286,13 +286,27 @@ class StationHub {
     final ({List<StationInstance> stations, bool migrated}) loaded = _store
         .load();
     int rebuilt = 0;
+    final List<String> droppedRetired = <String>[];
     for (final StationInstance station in loaded.stations) {
+      // **内置实例的 id 必须在点位表里**：表里删掉的点位（#43 的领域八族）在盘上会
+      // 剩一个 commands 为空的内置壳——路由不看它（分发按表 + 自建站扫描），但它照样
+      // 进 station.list 与面板，看上去"这个内置站还在、只是没命令"。读侧直接丢掉。
+      if (station.builtin && StationPoints.byId(station.id) == null) {
+        droppedRetired.add(station.id);
+        continue;
+      }
       // 内置 id 的类型以**点位表**为准：落盘写错了类型就按表重建（并记可读日志），
       // 否则该点位会静默失效（见 [_normalizeBuiltinPoint]）。
       final StationInstance normalized = _normalizeBuiltinPoint(station);
       if (!identical(normalized, station)) rebuilt++;
       _attach(normalized);
       _stations[normalized.id] = normalized;
+    }
+    if (droppedRetired.isNotEmpty) {
+      log?.call(
+        '退役点位已从站点存储移除：${droppedRetired.join('、')}'
+        '（点位表里没有它们，留着只会是个空壳）',
+      );
     }
     if (loaded.migrated) {
       log?.call(
@@ -301,7 +315,7 @@ class StationHub {
       );
     }
     // 迁移结果与"类型纠正"都要写回（此后幂等：文件里没有旧 id / 没有错类型就不会再触发）
-    if (loaded.migrated || rebuilt > 0) save();
+    if (loaded.migrated || rebuilt > 0 || droppedRetired.isNotEmpty) save();
   }
 
   /// 全部站点实例（按 id 字典序，输出稳定）。
@@ -457,7 +471,7 @@ class StationHub {
     );
   }
 
-  /// **确保全部内置点位存在**（33 个：广播 10 + 执行 11 + 中转 12；收集站除外）。
+  /// **确保全部内置点位存在**（24 个：广播 10 + 执行 2 + 中转 12；收集站除外）。
   ///
   /// 为什么需要这一步：[pointFor] 是**懒创建**（首次使用时才实例化）。按需开销为零
   /// 是好事，代价却是"没配插件 / 没人用过"时一个点位都没有——面板上就是
@@ -487,7 +501,7 @@ class StationHub {
     // 一批预建只落一次盘（每个点位的懒创建都会 save 一次，不合并就是二十几次写）
     _saveSuspend++;
     try {
-      // 全部内置点位（广播 10 + 执行 11 + 中转 12 = 33）预建；**收集站不预建**（见下）。
+      // 全部内置点位（广播 10 + 执行 2 + 中转 12 = 24）预建；**收集站不预建**（见下）。
       for (final StationPointSpec spec in StationPoints.all) {
         if (spec.kind == StationKind.collect) continue;
         _ensureOneBuiltin(() => pointFor(spec.id), created);

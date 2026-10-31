@@ -102,13 +102,13 @@ void main() {
       (result.payload ?? const <String, dynamic>{}) as Map<String, dynamic>;
 
   // ── 1/2/3：点位登记与挂载 ─────────────────────────────────────────────
-  test('新点位进了 StationHubIds.all，且内置点位总数是 36', () {
+  test('新点位进了 StationHubIds.all，且内置点位总数是 28', () {
     expect(
       StationHubIds.all,
       contains(StationHubIds.executePlugin),
       reason: '漏进 all ⇒ 插件订阅被当成别人的自建站拒掉（静默失效）',
     );
-    expect(StationPoints.all.length, 36);
+    expect(StationPoints.all.length, 28);
     expect(StationHubIds.all.length, StationPoints.all.length);
     expect(
       StationPoints.byId(StationHubIds.executePlugin),
@@ -142,6 +142,31 @@ void main() {
         .map((StationCommandMount m) => m.command)
         .toSet();
     expect(mounted, spec.commands.toSet(), reason: '点位表说有的，挂载位置就得有');
+  });
+
+  // #43 的形状是「表里加了命令、核心那侧没人执行」——单点位的一条断言只覆盖了
+  // plugin 族自己，所以这里按**整张表**要兑现：每个内置执行站点位的每条命令，
+  // 在接好线的总线上都必须真的有挂载位置（否则命令路由得到、执行必失败）。
+  test('门禁：点位表里每条内置执行站命令都真的有挂载位置（全表，不是单点）', () {
+    for (final StationPointSpec spec in StationPoints.executes) {
+      final ExecuteStation station = bus.stations.executePointFor(spec.id)!;
+      final Set<String> mounted = station
+          .mounts()
+          .map((StationCommandMount m) => m.command)
+          .toSet();
+      expect(
+        mounted,
+        spec.commands.toSet(),
+        reason: '${spec.id}：点位表声明与挂载位置不一致',
+      );
+      for (final String command in spec.commands) {
+        expect(
+          ExecuteStationMounts.handles(command),
+          isTrue,
+          reason: '$command 挂上了但核心没有实现前缀（路由得到、执行必失败）',
+        );
+      }
+    }
   });
 
   test('每条 plugin.* 命令的 owner 都是插件点位（命令 → 点位唯一）', () {

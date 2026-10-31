@@ -4266,6 +4266,12 @@ class PluginBus {
   }
 
   /// 自建执行站命令表校验：非空、不超限、名字合法、不得占用核心内置命令。
+  ///
+  /// **控制面命名空间只封 `plugin.` / `station.`**（核心确实自己执行的那两族）。
+  /// `tool.` / `agent.` 曾经也在禁令里，那是 A5 之前的历史包袱：那时这两个前缀是
+  /// **内置**命令，插件抢了会抢不掉；领域实现撤出核心后，这两个前缀反而成了
+  /// 真正的实现方（tree.agent）唯一顺手的名字，禁令不退就会把让出去的名又堵死
+  /// （known-issues #43 / `docs/exec_station_contract.md` §8）。
   static String? _checkExecuteCommands(List<String> commands) {
     if (commands.isEmpty) {
       return '自建执行站需要非空 commands 列表（插件能执行哪些命令）';
@@ -4281,10 +4287,7 @@ class PluginBus {
       if (StationPoints.allCommands.contains(command)) {
         return '命令 $command 是核心内置命令，插件不得自建同名命令';
       }
-      if (command.startsWith('plugin.') ||
-          command.startsWith('station.') ||
-          command.startsWith('tool.') ||
-          command.startsWith('agent.')) {
+      if (command.startsWith('plugin.') || command.startsWith('station.')) {
         return '命令 $command 属于控制面命名空间，插件不得自建';
       }
     }
@@ -5040,7 +5043,8 @@ class PluginBus {
     if (command.isEmpty) {
       throw const PluginRequestException(
         PluginRpcErrorCode.invalidParams,
-        'station/command 需要 command（执行站命令名，如 fs.read / tool.call）',
+        'station/command 需要 command（执行站命令名；核心内置的只有 plugin.* / '
+        'station.* 两族，其余命令名属于某个插件自建的执行站）',
       );
     }
     final Object? rawArguments = params['arguments'];
@@ -5191,9 +5195,9 @@ class PluginBus {
     // ── 团队级命令（无目标 agent，如 station.list）：team 可以留空 = 通配所有 team ──
     //
     // 用户定稿：**为空默认作用于所有 team**。所以这里不再 fail-closed 拒绝；
-    // 真正需要"证明归属"的是**执行类命令**（fs.* / terminal.exec / agent.*）——
-    // 它们在自己的挂载位置里按目标 agent 解析工作空间，解析不出来就拒绝执行
-    // （见 execute_mounts 的 _resolveTarget），闸门放在该放的地方。
+    // 真正需要"证明归属"的是**执行类命令**（local.* / ssh.* / tool.* / agent.*）——
+    // 它们现在都在插件自建的执行站上，执行器自己按目标 agent 解析工作空间，
+    // 解析不出来就显式失败（核心不解释领域语义，也不替它兜）。
     if (requestedAgent.isEmpty && declared.agentId.isEmpty) {
       final String team = requestedTeam.isNotEmpty
           ? requestedTeam

@@ -23,20 +23,32 @@ void main() {
       );
     });
 
-    test('类型分布：广播 10 / 执行 10 / 中转 12 / 收集 4', () {
+    test('类型分布：广播 10 / 执行 2 / 中转 12 / 收集 4', () {
       int count(StationKind kind) => StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 10);
-      expect(count(StationKind.execute), 10);
+      expect(count(StationKind.execute), 2);
       expect(count(StationKind.relay), 12);
       expect(count(StationKind.collect), 4);
-      expect(StationPoints.all.length, 36);
+      expect(StationPoints.all.length, 28);
     });
 
-    test('退役 id 不在表里（它们只用于读侧迁移）', () {
+    test('退役 id 不在表里（它们只用于读侧迁移与落盘对账）', () {
       for (final String retired in StationHubIds.retired) {
         expect(StationPoints.byId(retired), isNull, reason: retired);
         expect(StationHubIds.all, isNot(contains(retired)));
       }
+      // #43 让出去的八个领域点位必须**逐个**钉在退役集合里：漏一个就会在下次
+      // 有人「顺手加回一个内置执行站」时没人拦（表里加回去的话这条会先炸）。
+      expect(StationHubIds.retiredExecutePoints, <String>[
+        'system.execute.fs',
+        'system.execute.terminal',
+        'system.execute.agent',
+        'system.execute.llm',
+        'system.execute.tool',
+        'system.execute.session',
+        'system.execute.ssh',
+        'system.execute.usage',
+      ]);
     });
 
     test('说明与中文名都不为空（面板与日志直接展示它们）', () {
@@ -82,7 +94,7 @@ void main() {
         StationPoints.byId(StationHubIds.relayLlmHandle)!.suffix,
         'llm.handle',
       );
-      expect(StationPoints.byId(StationHubIds.executeFs)!.suffix, 'fs');
+      expect(StationPoints.byId(StationHubIds.executePlugin)!.suffix, 'plugin');
       // 经典点位（system.broadcast）没有点位后缀：返回 id 本身
       expect(
         StationPoints.byId(StationHubIds.broadcast)!.suffix,
@@ -90,32 +102,10 @@ void main() {
       );
     });
 
-    test('命令 → 点位：29 条命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：9 条平台面命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 29, reason: '$commands');
+      expect(commands.length, 9, reason: '$commands');
       expect(commands, <String>{
-        'fs.read',
-        'fs.write',
-        'fs.list',
-        'fs.grep',
-        'fs.delete',
-        'fs.mkdir',
-        'fs.writeBytes',
-        'terminal.exec',
-        // 后台（hook）任务的结构化读口与控口（阶段 6）
-        'terminal.listRuns',
-        'terminal.stopRun',
-        'terminal.log',
-        // 用量族（阶段 6）
-        'usage.query',
-        'agent.message',
-        'agent.stop',
-        'agent.compact',
-        'llm.call',
-        'tool.call',
-        'tool.close',
-        'session.rename',
-        'ssh.reconnect',
         // 插件族（20261015-hot-restart 阶段 1）
         'plugin.list',
         'plugin.restart',
@@ -141,6 +131,37 @@ void main() {
       }
       expect(StationPoints.ownerOfCommand('not.a.command'), isNull);
       expect(StationPoints.ownerOfCommand(''), isNull);
+      // 让出去的领域命令名**不在表里**（#43）：它们是插件自建执行站的命令，
+      // 表里再出现就等于核心重新假装自己会执行（ownerOfCommand 会把命令抢走）。
+      for (final String letGo in <String>[
+        'fs.read',
+        'terminal.exec',
+        'agent.compact',
+        'llm.call',
+        'tool.call',
+        'session.rename',
+        'ssh.reconnect',
+        'usage.query',
+      ]) {
+        expect(StationPoints.ownerOfCommand(letGo), isNull, reason: letGo);
+      }
+    });
+
+    // 这条就是本该在 #43 之前就存在的门禁：**点位表是承诺，挂载位置是兑现**。
+    // 只往表里加命令、核心那侧没有实现，命令就变成「路由得到、执行必失败」，
+    // 而插件又被内置名拦截抢不到这个名字——两边都动不了，坏掉的是随包插件。
+    test('门禁：表里每条命令都得被 ExecuteStationMounts 认下（有实现才许申报）', () {
+      for (final String command in StationPoints.allCommands) {
+        expect(
+          ExecuteStationMounts.handles(command),
+          isTrue,
+          reason: '$command 在点位表里，但核心执行站挂载位置没有它的前缀实现',
+        );
+      }
+      expect(ExecuteStationMounts.implementedPrefixes, <String>[
+        'plugin.',
+        'station.',
+      ]);
     });
 
     test('只有执行站点位带命令（其它类型恒为空）', () {
@@ -211,7 +232,7 @@ void main() {
       // 执行站不可订阅 ⇒ 任何 point 都解析不出来
       expect(StationPoints.resolveAlias(kindWire: 'execute'), isEmpty);
       expect(
-        StationPoints.resolveAlias(kindWire: 'execute', point: 'fs'),
+        StationPoints.resolveAlias(kindWire: 'execute', point: 'plugin'),
         isEmpty,
       );
       // 不存在的点位 / 类型

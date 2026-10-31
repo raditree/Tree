@@ -134,7 +134,17 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（36 个 id：广播 10 + 执行 10 + 中转 12 + 收集 4）
+### 3.1 全部内置点位（28 个 id：广播 10 + 执行 2 + 中转 12 + 收集 4）
+
+> **执行站只剩两族**（2026-10-31，known-issues #43）：`fs` / `terminal` / `agent` /
+> `llm` / `tool` / `session` / `ssh` / `usage` 八族从内置点位表里**整体删除**了。A5
+> 撤掉核心的领域实现之后，那 20 条命令在核心里只剩「路由得到、执行必失败」，而内置名
+> 拦截又让真正的实现方认领不了它们；删表就是把族名让给插件（`local_executor` /
+> `ssh_executor` / `tree.agent`）。**命令名仍然可以下**——只要有一个插件把这一族申报成
+> 自己的自建执行站（`station/register` + `commands`），核心就把命令原样转过去。
+> 命名与回包口径见 [exec_station_contract.md](exec_station_contract.md) §8。
+> 核心自己仍然执行的两族是下面表里的 `system.execute.plugin` 与
+> `system.execute.station`，插件不得占用 `plugin.` / `station.` 前缀。
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -150,20 +160,12 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.llm.register` | 中转 | 每个流式请求建立时（登记之后） | `{accepted, note}` ⇒ 回执只进日志；**内置登记表永远先建立**，取消/关闭/判死不在这一条上（别名 `llm.register`） |
 | `system.relay.compact.skip.reason` | 中转 | 每一次「压缩没走插件」（早退不投） | `{reason}` ⇒ **覆盖还账上那一条**（REST 与压缩结论会看到）；已推进历史的通知不回改；不改分级位（别名 `compact.skip.reason`） |
 | `system.relay.loop.run` | 中转 | 每一轮开始处（上下文装配完、进入内置 LlmSession **之前**） | 回 `{stream:true}` ⇒ **整轮循环形状归你**（第几跳、工具怎么排、何时收尾）；文本/思考/提示/用量经 `station/stream` 推回，**工具走 `tool.call` 并回带 `run_id`**；落库、卡片、取消与判死仍在核心（别名 `loop.run`，详见 §5.6） |
-| `system.execute.fs` | 执行 | — | `fs.read` / `fs.write` / `fs.list` / `fs.grep` |
-| `system.execute.terminal` | 执行 | — | `terminal.exec`（含 hook 后台任务）、`terminal.listRuns` / `terminal.stopRun` / `terminal.log`（后台任务的**结构化读口与控口**：列表回行不回散文，`exit_code`/`pid` 拿不到写 `null` 不省略键，终止**不保证杀得掉**且 `requested=false` 必带 `reason`，`log` 只递尾部；只看/只动目标 agent 自己的任务） |
-| `system.execute.agent` | 执行 | — | `agent.message` / `agent.stop` / `agent.compact` |
-| `system.execute.llm` | 执行 | — | `llm.call`（硬设 JSON 返回形式） |
-| `system.execute.tool` | 执行 | — | `tool.call`（执行任意工具）、`tool.close`（按 `handle` **显式关闭**一次运行中的工具/请求：先尽力终止进程树、再让在途调用收敛；句柄失效或不归你管 ⇒ 可读拒绝，**绝不自动关**） |
-| `system.execute.session` | 执行 | — | `session.rename`（会话重命名） |
-| `system.execute.ssh` | 执行 | — | `ssh.reconnect`（重建目标 agent 的远端链路；与 REST `POST /api/agents/{id}/ssh/reconnect`、右栏文件面板「重连」按钮同一实现） |
 | `system.execute.plugin` | 执行 | — | `plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`（插件热重启的控制面，见 §6.5；模型能使唤的那一面见 §6.7；别名 `plugin`）。**后两条不得被申报成 agent tool**：它们是生命周期原语，只能由插件自己下 |
 | `system.execute.station` | 执行 | — | `station.list` / `station.state`（**只看不动**的拓扑：谁接管了哪个点位、自建站归谁。内置点位任何 team 都可见，插件自建站只对订阅者所在 team 可见；接管权易手仍只走 `station/subscribe`，这里不开第二条路；别名 `station`，见 §6.9） |
-| `system.execute.usage` | 执行 | — | `usage.query`（按会话取**逐调用用量账本**：`{session_id, usage_file, count, skipped, calls, summary{…,by_source}}`。行形状与 `UsageCall.toJson()` 逐字一致；账本在数据根下，插件的 `fs.read` 本来够不到，这一条是它唯一的问口；只读一个会话、只读尾部；别名 `usage`） |
 | `system.broadcast` | 广播 | 通用主题（自定 topic） | 通知 |
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
-| `system.tool.timeout` | 广播 | 某次**工具运行/LLM 请求**超过阈值（默认 **300 s**）时，**每个运行只广播一次** | 通知：载荷 `{handle, agent_id, session_id, tool, command, elapsed_ms, started_at, point}`——拿到 `handle` 后可经执行站 `tool.close` 显式关闭这次运行（见下行）；别名 `tool.timeout`（`{station: 'broadcast', point: 'tool.timeout'}`） |
+| `system.tool.timeout` | 广播 | 某次**工具运行/LLM 请求**超过阈值（默认 **300 s**）时，**每个运行只广播一次** | 通知：载荷 `{handle, agent_id, session_id, tool, command, elapsed_ms, started_at, point}`——拿到 `handle` 后可下 `tool.close` 显式关闭这次运行（`tool.*` 由认领工具族的执行器插件自建执行站承接，核心不执行它；插件不在位就关不掉，会拿到「暂无挂载位置」）；别名 `tool.timeout`（`{station: 'broadcast', point: 'tool.timeout'}`） |
 | `system.broadcast.plugin.state` | 广播 | 插件**生命周期跃迁**（booting / ready / restarting / suspended / failed / stopped）与**失活标记**（心跳连续丢失 / 恢复）| 通知：载荷 `{plugin_id, lifecycle, previous, generation, missed_heartbeats, reason, buffer}`；别名 `plugin.state`（`{station: 'broadcast', point: 'plugin.state'}`）；发布点**只有这两处**（跃迁集中在 `PluginBus._setLifecycle`，失活与 `health` 同一个判定源 `LivenessTracker`，**不另造时钟**）。要看某个插件的当前读数请下执行站命令 `plugin.state`——**那是“问”，这里是“推”**；三者各管各的轴：**活性看 `health`、启停看 `status`、阶段看 `lifecycle`** |
 | `system.broadcast.turn.done` | 广播 | 本轮**正常结束**（会话收尾处） | 通知：`{agent_id, session_id, team_id, content_chars, elapsed_ms, finish_reason, tool_rounds}`；**不带正文**（正文有会话与 REST 两个正经读处）。别名 `turn.done` |
 | `system.broadcast.turn.cancelled` | 广播 | 本轮**被取消**（与 done 互斥，一轮只出一条） | 通知额外带 `source`：`interjection`（被新消息插话）/ `user_stop`（用户按停）——不变量 5 的两种取消在审计里必须分得开 |
@@ -288,7 +290,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 |---|---|
 | **订阅声明**（`station/subscribe` 的 `scope`、`plugins.yaml` 的 `scope`） | **不设条件（通配）**：空 team = 作用于**所有 team**；空 mode = local 与 ssh **都收** |
 | **消息信封**（核心投给你的请求里的 `scope`） | 空 = 不可证明归属 ⇒ 核心**拒绝投递**（你不会收到这类消息） |
-| **执行类命令的落地**（`fs.*` / `terminal.exec` / `agent.*`） | fail-closed：team / agent / mode 必须解析得出且与目标 agent 的真实归属**精确吻合**，否则拒绝执行 |
+| **执行类命令的落地**（`local.*` / `ssh.*` / `tool.*` / `agent.*`，由插件自建执行站承接） | fail-closed：team / agent / mode 必须解析得出且与目标 agent 的真实归属**精确吻合**，否则拒绝执行。**这道闸门在执行器插件那一侧**——核心只负责把 `_resolveCommandScope` 算出的运行期四元组原样递过去（#43 之后核心不再执行领域命令，也就不再替它兜） |
 | **团队级执行命令的 team** | 允许为空 = 作用于**所有 team**（如 `station.list`：拓扑本来就不分 team） |
 
 实践建议：
@@ -563,7 +565,8 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 {"method":"station/stream","params":{"request_id":"req-42","done":true,"finish_reason":"stop","usage":{"prompt_tokens":120,"completion_tokens":30}}}
 
 // 5) 工具必须走 tool.call，并回带 run_id（就是那个 request_id）
-{"method":"station/call","params":{"station_id":"system.execute.tool","command":"tool.call",
+//    （命令按名字路由，不带 station_id；`tool.*` 由认领工具族的执行器插件承接，见 §6.1 顶注）
+{"method":"station/command","params":{"command":"tool.call",
   "arguments":{"tool":"read","arguments":{"path":"a.txt"},"run_id":"req-42","call_id":"c1"}}}
 ```
 
@@ -604,6 +607,16 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 只带 `command` 即可。
 
 ### 6.1 命令清单
+
+> **两类命令要分开读**（2026-10-31，known-issues #43）：
+> - `plugin.*` / `station.*` —— **核心自己执行**的内置点位（§3.1 那两行）；
+> - 其余（`fs.*` / `terminal.*` / `agent.*` / `llm.call` / `tool.*` / `session.*` /
+>   `ssh.*` / `usage.*`）—— **核心不再执行**。参数与回包形状仍然登记在这里，是因为
+>   那是各家执行器**共同的历史口径**（改形状等于改契约）；能不能下到，取决于有没有
+>   插件把这一族申报成自己的自建执行站。下一片（`exec_station_contract.md` §8）把
+>   本机侧改名成 `local.file.*` / `local.exec.command`，与 `ssh.*` 对称，并逐族交接给
+>   `local_executor` / `ssh_executor` / `tree.agent`。在那之前，这些名字**除了插件自建
+>   执行站外没有别的提供方**——下不中就是「暂无挂载位置」，核心不会假装跑过。
 
 | 命令 | 参数 | 结果 payload | 说明 |
 |---|---|---|---|
@@ -1027,7 +1040,7 @@ plugins:
 | 旧 | 新 | 迁移动作 |
 |---|---|---|
 | `system.relay`（工具前/后共用一个实例） | `system.relay.tool.pre` + `.tool.post` | 核心**自动迁移**落盘订阅（旧订阅复制到两个点位、含更早一代 `system.relay@team@mode`，行为等价）；插件代码不用改：`{"station":"relay"}` 现在一次订两个点位 |
-| `system.execute`（九条命令共用一个实例） | `system.execute.fs/terminal/agent/llm/tool/session/ssh/plugin/station/usage` | 插件无感（命令名不变，核心按命令路由）；`ui.push` 随旧 UI 面板协议在片 E 删除 |
+| `system.execute`（九条命令共用一个实例） | 曾拆成 `fs/terminal/agent/llm/tool/session/ssh/plugin/station/usage` 十个点位 → **现役只有 `plugin` 与 `station` 两个** | 第一次拆分对插件无感（命令名不变，核心按命令路由）；2026-10-31 那八个领域点位**退役**（#43），命令名让给插件自建执行站（见 §3.1 顶注与 [exec_station_contract.md](exec_station_contract.md) §8）；`ui.push` 随旧 UI 面板协议在片 E 删除 |
 | 无流式接管 | `station/stream` + `station/cancel` | 想用就用；不用则一次 `reply` 仍可 |
 | `point` 参数不存在 | `station/subscribe` 支持 `point` | 可选：用别名代替完整 id |
 | 点位化前"广播站只有一个" | 通用主题 + `tool.pre` / `tool.post` | 广播站**没有**"不带 point = 全订"的糖（`{"station":"broadcast"}` 仍是通用主题）；要工具广播就订两个点位 |
