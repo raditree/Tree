@@ -2546,3 +2546,43 @@ compact 四条（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 sa
 `tree_protocol` 码表、§5 门禁五条断言全绿，租约旧名归并为 `lease_unknown`，
 见 [exec_station_contract.md](exec_station_contract.md) §8.4「片 5 已合」。
 
+## #44 工作空间有两条写入口（REST `/api/files` 与执行站租约），"同一文件只有一个写者"不成立
+
+**状态**：**已登记（2026-11-01），未处理**。D-5 只裁定了应用元数据（`agents.yaml` +
+会话历史）的接管范围，工作空间不在接管范围；本条记录它残留的**双写面**。
+**影响**：同一路径可被 agent 工具轮与前端文件面板同时写，没有共享锁或租约，
+存在"后写覆盖"与编辑器缓冲区不一致的风险（本机与 SSH 两侧同构）。
+**发现时间**：2026-11-01，解释 D-5「工作空间不接管」时核对读写归属撞出来的。
+
+### 现象
+
+- agent 侧：`_workspaceDirOf` 解析 agent → 工作空间目录，`workspaceIoFor` 登记租约
+  （`local.lease.register` / `ssh.lease.register`），随后所有 `local.file.*` /
+  `ssh.file.*` 都在租约内由执行器插件读写（`plugins/tree.agent/lib/src/runtime/agent_runtime.dart:197-201`、`:921`）。
+- 前端侧：文件面板的浏览 / 编辑 / 保存 / git 操作直接走核心 REST `/api/files`
+  （路由常量在 `packages/tree_protocol/lib/src/api_paths.dart`，调用在 `lib/io/api_service.dart`）。
+- 两条路**不共享租约表**：核心侧不知道工作空间正被哪条租约持有，执行站也不看 REST 的写。
+
+### 根因
+
+插件化把 agent 侧 I/O 搬到执行站（片 1~5 已完成，租约归执行器插件），但 REST 文件面
+留在核心侧直连读写。`ExecuteStationMounts` 只证明"发起者是谁的快照"
+（`packages/tree_core/lib/src/plugin/execute_mounts.dart:113-122`），不校验工作空间的归属或占用，
+所以两侧都能落盘。这不是"接管"能解决的——工作空间本来不归应用管（见 #39 / D-5），
+缺的是**单一写者**的约束。
+
+### 修复方向（两条，建议 A）
+
+- **A（推荐）REST 文件面改为委派执行站**：`/api/files` 的读写按目标 agent 的 mode 转成
+  `local.file.*` / `ssh.file.*`（与 [exec_station_contract.md](exec_station_contract.md) §4 的
+  委派同一条路）⇒ 全仓对工作空间只剩执行站一个写者，租约天然互斥；SSH 侧同构问题一并解决。
+  代价：REST 面从"直连读写"变成"中转 + 需要 agent 上下文"，无 agent 的纯本地路径要定义归属。
+- **B 保留直连、加同路径写锁**：核心与执行站共享一张「路径 → 租约/锁」表。代价是跨进程锁
+  要落盘，还要处理插件重启后的陈旧锁——比 A 复杂，且与 Q-2「租约归插件」的方向相反。
+
+### 收口时的验证
+
+1. 新增用例：同一路径并发写（执行站命令 + REST 写），后者必须被拒或显式提示，不得静默覆盖；
+2. 真机：编辑器打开某文件 → agent 改同一文件 → UI 能感知并提示，不出现"保存即覆盖"；
+3. 门禁：核心侧除读取 agent 元数据外，不再有直接写工作空间的 `File(...)` 路径。
+
