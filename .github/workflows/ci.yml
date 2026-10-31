@@ -1,0 +1,97 @@
+# 桌面仓门禁（L-21 / D-9）。
+#
+# 与 docs/handover.md §5.2 同顺序：静态检查 → 包内全量测试 → 契约门禁 →
+# 插件仓零核心依赖检查 → UI（analyze + test）。
+#
+# 两条刻意固定：
+# 1. 一律 `windows-latest`：本产品只发 Windows，门禁必须在真目标平台上跑
+#    （路径守卫 / 进程 / 编码类行为在 Linux runner 上不可信）；
+# 2. SDK 用维护版本（Dart 3.13.4 / Flutter 3.47.5，见 handover §5.1）：
+#    版本落后时 `dart pub get` 会因 `sdk: ^3.13.0` 直接失败，这是有意的红灯。
+#
+# `plugins/` 是独立仓（本仓 .gitignore 掉了），插件门禁在这里显式检出
+# raditree/tree-plugins（两仓均为公开仓，无需 PAT）。
+
+name: ci
+
+on:
+  push:
+    branches: [desktop, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DART_SDK: '3.13.4'
+  FLUTTER_SDK: '3.47.5'
+  PLUGIN_REPO: raditree/tree-plugins
+  PLUGIN_REF: master
+
+jobs:
+  protocol:
+    name: tree_protocol（analyze + test）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/tree_protocol
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK }}
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart test
+
+  core:
+    name: tree_core（analyze + test）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: packages/tree_core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK }}
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart test
+
+  plugin-contract:
+    name: 插件仓零核心依赖
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检出插件仓（plugins/ 不在本仓版本控制内）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLUGIN_REPO }}
+          ref: ${{ env.PLUGIN_REF }}
+          path: plugins
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ env.DART_SDK }}
+      - name: 门禁自检（证明脚本坏了不会静默放行）
+        run: dart run tool/check_plugin_repo_contract.dart --selftest
+      - name: 插件源码不得 import / 依赖核心包
+        run: dart run tool/check_plugin_repo_contract.dart --plugin-root plugins
+
+  app:
+    name: UI（flutter analyze + test）
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_SDK }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      # 先只守 lib：test/ 里还有 7 条既有 info（thinking_window_test.dart，见
+      # handover §4.3），清掉之前把 `test` 纳入这里只会让流水线常年红灯。
+      - run: flutter analyze lib
+      - run: flutter test
