@@ -199,7 +199,7 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 
 | 项 | 现状 | 完成标志 | 关联 |
 | --- | --- | --- | --- |
-| **数据接管 + 回滚** | 未设计。插件直接读写 `agents.yaml` 与 `data/`，升级中途失败无退路 | 原地接管 + 一次性备份 + 回滚入口 + 「接管失败可回滚」用例 | L-05 / G-5；前置 **L-22** `core_settings` 拆分；known-issues #39 |
+| **数据接管 + 回滚** | 未设计。插件直接读写 `agents.yaml` 与 `data/`，升级中途失败无退路 | 原地接管 + 一次性备份 + 回滚入口 + 「接管失败可回滚」用例 | L-05 / G-5；前置 **L-22** `core_settings` 拆分（乙方案·分文件，[§4.8.1](pluginization/agent_pluginization.md)）；known-issues #39 |
 | **性能基线** | 50ms/32token 合并、首字延迟差 ≤50ms 均未测 | 固定脚本压测，与迁移前数据对比并落文档 | L-06 / G-6；known-issues #40 |
 | **本地 zip 安装** | 只有仓库安装通道，无本地端点/UI 入口 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
 | **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面。**已收口（2026-10-31，片 1 / 片 3（桌面）+ 片 2 / 片 4 / Q-7 (a)（插件））**：点位表领域族清零（36 → 28 点位、29 → 9 命令）、撤 `tool.` / `agent.` 前缀禁令、落盘空壳读侧对账、两处门禁；两执行器改名成对称的 `local.*` / `ssh.*` 各 10 条 + 租约统一到插件侧 + tree.agent 换口 + 核心撤 `workspace/register` 与租约簿记 ⇒ **文件与终端两族真机已能打通**；让名的另一半由 tree.agent 在 `agent_tools` 站认领 `llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename`（插件仓 `b21e946`），compact / sample **命令名零改动**即恢复 | 真机复核 compact 的三条功能（总结调用 / 必读文件 / todo 快照） | **L-25 Q-5 / Q-7**；known-issues **#43**；契约 §8.4 落地状态 |
@@ -239,7 +239,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 
 | 项 | 现状证据（已核实） | 缺口 | 开展入口 |
 | --- | --- | --- | --- |
-| 数据接管 + 回滚 | 前置 **L-22 仍未开始**：核心 `core_settings.dart` 仍混装模型池 / token 节奏与平台开关（acceptance L-22 行）；`plugins/tree.agent/lib/` 内无备份 / 接管代码（只有 `paths.dart:5` 写了"同一文件只…"的布局口径）；known-issues #39 | **已拍板（D-5 + D-10）**：先拆 settings（平台级 vs 领域级），再只接管 `agents.yaml` + 会话历史，补「原地接管 + `.bak`/时间戳备份 + 回滚入口 + 接管失败可回滚」用例；工作空间不进本轮 | `packages/tree_core/lib/src/settings/core_settings.dart`、`plugins/tree.agent/lib/src/paths.dart:5`、known-issues #39 |
+| 数据接管 + 回滚 | 前置 **L-22 已拍板乙方案（D-10，2026-11-01）、未实施**：核心 `core_settings.dart` 仍混装模型池 / token 节奏与平台开关（acceptance L-22 行）；配套门禁「核心 `toMap()` 不得含任何领域键」已定、先红后绿（[§4.8.1](pluginization/agent_pluginization.md)）；`plugins/tree.agent/lib/` 内无备份 / 接管代码（只有 `paths.dart:5` 写了"同一文件只…"的布局口径）；known-issues #39 | **已拍板（D-5 + D-10）**：先拆 settings（乙方案·分文件），再只接管 `agents.yaml` + 会话历史，补「原地接管 + `.bak`/时间戳备份 + 回滚入口 + 接管失败可回滚」用例；工作空间不进本轮 | `packages/tree_core/lib/src/settings/core_settings.dart`、`plugins/tree.agent/lib/src/paths.dart:5`、known-issues #39、[§4.8.1](pluginization/agent_pluginization.md) |
 | 性能基线 | `tool/` 下**没有任何压测脚本**（只有 build / package / contract 检查类）；无迁移前后对比数据；known-issues #40 | 固定脚本：同 prompt / 同模型档 / 同会话长度，记首字延迟、每帧 token、帧率、CPU | 新建 `tool/bench_*.dart`；对照基线见 §4.3 |
 | 本地 zip 安装 | 安装通道只有 `POST /api/plugin/release/{id}/install`（`packages/tree_core/lib/src/server/core_server.dart:2784`，清单 2742 / 刷新 2759 / 卸载 2887）；全仓无 `install/local`；前端 `file_picker` 只用于工作空间文件同步 | **已拍板补端点（D-1）**：`POST /api/plugin/install/local`，复用仓库通道的安装后处理与面板流程；未实现前不算关闭 | `core_server.dart:2742-2890`、`packages/tree_core/lib/src/plugin/plugin_downloader.dart`（安装实现）、known-issues #38 |
 | 插件仓 CI | **两仓都没有 `.github/`**（路径不存在）；脚本 `tool/check_plugin_repo_contract.dart` 可跑（`--selftest` 5/5） | **已拍板（D-9）**：两仓都加 `.github`，插件仓独立 workflow 跑同一脚本 + 各插件 `dart analyze` / `dart test` | 插件仓根目录新增 `.github/workflows/`；脚本入口见 §5.2 第 4 步 |

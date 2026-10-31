@@ -2279,7 +2279,9 @@ markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断
 ### 根因
 
 存储布局已定为「插件自带 store + 原地接管」，但插件内**没有接管代码、备份与回滚用例**；
-`core_settings` 仍围绕单一 agent 功能设计，未拆分。
+`core_settings` 仍围绕单一 agent 功能设计，未拆分（2026-11-01 已拍板乙方案·分文件，
+细则与迁移顺序见 [agent_pluginization.md §4.8.1](pluginization/agent_pluginization.md)；
+配套门禁「核心 `toMap()` 不得含任何领域键」，落地时先红后绿）。
 
 ### 修复方向
 

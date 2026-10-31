@@ -251,7 +251,7 @@
 | L-14 | 历史已知问题：从仓库更新「运行中的内置插件」可能挂起 | 待复核 | 未找到对应回归用例（`test/` 无运行中更新场景） | 补一条「运行中更新」回归，确认是否已修 |
 | L-20 | 平台能力：按声明「逐 agent 单独起实例」 | 不支持（复核维持） | `PluginBus._hosts` 仍是 `Map<String, PluginHost>`（按 plugin id 唯一，`plugin_bus.dart:374`）；`granularity` 只做解析/序列化/重启比较，无按声明建实例分支（勘测见 [agent_pluginization.md §10.2](agent_pluginization.md#102-勘测插件平台是否支持按声明逐-agent-起实例)）。**新参考**：UI 侧已用 `_uiWindows`（plugin → window → host）实现“同 id 多实例”，stdio 侧尚未套用同一形状 | 本期由 `tree.agent` 内部调度；未来要支持需把 UI 的窗口表形状推广到 stdio（实例键 + 按需启停 + 按 `agent_id` 路由） |
 | L-21 | 插件仓禁止 import 核心包（CI 闸门） | **部分闭环（2026-10-25 更新）**：桌面仓合同用例 + 插件仓可独立运行的等价脚本 | tree-plugins CI 尚未实际挂载；脚本以单文件提供，CI 需加一步调用 | 已有 `plugin_repo_contract_test`（mutation 验证会变红）；新增 `tool/check_plugin_repo_contract.dart`：零三方依赖，扫全部插件 `.dart` 的 import/export 与 `pubspec.yaml` 依赖键，`--plugin-root` 可指向插件仓根，`--selftest` 5/5 通过；桌面仓根与 `plugins/` 根两次实跑均绿（11 插件 / 187 Dart / 6 pubspec）。下一步：把该文件放进 tree-plugins CI 可执行路径并加门禁步骤 |
-| L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | 未开始（复核维持） | 核心 `core_settings.dart` 仍同时持有 `CoreModelConfig` / `models` / `token_acquisition_rate` 与 `frame_rate` / heartbeat 等平台项 | 按 [§4.8](agent_pluginization.md#48-core_settingsdart-必须先拆分) 拆分；拆分前不得开始 A1 数据接管 |
+| L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | **已拍板乙方案（2026-11-01）、未实施** | 核心 `core_settings.dart` 仍同时持有 `CoreModelConfig` / `models` / `token_acquisition_rate` 与 `frame_rate` / heartbeat 等平台项 | 按 [§4.8.1](agent_pluginization.md) 分文件拆分（领域键落 `config/agent_settings.yaml`）；新增门禁「核心 `toMap()` 不得含任何领域键」（先红后绿）；拆分前不得开始 A1 数据接管 |
 | L-23 | 插件 scope 去领域化（`team_id/agent_id/session_id/mode_key`） | 未开始（复核维持） | `station_scope.dart:47-65` 四字段仍在；`execute_mounts.dart` / `station_instance.dart` 仍以 team/agent/session/mode 做 fail-closed 授权（勘测见 [§10.3](agent_pluginization.md#103-勘测插件-scope-仍含领域字段应去掉)） | 三步走：通用 `context` 先扩后收；授权搬到「执行器插件 + workspace 租约」；最后删字段。协议破坏性变更，需单独立项 |
 | L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | **已闭环（2026-10-25）** | 本地站 `plugin.local_executor.execute.local`（23/23 自检）；SSH 站 `plugin.ssh_executor.execute.ssh_workspace`（`8a5f6ee`）；本地 PTY 随插件分发（`lib/src/pty/`），终端 REST + 广播已接（见 L-26） | SSH 后台 hook 不支持 | — |
 | L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | **部分落地（2026-10-31 收到契约 §8 的片 1 / 2 / 3 / 4）**：本地/SSH 两个自建执行站命令表已对称成 `local.*` / `ssh.*` 各 10 条，`lease_id`、相对路径与可读错误已成型；terminal 改由 REST + 广播承载（不再进执行站命令表） | 错误码 `code` 字段链路与幂等还没落（契约 §4，片 5）；`llm.*` / `tool.*` / `agent.*` / `session.*` 无承接方（契约 §7 Q-7） | 把站点名、参数、错误码、幂等写进契约（执行站仍由插件内部定义）；**租约由执行器插件登记，核心只转发** |
@@ -328,7 +328,7 @@
 | L-19 | 已闭环 | `agent_api_contract.md`（`bda9df9`） | — | — |
 | L-20 | 不支持 | `PluginBus._hosts` 按 plugin id 唯一；`granularity` 仅元数据 | 平台立项 | 不在本期 |
 | L-21 | 部分闭环 | 桌面仓合同用例；新增 `tool/check_plugin_repo_contract.dart`（`--selftest` 5/5、11 插件 / 187 Dart / 6 pubspec 实跑绿）；插件仓 CI 未挂 | 插件仓 CI 接线 | P1 |
-| L-22 | 未开始 | 核心 `core_settings.dart` 仍混装模型池 / token 节奏与平台开关 | 无 | P1（L-05 前置） |
+| L-22 | 已定方案、未实施 | 乙方案·分文件（[§4.8.1](agent_pluginization.md)）：领域键归插件；核心仍是混装状态 | 门禁「核心 `toMap()` 不得含领域键」，先红后绿 | P1（L-05 前置） |
 | L-23 | 未开始 | `station_scope.dart` 四字段仍在，跨域授权仍依赖它们 | 单独立项 | P1（独立） |
 | L-24 | 已闭环 | 本地站 23/23 自检（含终端会话）；SSH 站 `8a5f6ee`；PTY 随 `local_executor` 分发，终端 REST + 广播已接 | — | — |
 | L-25 | 部分落地 | 本地/SSH 站点命令、`lease_id`、相对路径、可读错误已成型；后台 hook/错误码/幂等未统一 | L-24 | P3 |

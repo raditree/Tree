@@ -392,8 +392,14 @@ HTTP 面**已经迁完**（核心 router 无 `/api/settings/token-rate`，插件
 
 **门禁与测试**
 
-- 新增门禁：`CoreSettings.toMap()` 的键集**恰好等于**平台键集（出现任何领域键即红）；
-  核心源码里 `token_acquisition_rate` 只允许出现在迁移代码与测试中。
+- **新增门禁（2026-11-01 用户拍板，比文档更有约束力）：核心 `CoreSettings.toMap()`
+  不得包含任何领域键**。黑名单显式列全：`token_acquisition_rate`（token 速率）、
+  `models` / `model_*`（模型池）、`fallback_max_seqlen`。落地形态：
+  `packages/tree_core/test/core_settings_domain_key_gate_test.dart`——直接调 `toMap()`
+  断键集，同时扫核心 `lib/src/settings` 源码字面量（防"换个名字又加回来"）。
+  **预期先红后绿**：阶段 1 之前该用例必然失败（现状 `toMap()` 就带 `token_acquisition_rate`），
+  落地时先写用例、再看它转绿；**不允许**为了让门禁绿而写成空断言或跳过。
+  另一条保留约束：核心源码里 `token_acquisition_rate` 只允许出现在迁移代码与测试中。
 - 插件侧：阶段收尾后 `DomainSettings` 不得再回退读 `settings.yaml`（删掉兼容分支即验证）。
 - 契约数字不变（`delegated` 54 / agent 36 / `kept` 71），前端与 `delegate.dart` 行为不变。
 - 要改的既有测试：`packages/tree_core/test/settings_test.dart`（5 条 token 用例）、
@@ -527,7 +533,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | 6 | 领域测试（`agent/llm/team/tool/mcp` 相关用例）**随代码迁到插件仓** `tree_agent_loop`；核心只保留插件平台 / 协议 / 服务端测试 |
 | 7 | 模型供应商 Key 随插件明文落盘 + 权限收紧；落盘加密本期不做；「loader 注入」作废（§4.7） |
 | 8 | **插件不得 import 任何核心包**；复用只能走核心平台内置站（仅通用能力）、**执行器插件的自建执行站**，或 UI 的 REST 委派端点；通用小件由插件自备（§10.1） |
-| 9 | `core_settings.dart` 先按「平台级 / 领域级」拆分，拆分前不得开始 A1 数据接管（§4.8） |
+| 9 | `core_settings.dart` 先按「平台级 / 领域级」**分文件**拆分（乙方案，§4.8.1），拆分前不得开始 A1 数据接管 |
 | 10 | 插件 scope 必须去领域化：`team_id / agent_id / session_id / mode_key` 逐步移除，授权搬到「执行器插件 + workspace 租约」（§10.3） |
 | 11 | **执行与文件全部下沉**：本地命令 / PTY / 文件修改归 `local_executor`，远端归 `ssh_executor`；核心零 PTY、零文件操作、零租约簿记，只留站点转发与身份透传（§4.6；片 3 与契约 §8.3） |
 | 12 | **路由基线按实测冻结**：`tree.agent` = **36 条**（34 存量 + 2 新增），核心永久面 36 条；「裁剪到 25 条」的口径作废（那份 25 是数错的）。是否裁剪功能另立遗留项 L-27，不与 G 混做 |
