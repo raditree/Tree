@@ -239,6 +239,11 @@ void main(List<String> args) {
             });
           } else {
             event('silent');
+            // 沉默形态必须**真的不退**：核心关掉 stdin 之后，这个 isolate 就不再有任何
+            // 待处理句柄 ⇒ Dart 虚拟机自己就退出了，“彻底沉默但也不退”当场变成假前提
+            // （用例只能靠“进程死得比断言慢”侥幸通过，known-issues #42）。
+            // 空转定时器不发任何报文，只把事件循环钉住：它必须等到核心收尸才退。
+            Timer.periodic(const Duration(milliseconds: 500), (Timer timer) {});
             if (selfStopMs > 0) {
               Timer(Duration(milliseconds: selfStopMs), () => exit(0));
             }

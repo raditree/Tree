@@ -23,6 +23,25 @@ void main() {
 
   FileTreeStore newStore() => FileTreeStore(paths, log: logs.add);
 
+  /// 等目录**真的建出来**，而不是等挂钟。
+  ///
+  /// 构造器里的 `ensureLayout()` 是 fire-and-forget（`unawaited`），要等这个 isolate
+  /// 被调度到才跑得完；早先这里给固定 50ms，满负载时那次异步建目录还没落地，
+  /// `agents` 目录就不在（假红，known-issues #42「判据挂在挂钟上」）。
+  /// 到点还在不了 ⇒ 说明骨架真的没建，直接带路径明说。
+  Future<void> waitDirectory(String dir, {int timeoutMs = 2000}) async {
+    final DateTime deadline = DateTime.now().add(
+      Duration(milliseconds: timeoutMs),
+    );
+    while (!Directory(dir).existsSync()) {
+      if (DateTime.now().isAfter(deadline)) {
+        fail('等待 ${timeoutMs}ms 后目录仍未建立：$dir');
+      }
+      // 必须让出事件循环：阻塞式 sleep 会把 ensureLayout 永远排在后面。
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+  }
+
   // ① 与内存实现共享的行为契约
   runStoreContract('FileTreeStore', () => FileTreeStore(paths));
 
@@ -30,8 +49,6 @@ void main() {
   group('FileTreeStore 落盘', () {
     test('首次构造即建立 ~/.tree 目录骨架', () async {
       newStore();
-      // ensureLayout 是异步的：给它一个事件循环
-      await Future<void>.delayed(const Duration(milliseconds: 50));
       for (final String dir in <String>[
         paths.root,
         paths.configDir,
@@ -39,7 +56,7 @@ void main() {
         paths.agentsDir,
         paths.sessionsDataDir,
       ]) {
-        expect(Directory(dir).existsSync(), isTrue, reason: dir);
+        await waitDirectory(dir);
       }
     });
 

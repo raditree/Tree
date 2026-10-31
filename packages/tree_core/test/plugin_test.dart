@@ -347,9 +347,16 @@ void main() {
     expect(instance['status'], 'registered', reason: '插件还活着，只是健康度降级');
     expect(instance['degraded_reason'], contains('心跳丢失'));
 
-    // 恢复：插件重新回 ping ⇒ degraded 自动清除，进程始终没被杀
+    // 恢复：插件重新回 ping ⇒ degraded 自动清除，进程始终没被杀。
+    // 不能只跑一拍：pong 要经真子进程往返，满负载时这一拍的 ping 先超时（I 只有 50ms），
+    // 丢拍计数又被垫上去 ⇒ 判据挂在挂钟上就会假红（known-issues #42 同类）。
     gate.writeAsStringSync('go');
-    await bus.watchdog();
+    for (int round = 0;
+        round < 10 && bus.healthOf('deaf')['health'] != 'ok';
+        round++) {
+      await bus.watchdog();
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
     expect(bus.healthOf('deaf')['health'], 'ok');
     expect(bus.healthOf('deaf')['missed_heartbeats'], 0);
     expect(bus.instances(), hasLength(1));

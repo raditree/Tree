@@ -125,8 +125,15 @@ void main() {
     return bus;
   }
 
-  Future<void> settle(int ms) =>
-      Future<void>.delayed(Duration(milliseconds: ms));
+  /// 节拍由用例自己按的总线（A/B/C/E/F 全用它）：`start()` / `applyConfigs()` 会按
+  /// heartbeatInterval 挂一个**自主看门狗**，而这几条用例断言的是「第几拍才杀」
+  /// 「刚断开还不该有任何收尸」这类**按拍数**成立的性质——自主节拍在 `await` 期间
+  /// 偷偷记拍就会改掉这些状态（判失活 → 强杀 → 退出确认后销账，整条链自己跑完）。
+  ///
+  /// 间隔给 5 分钟等于把它摘掉：判活窗口本身没变（仍是 N=3 拍），拍改由用例显式
+  /// `watchdog()` 触发。这是 known-issues #42 的同一个毛病换个挂在墙上的钟——
+  /// 判据不许压在挂钟上。
+  PluginBus manualBus() => newBus(const Duration(minutes: 5));
 
   /// 等总线**真的又收到过一条入站证据**（丢拍被清零）——把「心跳在」这件事
   /// 挂在证据上，而不是挂在挂钟上。
@@ -147,6 +154,22 @@ void main() {
     fail('$id 在 5s 内没有新的入站心跳证据：前提「链路在、只是慢」已不成立');
   }
 
+  /// 等核心**真的确认了这个进程已经退出**（台账里那一行的 `exited` 变 true）。
+  ///
+  /// 与 [waitBeatEvidence] 同一理由：`process.exitCode` 的回调要等核心 isolate 被
+  /// 调度到才跑得动，而"过了 400ms 挂钟"不保证这一点已经发生（known-issues #42）。
+  Future<void> waitExitEvidence(PluginBus bus, String id) async {
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (DateTime.now().isBefore(deadline)) {
+      final Iterable<Map<String, dynamic>> rows = bus.reapingReadings().where(
+        (Map<String, dynamic> row) => row['plugin_id'] == id,
+      );
+      if (rows.isNotEmpty && rows.single['exited'] == true) return;
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    fail('$id 在 5s 内没有被核心确认退出：前提「它是自己退的」已不成立');
+  }
+
   List<String> idsOf(List<PluginReconcileAction> actions) => <String>[
     for (final PluginReconcileAction action in actions) action.pluginId,
   ];
@@ -154,13 +177,12 @@ void main() {
   // ── 用例 ───────────────────────────────────────────────────────────────
 
   test('A 心跳在、只是慢 ⇒ 跑很多拍看门狗也绝不收尸（D8 的正命题）', () async {
-    // 心跳间隔比“看门狗拍的节奏”密得多：这才是“链路在、只是慢”的真实形状。
-    // 反过来（拍比心跳密）本来就该被判失活，那不是本条要钉的东西。
-    // 每轮看门狗之前先等到新的入站证据（见 [waitBeatEvidence]）：判据挂在证据上，
-    // 窗口宽多少就不再取决于调度器抖多少。早先只把 120ms 撑到 360ms 去压抖动，
-    // 满负载跑全量时仍会被跨过（known-issues #42 同类），现在从根上钉死。
+    // 插件每 5ms 发一条通知，看门狗的拍由用例自己按（比心跳密得多也没关系：
+    // 每轮都先等到新的入站证据，丢拍因此永远只到 1）。
+    // 早先这里靠"把判活窗口从 120ms 撑到 360ms"去压调度抖动，满负载跑全量时仍会被
+    // 跨过（known-issues #42 同类），现在判据挂在证据上、节拍挂在用例上。
     writeEntries(entry('alpha', beatMs: 5));
-    final PluginBus bus = newBus(const Duration(milliseconds: 120));
+    final PluginBus bus = manualBus();
     await bus.start();
     expect(bus.instances(), hasLength(1));
 
@@ -194,7 +216,7 @@ void main() {
 
   test('B 判失活后才收尸，而且不得早于连续 N 拍（N=3）', () async {
     writeEntries(entry('alpha', beatMs: 0)); // 沉默但不退
-    final PluginBus bus = newBus(const Duration(milliseconds: 40));
+    final PluginBus bus = manualBus();
     await bus.start();
     writeEntries(entry('alpha', beatMs: 0, enabled: false));
     await bus.applyConfigs();
@@ -228,15 +250,17 @@ void main() {
   });
 
   test('C 自己退了就不用收尸：台账销账、killed=false', () async {
-    // 沉默，但 120ms 后自己退出；判活窗口 3×100ms = 300ms ⇒ 在它退出前不会判死
+    // 沉默，但 120ms 后自己退出。等的是「核心确实在退出证据上看见它走了」，不是
+    // 「过了 400ms 挂钟」：满负载时后者会在核心还没观测到退出之前就记满 3 拍，
+    // 于是把一个自己退了的进程当成赖着不退 ⇒ 收尸（实测假红，known-issues #42）。
     writeEntries(entry('alpha', beatMs: 0, selfStopMs: 120));
-    final PluginBus bus = newBus(const Duration(milliseconds: 100));
+    final PluginBus bus = manualBus();
     await bus.start();
     writeEntries(entry('alpha', beatMs: 0, selfStopMs: 120, enabled: false));
     await bus.applyConfigs();
 
-    await settle(400);
-    await bus.watchdog();
+    await waitExitEvidence(bus, 'alpha');
+    await bus.watchdog(); // 只有看门狗会销账：确认退出 ⇒ 台账清空
 
     expect(bus.straysKilled, 0, reason: '它是自己退的，不是被收的');
     expect(
@@ -291,7 +315,7 @@ void main() {
       ...entry('alpha', beatMs: 0),
       ...entry('beta', beatMs: 8),
     ]);
-    final PluginBus bus = newBus(const Duration(milliseconds: 40));
+    final PluginBus bus = manualBus();
     await bus.start();
     expect(bus.instances(), hasLength(2));
 
@@ -312,18 +336,20 @@ void main() {
       lessThan(1500),
       reason: '对账耗时 ${elapsed.elapsedMilliseconds}ms：等退出会把串行对账拖成长跑',
     );
+    // 两个都还挂在台账上：close() 没等退出，而它们也**真的还没退**（假插件在
+    // 沉默形态里钉住了自己的事件循环，否则这条断言只是在赌进程死得比断言慢）。
     expect(bus.reapingReadings(), hasLength(2));
-    expect(bus.straysKilled, 0, reason: '刚断开，还没到判失活的拍数');
+    expect(bus.straysKilled, 0, reason: '节拍归用例管：断开这一刻不该有任何收尸发生');
   });
 
   test('F 核心自己退出 ⇒ 赖着的进程被收尸，不留孤儿', () async {
     writeEntries(entry('alpha', beatMs: 8));
-    final PluginBus bus = newBus(const Duration(milliseconds: 40));
+    final PluginBus bus = manualBus();
     await bus.start();
     writeEntries(entry('alpha', beatMs: 8, enabled: false));
     await bus.applyConfigs();
     expect(bus.reapingReadings(), hasLength(1));
-    expect(bus.straysKilled, 0);
+    expect(bus.straysKilled, 0, reason: '节拍归用例管：这里唯一的杀意来自 close()');
 
     await bus.close();
     buses.remove(bus);

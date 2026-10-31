@@ -241,9 +241,16 @@ void main() {
     );
     expect(instance['degraded_reason'], isNotEmpty);
 
-    // 恢复：把闸门放下 ⇒ 下一拍 ping 得到回答 ⇒ degraded 自动清零
+    // 恢复：把闸门放下 ⇒ 之后的某一拍 ping 得到回答 ⇒ degraded 自动清零。
+    // 逐拍重试而不是只跑一拍：pong 要经真子进程往返，满负载时那一拍会先超时
+    // （I 只有 200ms），只跑一拍等于把判据挂在调度器上而不是行为上（known-issues #42）。
     gate.createSync();
-    await bus.watchdog();
+    for (int round = 0;
+        round < 10 && instanceOf(bus, 'slow')['health'] != 'ok';
+        round++) {
+      await bus.watchdog();
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
     final Map<String, dynamic> recovered = instanceOf(bus, 'slow');
     expect(recovered['health'], 'ok', reason: '恢复自动清除（不靠人手动碰）');
     expect(recovered['status'], 'registered');
