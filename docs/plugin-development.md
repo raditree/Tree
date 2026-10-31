@@ -613,10 +613,11 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 > - 其余（`fs.*` / `terminal.*` / `agent.*` / `llm.call` / `tool.*` / `session.*` /
 >   `ssh.*` / `usage.*`）—— **核心不再执行**。参数与回包形状仍然登记在这里，是因为
 >   那是各家执行器**共同的历史口径**（改形状等于改契约）；能不能下到，取决于有没有
->   插件把这一族申报成自己的自建执行站。下一片（`exec_station_contract.md` §8）把
->   本机侧改名成 `local.file.*` / `local.exec.command`，与 `ssh.*` 对称，并逐族交接给
->   `local_executor` / `ssh_executor` / `tree.agent`。在那之前，这些名字**除了插件自建
->   执行站外没有别的提供方**——下不中就是「暂无挂载位置」，核心不会假装跑过。
+>   插件把这一族申报成自己的自建执行站。族名已有承接方：本机侧 `local.file.*` /
+>   `local.exec.command` 归 `local_executor`、`ssh.*` 归 `ssh_executor`；
+>   `llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename` 归
+>   tree.agent 自建的 `agent_tools` 站（契约 §7 Q-7 (a)，插件仓 `b21e946`）。
+>   没被任何插件申报的名字，下不中就是「暂无挂载位置」，核心不会假装跑过。
 
 | 命令 | 参数 | 结果 payload | 说明 |
 |---|---|---|---|

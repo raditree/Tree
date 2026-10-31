@@ -203,6 +203,11 @@ A5（2026-10-25）起核心不再实现任何领域执行语义——这条口�
 > 但上表那**四行调用方**要：先定方向——这 20 条是从点位表**删掉**、把族名让给插件自建
 > （compact 的四个名字一个都不用改，由真正实现了它们的插件认领），还是**保留现状**、
 > 把所有调用方改到插件自建站的名字上。见 §7 Q-5。
+>
+> **本节是 2026-10-31 的现场记录，已随 §8.4 片 1 / Q-7 (a) 收口**：20 条全部从点位表
+> 摘除，`local.*` / `ssh.*` 由两个执行器认领，`llm.call` / `fs.read` / `tool.call` /
+> `agent.compact` / `session.rename` 由 tree.agent 的 `agent_tools` 站认领
+> （插件仓 `b21e946`），compact 与 sample 的命令名未改即恢复。
 
 ---
 
@@ -392,7 +397,7 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | Q-4b | 本机 REST 面把 `StateError` 一律映射成 **404**（`local_executor_plugin.dart:197-198`），而 SSH 侧同类"租约/会话不存在或已存在"是 **409**（`terminal_sessions.dart:117,259,271`） | **已拍板 → §8**：本机收成 409（404 在不变量里是"插件没装"的语义，不能兼作资源冲突） |
 | Q-5 | **20 条内置命令的定位**：它们既是 §2.4 那张"必然失败"的表，也是 §2.1 那 8 个"假别名"的根源，还是 compact 四条命令失败的原因——**先定方向才谈得上清** | **已拍板：走 A（删点位表 + 让名）**，2026-10-31。领域八族从 `StationPoints.executes` 整体摘掉，族名让给真正的实现方（`llm.*` / `tool.*` / `agent.*` / `session.*` / `usage.*` ⇒ tree.agent，`fs.*` / `terminal.*` ⇒ 由要做的人带着实现申报，本期不保留假可用）。让名同时必须撤 `_checkExecuteCommands` 的 `tool.` / `agent.` 前缀禁令，否则插件认不进来 |
 | Q-6 | 两个执行器的命令名要不要对称 | **已拍板 → §8**：本机改 `local.file.*` / `local.exec.command`，与 `ssh.*` 同后缀；限定词直接取 `StationModeKey` 的两个值 |
-| Q-7 | **片 4 只换到了 tree.agent 一家**：`compact` 的四条命令（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 `sample` 的四条演示开关，在片 1 让名之后**仍然没有任何承接方**，且不能靠换名解决——① `llm.* / tool.* / agent.*` 是 Q-5 A 里点名"让给 tree.agent"的族，但 tree.agent 今天没申报也没实现它们；② `fs.read → local.file.read` 换口需要一条 `local_lease_id`，而"agent → 工作空间目录"的解析只有 tree.agent（`_workspaceDirOf`）与 files（自己读 `agents/*.yaml`）各有一份，compact 再抄一份就是第三份漂移源 | **未拍板**，三条路：**(a)** tree.agent 在 `agent_tools` 站上申报并实现 `llm.call` / `tool.call` / `agent.compact` + 一条工作空间读命令，compact 改调它（领域命令回到唯一实现方，代价是 tree.agent 的站变大）；**(b)** compact 自己读 `agents/*.yaml` 解析目录并登记本机租约（改动只在 compact，但把同一份解析逻辑复制第三遍）；**(c)** 承认压缩的"必读文件"属于核心侧，撤掉这条 IO 依赖，只回摘要（改动最小，功能面收窄）。**建议 (a)**：与 Q-5 A 的"让名给真正的实现方"同一条线，不再新增重复解析 |
+| Q-7 | **片 4 只换到了 tree.agent 一家**：`compact` 的四条命令（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 `sample` 的四条演示开关，在片 1 让名之后**仍然没有任何承接方**，且不能靠换名解决——① `llm.* / tool.* / agent.*` 是 Q-5 A 里点名"让给 tree.agent"的族，但 tree.agent 今天没申报也没实现它们；② `fs.read → local.file.read` 换口需要一条 `local_lease_id`，而"agent → 工作空间目录"的解析只有 tree.agent（`_workspaceDirOf`）与 files（自己读 `agents/*.yaml`）各有一份，compact 再抄一份就是第三份漂移源 | **已拍板 → (a)**（2026-10-31，插件仓 `b21e946`）：tree.agent 在 `agent_tools` 站申报并实现这五条（`llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename`），compact 与 sample 的四条命令名**一字未改**即复活——命令按名全局路由，让名后的名字只要有人申报就通，不需要调用方换口。三条路：**(a)** tree.agent 在 `agent_tools` 站上申报并实现 `llm.call` / `tool.call` / `agent.compact` + 一条工作空间读命令，compact 改调它（领域命令回到唯一实现方，代价是 tree.agent 的站变大）；**(b)** compact 自己读 `agents/*.yaml` 解析目录并登记本机租约（改动只在 compact，但把同一份解析逻辑复制第三遍）；**(c)** 承认压缩的"必读文件"属于核心侧，撤掉这条 IO 依赖，只回摘要（改动最小，功能面收窄）。**建议 (a)**：与 Q-5 A 的"让名给真正的实现方"同一条线，不再新增重复解析 |
 
 ---
 
@@ -451,7 +456,7 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | 1 | 点位表删八族（Q-5 A）+ 撤 `tool.` / `agent.` 前缀禁令 + 落盘空壳对账 + §5 门禁 + 文档口径 | 桌面 | 无 |
 | 2 | 执行器改名（§8.1）+ 四条能力补齐（§8.2）+ `local.lease.register` + 两侧补 `source_plugin_id` 比对（§8.3） | 插件 | 片 1 先合（否则名字被内置点位表挡着） |
 | 3 | 撤协议面 `workspace/register` 与核心租约簿记（§8.3） | 桌面 | **片 2 已上线**，两片之间不能发版断档 → **已合（2026-10-31，插件仓 `2f30c5e`）** |
-| 4 | 调用方换口：tree.agent / compact / sample + 清 `reconnectSsh` 死代码 | 插件 | 片 2 |
+| 4 | 调用方换口：tree.agent / compact / sample + 清 `reconnectSsh` 死代码 + **Q-7 (a)：tree.agent 认领宿主五条命令** | 插件 | 片 2 |
 | 5+ | 已拍板的 `code` 字段链路（§4），码表新增 `lease_denied` | 两仓 | 片 1 |
 
 **落地状态（2026-10-31）**：
@@ -495,7 +500,16 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
   `workspace_root`」——它现在是不变量里**唯一**的核心侧落点。
   版本耦合：本轮两仓必须同发版；旧产物（`tree.agent` < 片 4）会发一条被丢弃的
   `workspace/register`，旧 `file.*` 在片 1 起就已经不可用。
-- **片 5 未开始**；**#43 仍未收口**：compact 与 sample 的命令换口卡在 §7 Q-7
-  （那四条名字到今天没有承接方，不是回归，是 A 的另一半没做）。片 2 落地前领域命令
-  在真机上报「暂无挂载位置」，落地后 `local.*` / `ssh.*` 两族是**能打通**的，
-  只有 `llm.* / tool.* / agent.* / session.*` 还悬着。
+- **Q-7 (a) 已合（插件仓 `b21e946`，2026-10-31）**：tree.agent 在 `agent_tools` 站申报并实现
+  `kAgentHostCommands` 五条——`llm.call`（复用 `LlmJsonCaller`，缺省 JSON、显式 `text` 不发
+  `response_format`，用量按调用方会话落 `source=llm.call`）、`fs.read`（`workspaceIoFor`，
+  "agent → 工作空间目录"的解析仍只有这一份）、`tool.call`（贡献工具走 `plugin.toolCall`，
+  其余走与生成循环**同一份** `StationToolRunner`）、`agent.compact`（与 REST `/compact` 同一实现）、
+  `session.rename`（空标题显式拒绝，成功后广播 `session_renamed`）。compact 与 sample 的
+  四条命令名**一行未改**——命令按名全局路由，申报即生效。
+  站回包口径：payload 里 `error` 非空 ⇒ 插件回 `{error, payload}`，核心用
+  `StationReply.failedWith`（`station_runtime.dart`）与 `_forwardStationCommand` 的
+  `failedWith` 把 `ok:false` 与载荷**一起**带回调用方（`llm.call` 的"已付费正文"靠它抢救，
+  known-issues #31）；工具级失败仍是 `{text, is_error}`，不是站级失败。
+- **片 5 未开始**（`code` 八字段链路 + `tree_protocol` 码表 + §5 门禁其余断言）；
+  **#43 已随 Q-7 (a) 收口**（compact 四条与 sample 四个演示开关都有承接方）。

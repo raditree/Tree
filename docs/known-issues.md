@@ -2406,12 +2406,13 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
 
 ## #43 A5 撤了领域实现，没撤点位表：20 条内置命令"申报了、路由得到、执行必失败"，随包插件 compact 四条全踩在上面
 
-**状态**：**片 1（桌面侧）+ 片 2 / 片 3 / 片 4（两侧）已修，2026-10-31**；文件与终端
+**状态**：**已收口（2026-10-31）**。片 1（桌面侧）+ 片 2 / 片 3 / 片 4（两侧）已修；文件与终端
 两族在真机上**已经能打通**（`local.*` / `ssh.*` 各 10 条、两侧对称、租约全部在插件侧，
 核心那张 `_workspaces` 表与 `workspace/register` 协议面已随片 3 撤除）。
-剩下的是"让名"的另一半：`llm.* / tool.* / agent.* / session.*` 还没有实现方申报，
-compact 与 sample 因此仍踩在空名字上（见下方「片 2 / 片 4 收口记录」与契约 §7 Q-7）。
-方向已拍板走 A，见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5
+让名的另一半随 **Q-7 (a)** 落地（插件仓 `b21e946`）：`llm.call` / `fs.read` / `tool.call` /
+`agent.compact` / `session.rename` 由 tree.agent 在 `agent_tools` 站申报并实现，
+compact 四条与 sample 四个演示开关**命令名一字未改**即恢复可用。
+方向已拍板走 A，见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5 / Q-7
 与 §8.4 落地状态。
 **影响**：不是纸面漂移——`compact` 是核心内置插件条目之一（`builtin_plugins.dart:247`），
 它的总结调用、必读文件读取、todo 快照三条功能**在 A5 之后就是稳定失败**。
@@ -2530,10 +2531,17 @@ compact 与 sample 因此仍踩在空名字上（见下方「片 2 / 片 4 收�
 - 发版约束：两仓必须同发版。旧产物（`tree.agent` < 片 4）会发一条被丢弃的
   `workspace/register`；旧 `file.*` 从片 1 起就已不可用。
 
-**这条 issue 还没收口**：compact 的四条（`llm.call` / `fs.read` / `tool.call` /
-`agent.compact`）与 sample 的四个演示开关**至今没有承接方**。换名解决不了——
-`llm.* / tool.* / agent.* / session.*` 是 Q-5 A 里点名"让给 tree.agent"的族，而 tree.agent
-今天既没申报也没实现；`fs.read → local.file.read` 又需要一条 `local_lease_id`，
-"agent → 工作空间目录"的解析目前 tree.agent 与 files 各有一份，不该再抄第三份。
-三条出路与推荐口径写在 [exec_station_contract.md](exec_station_contract.md) §7 **Q-7**。
+### Q-7 (a) 收口记录（2026-10-31，插件仓 `b21e946`）
+
+compact 四条（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 sample 四个演示开关
+（另加 `session.rename`）**都有承接方了**：tree.agent 在 `agent_tools` 站申报
+`kAgentHostCommands` 五条并逐条实现（落点与口径见 [exec_station_contract.md](exec_station_contract.md) §8.4
+「Q-7 (a) 已合」）。**调用方零改动**——命令按 `command` 名字全局路由，让名后的名字
+一旦被插件申报就通；`fs.read` 因此也不需要 compact 去抄第三份"agent → 工作空间目录"解析。
+核心侧配套一处：`StationReply.failedWith` + `_forwardStationCommand` 的 `failedWith`
+让插件回 `{error, payload}` 时载荷不被丢弃（`llm.call` 解析失败时的模型正文，本条 issue
+最初的触发点 known-issues #31 就靠它）。
+
+**仍未做**：§8.4 片 5（`code` 八字段链路 + `tree_protocol` 码表 + §5 门禁其余断言），
+与 #43 的记录范围无关，不阻塞本条收口。
 

@@ -2697,7 +2697,11 @@ class PluginBus {
         },
       ),
     );
-    if (reply.isFailed) return StationCommandOutcome.failed(reply.error);
+    if (reply.isFailed) {
+      // 失败也带载荷（`failedWith` 的语义）：`llm.call` 这类"命令没跑成、产出有价值"
+      // 的场景靠它把已付费的模型正文交给调用方（known-issues #31）。
+      return StationCommandOutcome.failedWith(reply.error, reply.payload);
+    }
     final Object? payload = reply.payload;
     if (payload is! Map) {
       return StationCommandOutcome.failed(

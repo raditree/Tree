@@ -178,6 +178,10 @@ class StationReply {
 
   const StationReply.failed(this.error) : payload = null, reason = '';
 
+  /// **失败但带载荷**：插件回 `{error, payload}` 时用它（典型是 `llm.call` 拿到 200、
+  /// 正文却解析不出 JSON——原文是已付费的产出，不能丢，见 known-issues #31）。
+  const StationReply.failedWith(this.error, this.payload) : reason = '';
+
   /// 回包内容（语义随站点类型）。
   final Object? payload;
 
@@ -200,7 +204,11 @@ class StationReply {
       return const StationReply.failed('回包不是对象（键值映射）');
     }
     final String error = (raw['error'] ?? '').toString();
-    if (error.isNotEmpty) return StationReply.failed(error);
+    if (error.isNotEmpty) {
+      // 失败也保留载荷：`{error, payload}` 是执行站允许的形态（与
+      // `StationCommandOutcome.failedWith` 同一口径）。其它站点在失败时忽略载荷。
+      return StationReply.failedWith(error, raw['payload']);
+    }
     return StationReply.ok(raw['payload'], (raw['reason'] ?? '').toString());
   }
 }
