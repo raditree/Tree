@@ -9,16 +9,16 @@
 
 ## 1. 一句话现状
 
-内核已收成**纯调度面**（39 条永久路由），agent / 文件 / 本机与 SSH 执行 / MCP / 压缩全部由插件承接，
+内核已收成**纯调度面**（40 条永久路由），agent / 文件 / 本机与 SSH 执行 / MCP / 压缩全部由插件承接，
 Flutter 前端已是一份可装卸的 `kind: ui` 插件（支持同插件多窗口、多 UI 插件并存）。
-**代码主干完成，剩下的是 4 项 P0 未开工、5 项真机验收（P1）、发版工程**（逐项展开见 [§7.4](#74-展开侦查2026-10-31只读核对)）。
+**代码主干与 P0 实现完成（2026-11-01）**：数据接管 / 回滚、性能基线、本地 zip 安装、执行站契约登记、插件仓 CI 均已落；剩余是 compact 真机复核（P1 环境）、5 项真机验收与发版（push / tag 待人工确认）。逐项展开见 [§7.4](#74-展开侦查2026-10-31只读核对)。
 
 | 基线 | 值 | 出处 |
 | --- | --- | --- |
-| 核心永久路由 | **39**（控制面 19 + 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4） | `ApiPaths.coreOwned` |
+| 核心永久路由 | **40**（控制面 20 含本地安装 + 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4） | `ApiPaths.coreOwned` |
 | 插件委派路由 | **54** | `ApiPaths.delegated` |
-| 契约全集 | **93**（39 + 54） | `contractRoutes` |
-| 可达路径白名单 | **71** | `ApiPaths.kept` |
+| 契约全集 | **94**（40 + 54） | `contractRoutes` |
+| 可达路径白名单 | **72** | `ApiPaths.kept` |
 | 待交接路由 | **0** | `pendingHandoffRoutes` |
 | 内置 Spec | 4（general-task / hard-task / team-meeting / plugin-creator） | `plugins/tree.agent/lib/src/spec/builtin_specs.dart` |
 | 核心内置插件条目 | 4（sample / compact / ssh_executor / self_updater） | `packages/tree_core/lib/src/plugin/builtin_plugins.dart` |
@@ -47,7 +47,7 @@ Flutter 前端已是一份可装卸的 `kind: ui` 插件（支持同插件多窗
 引导壳 Tree.exe（非 Flutter，不可卸载）
   ├─ 拉起内核；提供插件管理页兜底（无可用 UI 时）
 内核 tree_core（纯 Dart）
-  ├─ CoreServer：39 条永久路由 / 鉴权 / 路由覆盖度不变量
+  ├─ CoreServer：40 条永久路由 / 鉴权 / 路由覆盖度不变量
   ├─ PluginBus：插件进程表 · 站点总线 · 委派路由归属 · UI 窗口表
   └─ WsStationBridge：UI 订阅、四态投递（data / closed / lagged / reset）
 功能插件（stdio JSON-RPC 2.0）
@@ -99,13 +99,16 @@ UI 插件（WebSocket 客户端）
 
 | 套件 | 结果 |
 | --- | --- |
-| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped**（#42 第一轮修复后 15 轮全量连绿，含 5 轮 `-j 16` 超订；第二轮补掉四处挂钟判据与一处 fixture 假前提后再压 15 轮，全绿） |
-| `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁） |
-| 根仓 | `flutter analyze` 仅既有 10 issues（`tree_tunnel_protocol` + `thinking_window_test`，与插件化无关）；`flutter test` **886 passed** |
-| `plugins/tree.agent` | **363 passed** |
-| `plugins/ssh_executor` | **187 passed** |
-| `plugins/files` | **10 passed** |
-| `plugins/local_executor` | 自检 **23 passed** |
+| `packages/tree_core` | analyze 干净；`dart test` **644 passed / 2 skipped**（2026-11-01 实测，含本地安装 13 条；#42 两轮修复的 30 轮连绿记录仍有效） |
+| `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁；`coreOwned 40 / contract 94 / kept 72`） |
+| 根仓 | `flutter analyze lib` 干净；`flutter analyze lib test` 仅既有 7 issues（`thinking_window_test`，与插件化无关）；`flutter test` **886 passed**（2026-10-31 实测，此后未动 UI） |
+| `plugins/tree.agent` | **373 passed**（2026-11-01 实测，含接管/回滚 7 条） |
+| `plugins/ssh_executor` | **188 passed**（2026-11-01 实测） |
+| `plugins/files` | **10 passed**（2026-11-01 实测） |
+| `plugins/extra-tools` | **16 passed**（2026-11-01 实测） |
+| `plugins/mcp` | **18 passed**（2026-11-01 实测） |
+| `plugins/self_updater` | **16 passed**（2026-11-01 实测） |
+| `plugins/local_executor` | 无 `test/` 目录（只守 `dart analyze`）；设备自检 23 条在真机路径上 |
 
 ---
 
@@ -167,23 +170,22 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 
 ## 6. 仓库与发版状态
 
-| 项 | 状态（2026-10-31 实测） |
+| 项 | 状态（2026-11-01 实测） |
 | --- | --- |
 | 桌面仓分支 | `desktop`（`main` 是旧的服务端 Python 形态，不合并） |
 | 插件仓分支 | `master`（`plugins/` 内） |
-| 工作区 | 两仓均干净 |
-| 推送 | 桌面仓 **GitHub 已同步**到 `4b75dac`；**Gitee 落后 85 个提交**（`gitee/desktop` 停在 `477dbfc`）；插件仓 GitHub 已同步到 `85fa4f6` |
-| 版本号 | `pubspec.yaml` → `1.0.4+3`，**与已发布 tag 同号** |
-| Tag | 最新 annotated tag = `v1.0.4+3`（→ `41ccddf`，2026-10-19，已在 origin）；**插件化的 88 个提交未被任何 tag 覆盖** |
-| 发布资产 | **未挂**（setup / 插件 zip） |
+| 推送 | 桌面仓 HEAD `4fcedef`：`origin/desktop` 落后 **3** 个提交（`ae3c101`）、`gitee/desktop` 落后 **106** 个提交（`477dbfc`）；插件仓 HEAD `f4ca29c`：`origin/master` 落后 **2** 个提交（`4d5f788`） |
+| 版本号 | `pubspec.yaml` → **`1.0.5+1`**（2026-11-01 已 bump；`lib/app_version.dart` 同步，`test/version_info_test.dart` 18 条绿） |
+| Tag | 最新 annotated tag = `v1.0.4+3`（→ `41ccddf`，2026-10-19，已在 origin）；**插件化的提交仍未被任何 tag 覆盖**（新 tag 待 push 后打） |
+| 发布资产 | **未挂**（setup / 插件 zip）；Inno Setup 本机未安装（`iscc` 不在 PATH，`C:\Program Files*\Inno Setup*` 也没有） |
 
 > 原先本节写「未 push / 未打 tag」，与仓库实况不符，已按实测更正。
-> 由此 **D-4「沿用 `1.0.4+3`」不可行**：该版本已有 annotated tag 且已推到 origin，
-> 沿用等于给两个不同提交挂同一个版本号，必须 bump。
+> **D-4 已决**：插件化这一版用 **`1.0.5+1`**（`1.0.4+3` 已有 annotated tag 且已推到 origin，
+> 沿用等于给两个不同提交挂同一个版本号）。
 
 发版流程（细节见 [development.md](development.md) 发布检查单）：
 
-1. 两仓分别 push；桌面仓**两个远端都要推**（GitHub 已同步、Gitee 落后 85 个提交）；
+1. 两仓分别 push；桌面仓**两个远端都要推**（GitHub 落后 3 个、Gitee 落后 106 个提交）；
 2. `dart run tool/build_core.dart`、`dart run tool/build_plugins.dart`（逐个 `--selftest` + 写发布索引）；
 3. `dart run tool/package_windows.dart --flutter <flutter.bat>` → `dist/tree-desktop-<版本>-windows-x64.zip`；
 4. `dart run tool/package_ui_plugin.dart --build` → `tree-ui-default-<版本>.zip`；
@@ -199,13 +201,13 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 
 | 项 | 现状 | 完成标志 | 关联 |
 | --- | --- | --- | --- |
-| **数据接管 + 回滚** | 未设计。插件直接读写 `agents.yaml` 与 `data/`，升级中途失败无退路 | 原地接管 + 一次性备份 + 回滚入口 + 「接管失败可回滚」用例 | L-05 / G-5；前置 **L-22** `core_settings` 拆分（乙方案·分文件，[§4.8.1](pluginization/agent_pluginization.md)）；known-issues #39 |
-| **性能基线** | 50ms/32token 合并、首字延迟差 ≤50ms 均未测 | 固定脚本压测，与迁移前数据对比并落文档 | L-06 / G-6；known-issues #40 |
-| **本地 zip 安装** | 只有仓库安装通道，无本地端点/UI 入口 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
+| **数据接管 + 回滚** | **已完成（2026-11-01）**：前置 L-22 拆分先落（桌面仓 `cc1a920` + 插件仓 `cbdd8a5`），接管随后落（插件仓 `1d05b2d`：原地接管 `agents.yaml` + 会话历史、一次性 `.bak` 备份、覆盖式回滚、CLI `--takeover-status` / `--rollback-takeover`；`takeover_test.dart` 7 条含"接管失败可回滚"） | 原地接管 + 一次性备份 + 回滚入口 + 「接管失败可回滚」用例 | L-05 / G-5；known-issues #39 |
+| **性能基线** | **已建基线（2026-11-01）**：`plugins/tree.agent/tool/bench_stream_pipeline.dart` + `bench_baseline.json`，实测帧率贴配置值、首帧延迟 = 窗口 + 7~13ms；迁移前数据不可得（A5 已无实现且未留档），"32 token/帧"仅在 ≤800 token/s 成立（见 known-issues #40） | 固定脚本压测，与迁移前数据对比并落文档 | L-06 / G-6；known-issues #40 |
+| **本地 zip 安装** | **已完成（2026-11-01，桌面仓 `145f565`）**：`POST /api/plugin/install/local` + `PluginDownloader.installFromZip` + 前端面板「本地安装」按钮（`file_picker`）；`test/plugin_install_local_test.dart` 13 条 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
 | **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面。**已收口（2026-10-31，片 1 / 片 3（桌面）+ 片 2 / 片 4 / Q-7 (a)（插件））**：点位表领域族清零（36 → 28 点位、29 → 9 命令）、撤 `tool.` / `agent.` 前缀禁令、落盘空壳读侧对账、两处门禁；两执行器改名成对称的 `local.*` / `ssh.*` 各 10 条 + 租约统一到插件侧 + tree.agent 换口 + 核心撤 `workspace/register` 与租约簿记 ⇒ **文件与终端两族真机已能打通**；让名的另一半由 tree.agent 在 `agent_tools` 站认领 `llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename`（插件仓 `b21e946`），compact / sample **命令名零改动**即恢复 | 真机复核 compact 的三条功能（总结调用 / 必读文件 / todo 快照） | **L-25 Q-5 / Q-7**；known-issues **#43**；契约 §8.4 落地状态 |
 | **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径 + §8 已拍板统一口径）；**片 1 / 2 / 3 / 4 / 5 均已合**（2026-10-31，片 5 = 桌面仓 `8876254` + 插件仓 `f578894`）；`code` 八环链路、`tree_protocol` 码表、§5 门禁五条断言全部落地，门禁六条用例与 tree_core 全量 627 条跑绿（`ssh_lease_unknown` / `local_lease_unknown` 已归并为 `lease_unknown`） | 文档 §8.4 全部落地，门禁跑绿 | L-25 |
-| **插件仓 CI** | 脚本 `tool/check_plugin_repo_contract.dart` 已可跑（`--selftest` 5/5），未接进 tree-plugins CI | 插件仓流水线跑同一脚本 | L-21 |
-| **发版工程** | 见 §6，全部未执行 | push + tag + setup/zip 资产 | — |
+| **插件仓 CI** | **已完成（2026-11-01）**：插件仓 `.github/workflows/ci.yml`（`f4ca29c`：检出桌面仓拿同一份门禁脚本，跑 `--selftest` + 全仓扫描，再按矩阵对 7 个 Dart 插件跑 `dart pub get / analyze / test`；`local_executor` 无 test 目录只守 analyze）；桌面仓 `.github/workflows/ci.yml`（`4fcedef`：协议 / 核心 / 插件契约 / UI 四段）。两仓均为公开仓，跨仓检出无需 PAT；runner 与 SDK 都钉在维护版本 | 插件仓流水线跑同一脚本 | L-21 |
+| **发版工程** | **版本号已备（2026-11-01）**：`pubspec.yaml` / `lib/app_version.dart` → `1.0.5+1`（`test/version_info_test.dart` 18 条绿）；**构建产物 / push / tag / 挂资产未执行**（需人工确认）；Inno Setup 本机未安装，setup 一步待补 | push（两远端）+ tag + setup/zip 资产 | — |
 
 ### P1 · 真机验收（必须在有环境的机器上做）
 
@@ -239,11 +241,11 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 
 | 项 | 现状证据（已核实） | 缺口 | 开展入口 |
 | --- | --- | --- | --- |
-| 数据接管 + 回滚 | 前置 **L-22 已拍板乙方案（D-10，2026-11-01）、未实施**：核心 `core_settings.dart` 仍混装模型池 / token 节奏与平台开关（acceptance L-22 行）；配套门禁「核心 `toMap()` 不得含任何领域键」已定、先红后绿（[§4.8.1](pluginization/agent_pluginization.md)）；`plugins/tree.agent/lib/` 内无备份 / 接管代码（只有 `paths.dart:5` 写了"同一文件只…"的布局口径）；known-issues #39 | **已拍板（D-5 + D-10）**：先拆 settings（乙方案·分文件），再只接管 `agents.yaml` + 会话历史，补「原地接管 + `.bak`/时间戳备份 + 回滚入口 + 接管失败可回滚」用例；工作空间不进本轮 | `packages/tree_core/lib/src/settings/core_settings.dart`、`plugins/tree.agent/lib/src/paths.dart:5`、known-issues #39、[§4.8.1](pluginization/agent_pluginization.md) |
-| 性能基线 | `tool/` 下**没有任何压测脚本**（只有 build / package / contract 检查类）；无迁移前后对比数据；known-issues #40 | 固定脚本：同 prompt / 同模型档 / 同会话长度，记首字延迟、每帧 token、帧率、CPU | 新建 `tool/bench_*.dart`；对照基线见 §4.3 |
-| 本地 zip 安装 | 安装通道只有 `POST /api/plugin/release/{id}/install`（`packages/tree_core/lib/src/server/core_server.dart:2784`，清单 2742 / 刷新 2759 / 卸载 2887）；全仓无 `install/local`；前端 `file_picker` 只用于工作空间文件同步 | **已拍板补端点（D-1）**：`POST /api/plugin/install/local`，复用仓库通道的安装后处理与面板流程；未实现前不算关闭 | `core_server.dart:2742-2890`、`packages/tree_core/lib/src/plugin/plugin_downloader.dart`（安装实现）、known-issues #38 |
-| 插件仓 CI | **两仓都没有 `.github/`**（路径不存在）；脚本 `tool/check_plugin_repo_contract.dart` 可跑（`--selftest` 5/5） | **已拍板（D-9）**：两仓都加 `.github`，插件仓独立 workflow 跑同一脚本 + 各插件 `dart analyze` / `dart test` | 插件仓根目录新增 `.github/workflows/`；脚本入口见 §5.2 第 4 步 |
-| 发版工程 | 最新 annotated tag 仍 `v1.0.4+3`（插件化提交未被任何 tag 覆盖）；`dist/` 存在；远端 `origin`（GitHub）+ `gitee` 都在，本地分支已与 `origin/desktop` 齐平 | 按 §6 七步执行（bump 版本、两远端推、构建、打包、ISP、tag、挂资产） | §6 发布检查单 |
+| 数据接管 + 回滚 | **已完成（2026-11-01）**：桌面仓 `cc1a920` / 插件仓 `cbdd8a5` 落 L-22 乙方案分文件；插件仓 `1d05b2d` 落 `takeover.dart`（原地接管 `agents.yaml` + 会话历史、一次性 `.bak`、覆盖式回滚、CLI `--takeover-status` / `--rollback-takeover`），`takeover_test.dart` 7 条 | 工作空间不进本轮；真机升级演练待做（P1） | `plugins/tree.agent/lib/src/takeover.dart`、known-issues #39 |
+| 性能基线 | **已建基线（2026-11-01）**：新增 `plugins/tree.agent/tool/bench_stream_pipeline.dart`（脚本引擎 → `TokenPacer` → `_ChunkPump` → 记录 hub，零外部依赖）与 `tool/bench_baseline.json`；实测 6 组（40/200/1000 token/s × 25/20fps）帧率贴配置值、首帧延迟 = 窗口 + 7~13ms；结论与边界写进 known-issues #40 | 迁移前实测不可得（A5 撤实现时未留档），基线以本次数字为准、同参数重跑对比 | 脚本 `--runs/--tokens/--history/--rates/--fps` 可调；见 known-issues #40 |
+| 本地 zip 安装 | **已完成（2026-11-01，桌面仓 `145f565`）**：`ApiPaths.pluginInstallLocal` + `core_server._installPluginLocal` + `PluginDownloader.installFromZip`（`_readLocalEntry` / `_normalizeZipEntry`，卸载支持 `plugins/<id>/`）+ 前端 `ApiService.installPluginLocal` 与面板「本地安装」按钮；`test/plugin_install_local_test.dart` 13 条 | 无（真机点一下按钮即可复验） | `core_server.dart`、`plugin_downloader.dart`、known-issues #38 |
+| 插件仓 CI | **已完成（2026-11-01）**：插件仓 `f4ca29c`、桌面仓 `4fcedef`；插件仓 workflow 跨仓检出桌面仓拿同一份门禁脚本（两仓公开，无需 PAT），矩阵覆盖 7 个 Dart 插件；本地已逐个验证 6 个包的 analyze/test 全绿（`local_executor` 无 test 目录只守 analyze） | 首次 CI 跑在 GitHub 侧的真实结果（本地无法代跑） | `.github/workflows/ci.yml`（两仓）、§5.2 第 4 步 |
+| 发版工程 | **版本号已备（2026-11-01）**：`pubspec.yaml` / `lib/app_version.dart` → `1.0.5+1`；最新 annotated tag 仍 `v1.0.4+3`（插件化提交未被任何 tag 覆盖）；桌面仓 `origin` 落后 3 / `gitee` 落后 106、插件仓 `origin/master` 落后 2；`dist/` 存在；Inno Setup 本机未安装 | 按 §6 七步执行；**构建 / push / tag / 挂资产需人工确认**（Inno Setup 需先装） | §6 发布检查单 |
 
 **P1（真机验收）**
 
@@ -265,7 +267,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 | L-18 UI 视图文档对齐 | `docs/ssh-tunnel-protocol.md:363-369` 描述的 `ui/manifest` 只发一次 + 之后 `ui/update`、动作判据在 `params['event']` —— **已经是当前协议**，不是旧协议；`plugin_ui_action` 仍在使用（`plugins/sample` / `terminal_probe` 按 `event` 通知处理，裸 `method` 仅作老核心兼容）；`plugin-development.md:922` 的退役声明不冲突 | 要做的是**补一句口径**（"这是当前协议"）并全仓复核，**不是删段**；顺带可修 §7 P3 的「35 个点位」旧数字 |
 | L-20 stdio 多实例 | `plugin_bus.dart:290` `Map<String, PluginHost> _hosts`，键＝`config.id`（**一插件一宿主**）；无任何 `(plugin_id, agent_id)` 键痕迹；站点 id 也按插件 id | 改动面＝宿主表键 + 站点命名空间 + 委派按信封 `agent_id` 路由 + 每实例看门狗/并发上限；属平台立项 |
 | L-23 scope 去领域化 | `packages/tree_core/lib/src/plugin/station_scope.dart:5`（四字段 `team_id/agent_id/session_id/mode_key`）、`:117-129`（序列化进 wire 的 `scope` map）；mode_key 已明确不兜底成 `local`（`:103-106`） | **侦查已完成（D-2，本期不实现）**：见 [pluginization/scope-de-domainization-recon.md](pluginization/scope-de-domainization-recon.md)；下期按 S0~S4 执行（mode_key → team_id 两步下沉，agent/session 保留） |
-| L-27 功能裁剪 | 路由口径 36/54/93/71 出自 `ApiPaths`（§1 基线表）；候选裁剪项**都还有实现与调用方**——`token-rate` 在 `plugins/tree.agent/lib/src/delegate.dart:59,531-544` 与 `tree.agent_plugin.dart:1730` 自检、前端设置页仍在用 | 缺的是**真实使用数据**与产品决策，不是代码清理；不要与迁移混做 |
+| L-27 功能裁剪 | 路由口径 40/54/94/72 出自 `ApiPaths`（§1 基线表）；候选裁剪项**都还有实现与调用方**——`token-rate` 在 `plugins/tree.agent/lib/src/delegate.dart:59,531-544` 与 `tree.agent_plugin.dart:1730` 自检、前端设置页仍在用 | 缺的是**真实使用数据**与产品决策，不是代码清理；不要与迁移混做 |
 | L-30~L-34 契约复测 | L-30：`plugins/tree.agent/lib/src/delegate.dart:81-105` `_bodyOf` 抛 `FormatException`（未统一成 400，顶层兜底待复核）；L-31：`packages/tree_protocol/lib/src/api_paths.dart:33-35` 仍是双 `{memberId}`，tree.agent 申报用 `{leaderId}`；L-32 `createAgent` 仍缺建成员参数；L-33 三处（未知 session 200 / DELETE 200 / 空 body token-rate）未复测；L-34 `sub_` id 语义未定 | 全部等 G-1 行为基线冻结后单独评审；L-31 必须核心 + 前端 + 插件 + 契约常量同批改 |
 
 ---
@@ -274,7 +276,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 
 ### 8.1 核心侧
 
-1. 核心**只**硬编码 `ApiPaths.coreOwned` 的 39 条；不得为任何插件路由写专用 handler。
+1. 核心**只**硬编码 `ApiPaths.coreOwned` 的 40 条；不得为任何插件路由写专用 handler。
 2. 核心不认识 agent / 会话 / 团队 / 模型 / 文件 / 终端等任何领域概念。
 3. 委派层只做路由、身份透传、响应形状校验；四要素 fail-closed 校验留在核心，不下放插件。
 4. 转发执行站命令时**无条件删除**调用方传入的 `root`，只注入租约根（路径守卫不可绕过）。
@@ -316,7 +318,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 
 | 关注点 | 从哪读起 |
 | --- | --- |
-| 核心路由（39 条） | `packages/tree_core/lib/src/server/core_server.dart` |
+| 核心路由（40 条） | `packages/tree_core/lib/src/server/core_server.dart` |
 | 插件平台（进程 / 站点 / 委派 / 窗口） | `packages/tree_core/lib/src/plugin/plugin_bus.dart`（大文件，按符号搜） |
 | UI 进程与窗口号 | `packages/tree_core/lib/src/plugin/ui_host.dart` |
 | UI WS 订阅桥 | `packages/tree_core/lib/src/plugin/station_ws_bridge.dart` |

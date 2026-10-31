@@ -22,7 +22,7 @@
 
 1. UI 前端可安装、卸载、启停、替换，与现有插件走**同一条**分发/落盘/生命周期管道。
 2. 主题、布局、窗口内形态（主界面 / 悬浮球 / 面板）全部由 UI 插件自己决定；核心只负责**进程级窗口实例**（多窗口 = 多进程）与窗口身份（`w1`/`w2`），不解释窗口内容。
-3. 核心的 REST 面收束为 **39 条方法路由**：平台控制面 19（含 UI 多窗口 3）、传输设置 9、引导壳 3、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（36 条移交 agent 插件）。
+3. 核心的 REST 面收束为 **40 条方法路由**：平台控制面 20（含 UI 多窗口 3、本地 zip 安装 1）、传输设置 9、引导壳 3、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（36 条移交 agent 插件）。
 4. 领域端点 **15 条路径 / 18 条方法路由**（Spec 2、MCP 3、文件 13）迁给领域插件；**Git 3 条已按用户决定删除（2026-10-25）**。
 5. **agent 能力完全剥离为插件**（承接方见 [agent\_pluginization.md](agent_pluginization.md)），功能零丢失。
 6. 全部 UI 被卸载后，系统仍可恢复：由一个**不可卸载的极小引导壳**提供插件管理。
@@ -181,14 +181,14 @@
 
 ***
 
-## 4. API 端点归属总表（终态 93 条方法路由 / 70 条路径）
+## 4. API 端点归属总表（终态 94 条方法路由 / 70 条路径）
 
 > 判据：**卸载的是能力，端点跟着能力走。** 只把端点搬走、能力仍在核心，属于纯代理，不算卸载。
-> 2026-10-25 重算：核心 39（36 + UI 多窗口 3）+ agent 36（含 2 条新增）+ spec 2 + mcp 3 + files 13 = 93；**git 3 条已按用户决定删除**（不再属于契约）。
+> 2026-11-01 重算：核心 40（36 + UI 多窗口 3 + 本地 zip 安装 1）+ agent 36（含 2 条新增）+ spec 2 + mcp 3 + files 13 = 94；**git 3 条已按用户决定删除**（不再属于契约）。
 
-### 4.1 核心永久面（39 条）
+### 4.1 核心永久面（40 条）
 
-**平台控制面（19）** — 装插件的前提，也是引导页唯一依赖。
+**平台控制面（20）** — 装插件的前提，也是引导页唯一依赖。
 
 | 端点                                                                                             | <br />                           | <br />                                                                    |
 | ---------------------------------------------------------------------------------------------- | :------------------------------- | :------------------------------------------------------------------------ |
@@ -196,6 +196,7 @@
 | \`GET                                                                                          | POST /api/plugin/configs`、`PATCH | DELETE /api/plugin/configs/{id}`、`POST /api/plugin/configs/{id}/restart\` |
 | `GET /api/plugin/builtins`、`POST .../{id}/enable`、`POST .../{id}/disable`                      | <br />                           | <br />                                                                    |
 | `GET /api/plugin/release`、`POST .../refresh`、`POST .../{id}/install`、`POST .../{id}/uninstall` | <br />                           | <br />                                                                    |
+| `POST /api/plugin/install/local`（2026-11-01 新增，离线 zip）                                   | 与仓库通道共用安装后处理（依赖闸门 → 写 `plugins.yaml` → 热应用） | <br /> |
 | `GET /api/plugin/stations/{id}`、`PATCH .../{id}/config`、`POST .../{id}/subscribers/{key}`      | <br />                           | <br />                                                                    |
 | `GET /api/plugin/windows`（列出窗口）、`POST /api/plugin/windows`（新建窗口）、`DELETE /api/plugin/windows/{id}`（全关） | UI 多窗口：进程必须由核心拉起 | <br /> |
 
@@ -314,19 +315,19 @@
 
 | 分类 | 路径 / 方法路由 | 归属 |
 | --- | --- | --- |
-| 核心永久面 | 29 / 39（含 UI 多窗口 3） | `tree_core` |
+| 核心永久面 | 29 / 40（含 UI 多窗口 3、本地 zip 安装 1） | `tree_core` |
 | agent 面 | — / 36（34 存量 + 2 新增） | `tree.agent` 插件 |
 | 领域面 JSON | — / 5（spec 2 + mcp 3） | `spec` / `mcp` |
 | 领域面二进制 | — / 13（files） | `files` |
-| **合计** | **70 / 93** | |
+| **合计** | **70 / 94** | |
 
-> 93 条方法路由（`coreOwned` 39 + `delegated` 54）。**Git 3 条已删除**；旧「93」口径含 git，不再适用（当前 93 = 39 + 54）。
+> 94 条方法路由（`coreOwned` 40 + `delegated` 54）。**Git 3 条已删除**；旧「93」口径含 git，不再适用（当前 94 = 40 + 54）。
 >
-> `ApiPaths.kept` 保持**路径**集合语义（71 条）：契约 93 条方法路由去重为 70 条路径，其中 `DELETE /api/files/{workspaceId}` 与 GET 共用常量（`fileDelete` 是 `files` 的别名）只列一次；另加执行器插件的 2 条终端路径（`/api/terminal/{local|ssh}/sessions`，插件申报、不在 93 条契约内）。契约的方法路由维度由下面的静态集合表达。
+> `ApiPaths.kept` 保持**路径**集合语义（72 条）：契约 94 条方法路由去重为 70 条路径，其中 `DELETE /api/files/{workspaceId}` 与 GET 共用常量（`fileDelete` 是 `files` 的别名）只列一次；另加执行器插件的 2 条终端路径（`/api/terminal/{local|ssh}/sessions`，插件申报、不在 94 条契约内）。契约的方法路由维度由下面的静态集合表达。
 
 契约新增三个**方法路由**（`METHOD /pattern`）集合：
 
-- `ApiPaths.coreOwned`（39）：核心永久面，**只增不删**。交接完成后核心 router 的键集必须**恰好等于**它。
+- `ApiPaths.coreOwned`（40）：核心永久面，**只增不删**。交接完成后核心 router 的键集必须**恰好等于**它。
 - `ApiPaths.delegated`（54）：契约中归插件的全部方法路由（agent 36 + spec 2 + mcp 3 + files 13）。**git 3 已删除；只作契约与验收口径，运行期不再当白名单用**（L-28）。
 - `ApiPaths.pendingHandoffRoutes`（0）：A5 已删完核心域实现、G1 删除 git 后清零；保留空集合只为兼容旧门禁形状，不再登记迁移债。
 
@@ -344,7 +345,7 @@
 
 门禁随之改为（`test/server_test.dart`）：
 
-1. 核心 router 键集 == `coreOwned`（39 条）；
+1. 核心 router 键集 == `coreOwned`（40 条）；
 2. `coreOwned ∩ delegated == ∅`，`pendingHandoffRoutes` 为空集；
 3. 核心 router 的路径 ⊆ `ApiPaths.kept`（前端可调用面仍在契约内）。
 
@@ -686,7 +687,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 | 层           | 用例                                                                                      |
 | ----------- | --------------------------------------------------------------------------------------- |
-| 协议          | 契约集合自检（`coreOwned` 39 / `delegated` 54 / `pendingHandoffRoutes` 0、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀拒收、核心已实现同键标 shadowed）、新帧名登记、`api/delegate` 计数基线 |
+| 协议          | 契约集合自检（`coreOwned` 40 / `delegated` 54 / `pendingHandoffRoutes` 0、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀拒收、核心已实现同键标 shadowed）、新帧名登记、`api/delegate` 计数基线 |
 | 核心 · 站点 WS  | 订广播投递、越界订阅拒绝、`ui.hello` 身份不符拒绝、空 scope 通配、`topics[]` 过滤生效                               |
 | 核心 · UI 自建站 | 可注册广播；注册收集/中转/执行被拒；同 id 不同配置拒收；关一个窗口不销毁站点；最后连接断开注销并广播 `closed`；自环投递带 `origin_plugin_id` |
 | 核心 · UI 多窗口 | 同插件开第二个窗口（w1/w2 两个 pid、快照 `windows=2`、`TREE_UI_WINDOW_ID` 注入）；关一个窗口插件仍在线且不发 `closed`；最后一个窗口才下线；多个 UI 插件并存互不影响；窗口上限 / 非 UI 目标 409 |

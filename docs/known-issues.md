@@ -2245,7 +2245,7 @@ markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断
 
 ## #38 面板只能从发布仓库装插件，离线 zip 无入口
 
-**状态**：**已拍板（2026-11-01）：本期补端点** `POST /api/plugin/install/local`（复用仓库通道的安装后处理与面板流程），未实现前不算关闭（2026-10-26 记录；对应 acceptance L-10）
+**状态**：**已修复（2026-11-01，桌面仓 `145f565`）**（2026-10-26 记录；对应 acceptance L-10）
 
 ### 现象
 
@@ -2257,18 +2257,21 @@ markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断
 核心只实现了仓库通道 `POST /api/plugin/release/{pluginId}/install`，
 没有"本地 zip 安装"端点；UI 侧也没有文件选择与上传入口。
 
-### 修复方向
+### 修复（2026-11-01）
 
-二选一：
-1. 补 `POST /api/plugin/install/local`（文件选择 → 读 zip → 校验 `plugin.json` / 自校验 → 落盘），
-   与仓库通道共用同一套安装后处理（依赖检查、生命周期、失败回滚）；
-2. 明确"本地 zip 不在本期范围"，并在面板文案里说清只能走仓库。
+1. `POST /api/plugin/install/local`（`ApiPaths.pluginInstallLocal`，进 `coreOwned` 40 条），
+   `PluginDownloader.installFromZip` 与仓库通道共用同一套安装后处理（依赖闸门 → 写
+   `plugins.yaml` → 热应用）；目录形态 zip 由 `_normalizeZipEntry` / `_readLocalEntry` 归一，
+   卸载同时支持 `plugins/<id>/` 与单文件布局。
+2. 面板新增「本地安装」按钮（`FilePicker.pickFile` → `ApiService.installPluginLocal`）。
+3. `test/plugin_install_local_test.dart` 13 条（成功安装 / 清单非法 / 解压失败 / 依赖闸门 /
+   卸载目录形态 / 旧文件不动）。
 
 ---
 
 ## #39 从旧版本升级缺少数据接管、备份与回滚
 
-**状态**：未设计（2026-10-26；对应 acceptance L-05 / G-5，前置 L-22 `core_settings` 拆分）
+**状态**：已修复（2026-11-01；对应 acceptance L-05 / G-5；桌面仓 `cc1a920` / `cbdd8a5` / `1d05b2d`）
 
 ### 现象
 
@@ -2279,30 +2282,78 @@ markdown 的还原）；`http_sse_transport_test` 『有限重试』组钉截断
 ### 根因
 
 存储布局已定为「插件自带 store + 原地接管」，但插件内**没有接管代码、备份与回滚用例**；
-`core_settings` 仍围绕单一 agent 功能设计，未拆分（2026-11-01 已拍板乙方案·分文件，
-细则与迁移顺序见 [agent_pluginization.md §4.8.1](pluginization/agent_pluginization.md)；
-配套门禁「核心 `toMap()` 不得含任何领域键」，落地时先红后绿）。
+且当时 `core_settings` 未拆分（2026-11-01 已按乙方案·分文件完成，细则见
+[agent_pluginization.md §4.8.1](pluginization/agent_pluginization.md)）。
 
-### 修复方向
+### 修复（2026-11-01）
 
-按"原地接管 + 一次性备份（`.bak` / 时间戳目录）+ 显式回滚入口"实施；
-先完成 settings 拆分，再补升级路径与回归用例（含"接管失败可回滚"）。
+1. **先拆分 settings**（L-22，`cc1a920`）：核心 `core_settings` 分文件，领域键留在插件侧；
+   配套门禁「核心 `toMap()` 不得含任何领域键」已落地。
+2. **原地接管**：`plugins/tree.agent/lib/src/takeover.dart` 首次启动把 `agents/` 与 `data/`
+   各拍一份快照到 `<root>/backups/takeover-<时间戳>/`，顺序 = 复制到 `.part-<时间戳>`
+   → 改名成正式目录 → 写 `config/takeover.json` 标记；标记在且备份真实存在才算已接管。
+3. **失败不动用户数据**：任一步失败删掉半成品、不写标记、返回可读原因；标记在但备份
+   失踪 ⇒ 报失败且**不覆盖旧标记**（保留"那次备份去哪了"的线索，要求人工核对）。
+4. **接管失败不阻断业务**：`AgentRuntime` 启动时接管失败只写一行 stderr 并继续使用现有数据
+   （避免升级瞬间把用户挡在门外）。
+5. **显式回滚入口**：`tree.agent_plugin.dart --takeover-status <数据根>` /
+   `--rollback-takeover <数据根>`；回滚把备份覆盖回 `agents/` 与 `data/`（保留接管后新建
+   的文件）并删标记，下次启动重新接管。
+6. **用例**：`test/takeover_test.dart` 7 条 —— 首次接管备份并写标记 / 再次启动不重复备份
+   （标记即幂等键）/ 回滚覆盖旧数据且删标记 / 无接管记录时回滚拒猜路径 / 备份丢失时接管
+   报失败且不覆盖标记（回滚同样拒绝）/ 备份不可写时不写标记且用户数据原样 / 状态快照。
 
 ---
 
 ## #40 性能基线未测：合并发送与首字延迟
 
-**状态**：未测（2026-10-26；对应 acceptance L-06 / G-6）
+**状态**：已建基线（2026-11-01；对应 acceptance L-06 / G-6）；迁移前数据仍不可得
 
 ### 现象
 
 插件侧要求"50ms / 32 token 合并发送"、目标"首字延迟差 ≤ 50ms"，
 但迁移前后没有同条件对比数据，无法回答"迁到插件后是否变慢"。
 
-### 修复方向
+### 基线（2026-11-01 实测）
 
-固定脚本压测（同一 prompt、同一模型档位、同一会话长度），记录首字延迟、
-每帧 token 数、帧率与 CPU 占用；与迁移前核心内置实现对比后写进本文档。
+脚本：`plugins/tree.agent/tool/bench_stream_pipeline.dart`（零外部依赖，单文件）。
+原始结果：`plugins/tree.agent/tool/bench_baseline.json`。
+
+固定参数：输出 **256 token**（每增量 1 token = 2 字符，`token_scale=2.0`）、
+历史会话 **40 条**、每场景预热 1 轮 + 正式 3 轮；管道 = 脚本引擎 → `TokenPacer`
+→ `_ChunkPump` → 只记录不发送的 hub（**不含网络、不含真端点**）。
+环境：Windows / Dart 3.13.4 / i5-13400。
+
+| token/s | 帧率 | 窗口 | 首帧延迟 | 整轮 | 帧数 | token/帧 均 | token/帧 峰 | 实际帧率 | CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 40 | 25 | 40ms | 47ms | 6408ms | 160 | 1.6 | 2 | 25.0 | 1.0% |
+| 40 | 20 | 50ms | 62ms | 6408ms | 128 | 2.0 | 3 | 20.0 | 1.6% |
+| 200 | 25 | 40ms | 47ms | 1292ms | 32 | 8.0 | 10 | 24.8 | 0.3% |
+| 200 | 20 | 50ms | 63ms | 1282ms | 26 | 9.8 | 13 | 20.3 | 0.9% |
+| 1000 | 25 | 40ms | 47ms | 267ms | 7 | 36.6 | 49 | 26.2 | ≈0% |
+| 1000 | 20 | 50ms | 63ms | 266ms | 6 | 42.7 | 64 | 22.6 | ≈0% |
+
+### 结论
+
+1. **合并窗口达标**：实际帧率贴着配置值（25fps → 25.0/24.8/26.2；20fps →
+   20.0/20.3/22.6），帧窗口 40/50ms 均未越过 50ms 上限。
+2. **首帧延迟 = 一个帧窗口 + 7~13ms 调度开销**（47ms vs 40ms、62~63ms vs 50ms）。
+   这是管道自身的成本，可作为后续同参数重跑的对照量；**迁移前核心内置实现的实测
+   数据已不可得**（A5 已撤走实现且当时未留档），因此"与迁移前差值 ≤50ms"只能先以
+   本次数字为基准，下次改动同参数重跑对比——差值 ≤50ms 即达标。
+3. **"32 token/帧"只在 token 速率 ≤800 时成立**：合并只按时间窗（`frameWindowFor`
+   帧率），1000 token/s × 40ms = 40 token，20fps 时达 64 token（与结果一致）。
+   真实模型速率（40~200 token/s）下每帧 1~13 token，远低于 32。原口径出自插件→核心
+   **stdio 行式协议**的单行体积；当前走驻留进程广播站，不应为了压到 32 而把帧率反向
+   放大（帧越多带宽越差）。**若将来确有 32 上限要求，应在 `_ChunkPump.add` 里按累计
+   token 提前切帧，并同批更新 acceptance 口径**，不要在本基线里偷偷改语义。
+
+重跑（同一份脚本、同一组默认参数即可复现）：
+
+```powershell
+cd plugins\tree.agent
+dart run tool\bench_stream_pipeline.dart --runs=3
+```
 
 ---
 

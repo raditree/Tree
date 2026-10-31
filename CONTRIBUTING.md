@@ -94,7 +94,7 @@
   `package:tree_protocol`（第三方会单独 clone 插件仓，那边解析不到这两个包）。
   复用核心能力只有两条路：核心主动提供的**内置执行站命令**，或 UI 插件的 **REST 委派端点**。
   门禁：`tool/check_plugin_repo_contract.dart`（插件仓 CI 用同一份脚本，`--plugin-root .`）。
-- **路由归属**：核心只硬编码自己的**永久面**（`ApiPaths.coreOwned`，当前 39 条）；
+- **路由归属**：核心只硬编码自己的**永久面**（`ApiPaths.coreOwned`，当前 40 条）；
   域端点一律由插件启动时经 `system.collect.api.routes` 申报，核心只做归属转发与响应校验。
   插件不得申报 `coreOwned` 同键，也不得占用保留前缀（`/api/plugin`、`/api/bootstrap`、`/api/meta`、`/api/logs`、`/api/store`）。
 - **UI 只消费不提供**：UI 插件的功能调用一律走 REST 委派；WS 上行白名单只有

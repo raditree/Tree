@@ -24,7 +24,7 @@
 
 | ID | 操作 | 期望 |
 | --- | --- | --- |
-| A-1 | 运行路径覆盖度用例 | 核心 router 键集 == `coreOwned`（39）；`coreOwned ∩ delegated == ∅`；`pendingHandoffRoutes` 为空集；核心 router 路径 ⊆ `kept` |
+| A-1 | 运行路径覆盖度用例 | 核心 router 键集 == `coreOwned`（40）；`coreOwned ∩ delegated == ∅`；`pendingHandoffRoutes` 为空集；核心 router 路径 ⊆ `kept`（72） |
 | A-2 | 检查新增路径 | `/api/meta`、`/bootstrap`、`/api/bootstrap/session` 在 `kept` 内 |
 | A-3 | 编码/解码新帧 | `ui.hello`、`station/subscribe`、`station/unsubscribe`、`station_delivery`、`station/trigger`、`station/register`、`station/unregister` 往返一致 |
 | A-4 | 契约防漂移 | 删除任一路径或改任一帧名 ⇒ 契约测试变红（故意改一次验证后还原） |
@@ -239,19 +239,19 @@
 | L-02 | G-2 核心路由表去除领域路由 | **已完成（2026-10-25 独立复核）** | 实测 `CoreServer.router == ApiPaths.coreOwned` 36 条；`pendingHandoffRoutes` 已清零（G1 删 git 后）；`stubApiPaths` 为空 | — |
 | L-03 | G-3 领域帧改 `station_delivery` | **代码已接（2026-10-25），待真机签收** | 核心领域目录与领域帧生产代码已删；`tree.agent` 启动注册 `plugin.tree.agent.broadcast.events`，每帧以 `topic=tree.agent.<session>.<kind>` 经 `station/trigger` 发布；UI 订阅 + `FrameRouter` 还原旧帧名 | 缺口：真机双轨比对（帧序 / 丢帧 / closed / reset）与 50ms/32token 合并未做 | 按 E2E 跑一轮事件面，记录帧数与水位 |
 | L-04 | G-4 过渡映射删除 | 未开始（过渡代码**存在**，见 E 节更正） | 依赖 G-3 完成一个版本周期 | G+1 提交时删除映射代码 |
-| L-05 | G-5 数据接管（`agents.yaml` + 会话历史原地接管、备份、回滚） | 未设计 | 存储布局已定为「插件自带 store + 原地接管」，但插件内无接管/备份/回滚代码与用例 | 按原地接管写备份/回滚用例；前提是 L-22 settings 拆分完成 |
-| L-06 | G-6 性能基线（50ms/32 token 合并、首字延迟差 ≤ 50ms） | 未测 | 依赖 G-3 | 压测脚本 + 迁移前后对比记录 |
+| L-05 | G-5 数据接管（`agents.yaml` + 会话历史原地接管、备份、回滚） | **已完成（2026-11-01）** | 插件仓 `1d05b2d`：`plugins/tree.agent/lib/src/takeover.dart` 原地接管 `agents.yaml` + 会话历史、一次性 `.bak` 备份、覆盖式回滚、CLI `--takeover-status` / `--rollback-takeover`；`test/takeover_test.dart` 7 条（含「接管失败可回滚」）；前置 L-22 已先落 | 真机升级演练（P1 环境） |
+| L-06 | G-6 性能基线（50ms/32 token 合并、首字延迟差 ≤ 50ms） | **已建基线（2026-11-01）** | `plugins/tree.agent/tool/bench_stream_pipeline.dart` + `tool/bench_baseline.json`：6 组参数（40/200/1000 token/s × 25/20fps）实测帧率贴配置值、首帧延迟 = 窗口 + 7~13ms；迁移前实现已拆且未留档，基线以本次为准；"32 token/帧"仅在 ≤800 token/s 成立（详见 known-issues #40） | 后续改动同参数重跑对比（差值 ≤50ms 即达标） |
 | L-07 | G-7 agent 插件崩溃 → 领域端点 503 + UI 可读提示 | **已完成（2026-10-25）** | 核心委派层对「归属插件停用 / 启动失败 / 崩溃」回 503（C-2）；UI 侧 `ApiService._handleResponse` 识别 503 ⇒ `ServiceAvailability` 记原因，主界面顶部显示「服务不可用：…」提示条（可「知道了」关闭，领域端点下一次成功自动撤掉；平台面端点不参与清除）。用例：`test/service_availability_test.dart` 2 条 | 真机项：用可崩溃测试插件跑一次（崩溃 → 503 提示 → 重启插件后自动消失） | 与 L-03 同批真机验 |
 | L-08 | U-3 推送收口 `frame_router`（topic → 既有渲染入口） | **已完成（2026-10-25）** | 新增 `lib/io/frame_router.dart`（topic kind → `type`，补 `session_id`）+ `LegacyFrameBus`（多订阅者）；消息面板与团队页已注册；`test/frame_router_test.dart` 5 条通过 | 真机联调（`station/trigger` 实际投递） | 与 L-03 同批签收 |
 | L-09 | U-4 快照 `seq` 水位对齐（重连去重、无重复段落） | **已完成（2026-10-25）** | ① 核心**每次订阅成功都发 `reset`**（seq 是通道级计数，新通道从 1 开始；以前只在"同键重订"时发 ⇒ 断线重连会拿旧水位丢掉首批帧，E2E-04 丢帧根因）；② `FrameRouter` 把领域事件站的 `reset`/`lagged` 合成 `station_resync`；③ 消息面板收到即**整表重拉会话详情 REST**（tree.agent 承接）作为快照，补齐断线期间缺的帧 | 真机项：生成中拔网重连（E2E-04） | `ui_station_ws_test`（首次订阅即 reset）+ `frame_router_test`（resync 只对领域站） |
-| L-10 | U-2 「从面板安装本地 zip」 | 未实现 | 核心只有发布仓库安装（`/api/plugin/release/{id}/install`），无本地 zip 端点；UI 面板也只调发布仓库 | 要么补安装端点，要么明确该场景不在本期范围 |
+| L-10 | U-2 「从面板安装本地 zip」 | **已完成（2026-11-01，桌面仓 `145f565`）** | `POST /api/plugin/install/local`（`plugin_install_local` 进 `coreOwned`，40 条）+ `PluginDownloader.installFromZip`（目录形态 zip 归一、`plugins/<id>/` 卸载）+ UI 面板「本地安装」按钮；`test/plugin_install_local_test.dart` 13 条 | 真机点一次按钮复验（P1 环境） |
 | L-11 | U-6 多窗口（同插件多连接各自订阅、关窗不销毁共用站） | **已完成（2026-10-25）** | 多窗口 = 多进程：`POST /api/plugin/windows` 由核心拉起 `w1`/`w2`…（`TREE_UI_WINDOW_ID` 注入、`ui.hello.window_id` 回带）；关一个窗口不打断另一个，最后一个窗口才发 `closed`；多个 UI 插件互不挤占；托盘按回环端口锁选唯一归属 | 真机手工项：核心 + 两个窗口 + 两个 UI 插件跑一次 | `test/ui_windows_test.dart` 4 条 |
-| L-12 | C-11 删除领域端点核心实现（原文 18 路径/21 方法；git 3 方法已按 G1 删除） | **核心删除完成；mcp/spec/files 承接齐全；C-11 原顺序未满足** | A5 后核心 router 仅 39 条（36 + UI 多窗口 3）；mcp 3 由 mcp 插件承接；spec 2 由 tree.agent 承接（并新增原生 spec 工具）；files 13 由 files 插件承接，**SSH 缺口已于 2026-10-25 清零**（列表 size/mtime、分块读写、pdf 定读、syncToLocal、download_folder、原子 rename）；git 3 删除；C-1..C-10 未全绿即删除 | 补 C-1..C-10 验收；补回滚预案 |
+| L-12 | C-11 删除领域端点核心实现（原文 18 路径/21 方法；git 3 方法已按 G1 删除） | **核心删除完成；mcp/spec/files 承接齐全；C-11 原顺序未满足** | A5 后核心 router 仅 39 条（36 + UI 多窗口 3），2026-11-01 加本地安装 1 条后为 40；mcp 3 由 mcp 插件承接；spec 2 由 tree.agent 承接（并新增原生 spec 工具）；files 13 由 files 插件承接，**SSH 缺口已于 2026-10-25 清零**（列表 size/mtime、分块读写、pdf 定读、syncToLocal、download_folder、原子 rename）；git 3 删除；C-1..C-10 未全绿即删除 | 补 C-1..C-10 验收；补回滚预案 |
 | L-13 | loader 托盘 | 延后 | 源码明确写「本期不做 Windows 托盘图标」，以控制台菜单替代（`tool/tree_launcher/bin/tree_launcher.dart`；E-8 已按此口径） | 托盘实现单独排期，不影响其它项 |
 | L-14 | 历史已知问题：从仓库更新「运行中的内置插件」可能挂起 | 待复核 | 未找到对应回归用例（`test/` 无运行中更新场景） | 补一条「运行中更新」回归，确认是否已修 |
 | L-20 | 平台能力：按声明「逐 agent 单独起实例」 | 不支持（复核维持） | `PluginBus._hosts` 仍是 `Map<String, PluginHost>`（按 plugin id 唯一，`plugin_bus.dart:374`）；`granularity` 只做解析/序列化/重启比较，无按声明建实例分支（勘测见 [agent_pluginization.md §10.2](agent_pluginization.md#102-勘测插件平台是否支持按声明逐-agent-起实例)）。**新参考**：UI 侧已用 `_uiWindows`（plugin → window → host）实现“同 id 多实例”，stdio 侧尚未套用同一形状 | 本期由 `tree.agent` 内部调度；未来要支持需把 UI 的窗口表形状推广到 stdio（实例键 + 按需启停 + 按 `agent_id` 路由） |
-| L-21 | 插件仓禁止 import 核心包（CI 闸门） | **部分闭环（2026-10-25 更新）**：桌面仓合同用例 + 插件仓可独立运行的等价脚本 | tree-plugins CI 尚未实际挂载；脚本以单文件提供，CI 需加一步调用 | 已有 `plugin_repo_contract_test`（mutation 验证会变红）；新增 `tool/check_plugin_repo_contract.dart`：零三方依赖，扫全部插件 `.dart` 的 import/export 与 `pubspec.yaml` 依赖键，`--plugin-root` 可指向插件仓根，`--selftest` 5/5 通过；桌面仓根与 `plugins/` 根两次实跑均绿（11 插件 / 187 Dart / 6 pubspec）。下一步：把该文件放进 tree-plugins CI 可执行路径并加门禁步骤 |
-| L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | **已拍板乙方案（2026-11-01）、未实施** | 核心 `core_settings.dart` 仍同时持有 `CoreModelConfig` / `models` / `token_acquisition_rate` 与 `frame_rate` / heartbeat 等平台项 | 按 [§4.8.1](agent_pluginization.md) 分文件拆分（领域键落 `config/agent_settings.yaml`）；新增门禁「核心 `toMap()` 不得含任何领域键」（先红后绿）；拆分前不得开始 A1 数据接管 |
+| L-21 | 插件仓禁止 import 核心包（CI 闸门） | **已闭环（2026-11-01）** | 桌面仓 `plugin_repo_contract_test`（mutation 验证会变红）+ `tool/check_plugin_repo_contract.dart`（零三方依赖、`--plugin-root` / `--selftest` 5/5）；**两仓 `.github/workflows/ci.yml` 已落**（插件仓 `f4ca29c`、桌面仓 `4fcedef`）：插件仓流水线跨仓检出桌面仓拿同一份脚本，矩阵跑 7 个 Dart 插件的 `dart pub get / analyze / test`（`local_executor` 无 test 只守 analyze） | 首次 GitHub 侧实跑结果（本地无法代跑） |
+| L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | **已完成（2026-11-01，乙方案·分文件）** | 桌面仓 `cc1a920`：核心 `toMap()` 不再含领域键，领域键条件化删旧键（带备份）；插件仓 `cbdd8a5`：领域设置落 `config/agent_settings.yaml`（旧键回退 + 镜像）；门禁「核心 `toMap()` 不得含领域键」已先红后绿 | — |
 | L-23 | 插件 scope 去领域化（`team_id/agent_id/session_id/mode_key`） | 未开始（复核维持） | `station_scope.dart:47-65` 四字段仍在；`execute_mounts.dart` / `station_instance.dart` 仍以 team/agent/session/mode 做 fail-closed 授权（勘测见 [§10.3](agent_pluginization.md#103-勘测插件-scope-仍含领域字段应去掉)） | 三步走：通用 `context` 先扩后收；授权搬到「执行器插件 + workspace 租约」；最后删字段。协议破坏性变更，需单独立项 |
 | L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | **已闭环（2026-10-25）** | 本地站 `plugin.local_executor.execute.local`（23/23 自检）；SSH 站 `plugin.ssh_executor.execute.ssh_workspace`（`8a5f6ee`）；本地 PTY 随插件分发（`lib/src/pty/`），终端 REST + 广播已接（见 L-26） | SSH 后台 hook 不支持 | — |
 | L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | **部分落地（2026-10-31 收到契约 §8 的片 1 / 2 / 3 / 4）**：本地/SSH 两个自建执行站命令表已对称成 `local.*` / `ssh.*` 各 10 条，`lease_id`、相对路径与可读错误已成型；terminal 改由 REST + 广播承载（不再进执行站命令表） | 错误码 `code` 字段链路与幂等还没落（契约 §4，片 5）；`llm.*` / `tool.*` / `agent.*` / `session.*` 无承接方（契约 §7 Q-7） | 把站点名、参数、错误码、幂等写进契约（执行站仍由插件内部定义）；**租约由执行器插件登记，核心只转发** |
@@ -297,8 +297,8 @@
 | scope 去领域化 | **已定方向**：移除 `team_id/agent_id/session_id/mode_key`，授权搬到「执行器插件 + workspace 租约」→ L-23 |
 | 执行与文件 | **已定**：核心零 PTY / 零文件操作；本地执行、文件修改、终端归 `local_executor`，远端归 `ssh_executor`；执行站由**两个插件内部定义**（非核心内置）→ L-24~L-26 |
 | 核心职责 | 只做插件生命周期 / 站点总线 / 传输 / 通用键值存储与日志 / 认证；租约簿记与领域授权一律归插件（契约 §8.3） |
-| 路由基线 | **已定**：冻结实测 36 条（34 存量 + 2 新增）为基线；核心永久面 **39 条**（36 + UI 多窗口 3）；是否裁剪另立 L-27 |
-| 路由申报 | **目标形态（L-28 已落地）**：核心只硬编码自己的 **39 条**（36 基线 + UI 多窗口 3）；其余 **54 条**由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；放行规则为命名空间规则 + 保留前缀 + 同键申报标 shadowed（coreOwned 拒收），无静态白名单 |
+| 路由基线 | **已定**：冻结实测 36 条（34 存量 + 2 新增）为基线；核心永久面现为 **40 条**（36 + UI 多窗口 3 + 本地安装 1，2026-11-01）；是否裁剪另立 L-27 |
+| 路由申报 | **目标形态（L-28 已落地）**：核心只硬编码自己的 **40 条**（36 基线 + UI 多窗口 3 + 本地安装 1）；其余 **54 条**由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；放行规则为命名空间规则 + 保留前缀 + 同键申报标 shadowed（coreOwned 拒收），无静态白名单 |
 
 ### E. L-01~L-34 + G-1~G-7 最新状态矩阵（2026-10-25 审计）
 
@@ -311,12 +311,12 @@
 | L-02 | 已完成 | 实测 `router == ApiPaths.coreOwned` 36；`pendingHandoffRoutes` 为空；stub 为空 | — | P2 |
 | L-03 | 代码已接，待签收 | 事件站 `plugin.tree.agent.broadcast.events` + `FrameRouter` 已落地；真机双轨未跑 | L-01 事件面 | P2 |
 | L-04 | 未开始 | 过渡映射**确实存在**：`lib/io/frame_router.dart` 整层就是"topic → 旧帧名"的换收口（含 `LegacyFrameBus`，`test/frame_router_test.dart` 覆盖）；原"未发现过渡代码"已更正（2026-10-31 复核） | L-03 完成 + 一个版本周期 | P2（尾） |
-| L-05 | 未设计 | 插件无数据接管 / 备份 / 回滚代码与用例 | L-22、L-01 数据层 | P5 |
-| L-06 | 未测 | 无压测脚本与迁移前后对比记录 | L-03 | P2（G-3 后） |
+| L-05 | 已完成（2026-11-01） | `takeover.dart`：原地接管 + 一次性 `.bak` + 覆盖式回滚 + CLI 运维入口；`takeover_test.dart` 7 条 | L-22 已先落 | 真机升级演练 |
+| L-06 | 已建基线（2026-11-01） | `tool/bench_stream_pipeline.dart` + `bench_baseline.json`；6 组参数，帧率贴配置值、首帧延迟 = 窗口 + 7~13ms | — | P2（同参数重跑对比） |
 | L-07 | 已完成（2026-10-25） | 核心 503（C-2）+ UI `ServiceAvailability` 顶部提示条；`test/service_availability_test.dart` | G-2 | 真机崩溃用例 |
 | L-08 | 已完成（2026-10-25） | `frame_router.dart` + `LegacyFrameBus`；5 条用例通过 | — | 与 L-03 同批签收 |
 | L-09 | 已完成（2026-10-25） | 每次订阅发 `reset` + `station_resync` → 会话详情 REST 整表重拉；`ui_station_ws_test` / `frame_router_test` 钉住 | — | 真机 E2E-04 |
-| L-10 | 未实现 | 核心只有发布仓库安装端点；UI 面板也只走发布仓库 | 产品范围决定 | P1 |
+| L-10 | 已完成（2026-11-01） | `POST /api/plugin/install/local`（`coreOwned` 40）+ 面板「本地安装」按钮；`test/plugin_install_local_test.dart` 13 条 | L-28 | 真机点一次 |
 | L-11 | 已完成（2026-10-25） | 多窗口 = 多进程，两条诉求都已落地：① **同一插件多窗口**：`POST /api/plugin/windows` 由核心拉起 `w1`/`w2`…（`TREE_UI_WINDOW_ID` 注入、`ui.hello.window_id` 回带），关一个窗口不再打断另一个；② **多个 UI 插件并存**：`_uiWindows` 按插件分组，互不挤占；UI 侧托盘用回环端口锁选唯一归属，副窗口关窗即退出。核心 `_offlineNotified` 保证 `closed` 每世代只发一次 | — | 已闭环（`test/ui_windows_test.dart` 4 条） |
 | L-12 | 核心删除完成，承接到位 | mcp 3 已交接；spec 2 由 tree.agent 承接（+原生 spec 工具）；files 13 由 files 插件承接且 SSH 缺口已清零（2026-10-25）；git 3 已删；C-1..C-10 未全绿 | 补 C-1..C-10 验收 + 回滚预案 | P4 |
 | L-13 | 延后 | `tree_launcher.dart` 明示本期不做 Windows 托盘 | 单独排期 | P1 |
@@ -327,8 +327,8 @@
 | L-18 | 待复核（部分改） | `docs/plugin-development.md:922` 已声明旧协议退役；`docs/ssh-tunnel-protocol.md:363-369` 仍按 `ui/manifest` / `plugin_ui_action` 描述 | 文档修订 | P1 |
 | L-19 | 已闭环 | `agent_api_contract.md`（`bda9df9`） | — | — |
 | L-20 | 不支持 | `PluginBus._hosts` 按 plugin id 唯一；`granularity` 仅元数据 | 平台立项 | 不在本期 |
-| L-21 | 部分闭环 | 桌面仓合同用例；新增 `tool/check_plugin_repo_contract.dart`（`--selftest` 5/5、11 插件 / 187 Dart / 6 pubspec 实跑绿）；插件仓 CI 未挂 | 插件仓 CI 接线 | P1 |
-| L-22 | 已定方案、未实施 | 乙方案·分文件（[§4.8.1](agent_pluginization.md)）：领域键归插件；核心仍是混装状态 | 门禁「核心 `toMap()` 不得含领域键」，先红后绿 | P1（L-05 前置） |
+| L-21 | 已闭环（2026-11-01） | 两仓 `.github/workflows/ci.yml` 已落；插件仓跨仓检出同一份门禁脚本 + 7 插件矩阵 | D-9 | 首次 GitHub 实跑 |
+| L-22 | 已完成（2026-11-01） | 乙方案·分文件：核心 `toMap()` 去领域键（`cc1a920`）+ 插件 `config/agent_settings.yaml`（`cbdd8a5`）；门禁先红后绿 | — | — |
 | L-23 | 未开始 | `station_scope.dart` 四字段仍在，跨域授权仍依赖它们 | 单独立项 | P1（独立） |
 | L-24 | 已闭环 | 本地站 23/23 自检（含终端会话）；SSH 站 `8a5f6ee`；PTY 随 `local_executor` 分发，终端 REST + 广播已接 | — | — |
 | L-25 | 部分落地 | 本地/SSH 站点命令、`lease_id`、相对路径、可读错误已成型；后台 hook/错误码/幂等未统一 | L-24 | P3 |
@@ -344,8 +344,8 @@
 | G-2 | 已完成 | 同 L-02：router 36 == coreOwned，pending 0 | — | P2 |
 | G-3 | 已完成（代码侧，待真机双轨） | 核心不再产生领域帧；tree.agent 事件广播站 + UI `StationClient`/`FrameRouter` 已接（L-03/L-08） | G-1 | P2 |
 | G-4 | 未开始 | 无过渡映射代码可删 | G-3 + 一个版本周期 | P2（尾） |
-| G-5 | 未设计 | 无接管 / 备份 / 回滚实现 | L-22、L-05 | P5 |
-| G-6 | 未测 | 无 50ms/32 token 合并压测与首字延迟对比 | G-3 | P2（G-3 后） |
+| G-5 | 已完成（2026-11-01） | 同 L-05：接管 / 备份 / 回滚已落并有用例 | — | 真机演练 |
+| G-6 | 已建基线（2026-11-01） | 同 L-06：固定脚本 + 基线表（known-issues #40） | — | 同参数重跑对比 |
 | G-7 | 已完成（2026-10-25） | 同 L-07：核心 503 + UI 全局提示条；缺真机崩溃复现 | — | 真机 |
 
 ### F. 依赖顺序与可并行拆分（2026-10-25）

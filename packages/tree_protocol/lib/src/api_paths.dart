@@ -412,7 +412,7 @@ abstract final class ApiPaths {
     'DELETE $storeEntry',
   };
 
-  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 39 条（36 + UI 多窗口 3）。
+  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 40 条（36 + UI 多窗口 3 + 本地安装 1）。
   ///
   /// 历史：这里曾登记 52 条「核心仍实现、待交接」的域路由；A5 已删除核心实现，
   /// git 3 条也按用户决定从契约中删除。保留空集合只为兼容旧门禁形状；
