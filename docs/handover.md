@@ -99,7 +99,7 @@ UI 插件（WebSocket 客户端）
 
 | 套件 | 结果 |
 | --- | --- |
-| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped**（#42 修复后 15 轮全量连绿，含 5 轮 `-j 16` 超订） |
+| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped**（#42 第一轮修复后 15 轮全量连绿，含 5 轮 `-j 16` 超订；第二轮补掉四处挂钟判据与一处 fixture 假前提后再压 15 轮，全绿） |
 | `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁） |
 | 根仓 | `flutter analyze` 仅既有 10 issues（`tree_tunnel_protocol` + `thinking_window_test`，与插件化无关）；`flutter test` **886 passed** |
 | `plugins/tree.agent` | **363 passed** |
@@ -146,7 +146,7 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 3. 执行器 `file.*` 的条目必须是**工作空间根相对**，本机与 SSH 同形（否则 spec reset 路径会多一层）。
 4. 核心 `stdout` 只允许握手行，日志走 `stderr`；核心 stderr 若无人读且是管道，会在 shutdown 时卡住。
 5. 网络/LLM/时钟不进单测：用假传输、假时钟、可注入节拍器。
-6. 用例判据**挂在证据上，不要挂在挂钟上**（known-issues #42，已修两处）：
+6. 用例判据**挂在证据上，不要挂在挂钟上**（known-issues #42，两轮共修七处）：
    - 站点面：`publish` / 插件下线 / 站点注销都只作用于「通道已建好」的订阅，用固定
      sleep 等另一条连接的订阅帧处理完，满负载跑全量时会假红。订阅成功的同步回证是
      **点名本站的 `reset` 帧**；注册 / 注销没有确认帧，轮询核心状态或 `/api/meta` 的
@@ -155,6 +155,13 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
    - 收尸面：看门狗每轮记一次丢拍，判活窗口只有 3 拍，用例不能靠「跑很多轮 × 固定
      sleep」间接假设证据会到——每轮前先确认 `missed_heartbeats` 已被新入站心跳清零。
    - 放宽 sleep 治不了这一类：360ms 窗口照样被满负载跨过。
+   - **两个节拍源**也算挂在挂钟上：`PluginBus.start()` / `applyConfigs()` 会自己挂一个
+     自主看门狗，用例手按 `watchdog()` 时它仍在 `await` 期间偷记拍，把「判失活 → 强杀 →
+     销账」整条链自己跑完。断言按拍数成立的性质时，间隔要给到 5 分钟（摘掉自主节拍，
+     判活窗口本身不变），节拍归用例管。
+   - **fixture 的前提要能证伪**：`suspendable_plugin.dart` 的「沉默但不退」原先没有
+     钉住事件循环，核心关掉 stdin 后虚拟机自己就退了——用例一直只在赌进程死得比断言慢。
+     赌生死和赌时间戳是同一件事。
 
 ---
 
@@ -195,7 +202,8 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 | **数据接管 + 回滚** | 未设计。插件直接读写 `agents.yaml` 与 `data/`，升级中途失败无退路 | 原地接管 + 一次性备份 + 回滚入口 + 「接管失败可回滚」用例 | L-05 / G-5；前置 **L-22** `core_settings` 拆分；known-issues #39 |
 | **性能基线** | 50ms/32token 合并、首字延迟差 ≤50ms 均未测 | 固定脚本压测，与迁移前数据对比并落文档 | L-06 / G-6；known-issues #40 |
 | **本地 zip 安装** | 只有仓库安装通道，无本地端点/UI 入口 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
-| **执行站契约登记** | 站点名、命令表、`lease_id`、相对路径已成型；错误码与幂等未统一登记 | 契约文档 + 每命令错误码 + 幂等断言 | L-25 |
+| **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面（开关一开就稳定失败，压缩整段回退内置） | 按 Q-5 定方向后：点位表领域族清零并把族名让给实现方认领（或调用方全改自建站名），并补一条「申报的每个命令在真实接线下都有能跑的挂载位置」门禁 | **L-25 Q-5**；known-issues **#43** |
+| **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径）；**代码未动**：`code` 八字段链路、`tree_protocol` 码表、§5 门禁五条断言都还在纸面上 | 文档 §6 片 2~5 全部落地，门禁跑绿 | L-25 |
 | **插件仓 CI** | 脚本 `tool/check_plugin_repo_contract.dart` 已可跑（`--selftest` 5/5），未接进 tree-plugins CI | 插件仓流水线跑同一脚本 | L-21 |
 | **发版工程** | 见 §6，全部未执行 | push + tag + setup/zip 资产 | — |
 
@@ -290,7 +298,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 [ui-pluginization_acceptance.md](pluginization/ui-pluginization_acceptance.md)（验收台账）、
 [agent_pluginization.md](pluginization/agent_pluginization.md)（agent 承接范围）、
 [agent_api_contract.md](pluginization/agent_api_contract.md)（逐条契约与样例）、
-[known-issues.md](known-issues.md)（台账，当前最大编号 #42）。
+[known-issues.md](known-issues.md)（台账，当前最大编号 #43）。
 
 ---
 

@@ -2373,3 +2373,92 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
 关闭时属于侥幸；现在先等连接表真的降到 1。
 
 修复合计 **15 轮全量连绿**（其中 5 轮 `-j 16` 超订压测），每轮仍是 618 passed / 2 skipped。
+
+### 追加（同日，同一类的另外四处 + 一处假前提）
+
+第一轮修完再压 15 轮，仍有三处翻车，根因都在同一类上，但形态不同：
+
+1. **自主节拍 vs 用例节拍**：`PluginBus.start()` / `applyConfigs()` 自己会挂一个
+   `Timer.periodic(heartbeatInterval, watchdog)`。用例把节拍交给自己 `watchdog()` 手按，
+   断言的却是「第几拍才杀」「刚断开不该有任何收尸」这类**按拍数**成立的性质——
+   那个自主看门狗在 `await` 期间偷偷记拍，会把整条链（判失活 → 强杀 → 退出确认销账）
+   自己跑完。C 实测多出 1 次 `straysKilled`，A 则表现为「等不到新心跳证据」
+   （其实是被收尸后从台账里消失了）。这不是窗口不够宽，是**有两个节拍源**：
+   修法是把间隔设成 5 分钟（等于摘掉自主看门狗，判活窗口本身没变），节拍归用例管。
+2. **恢复类只跑一拍**：`degraded → ok` 的恢复用例 `await bus.watchdog()` 一次就断言
+   `health == 'ok'`。pong 要经真子进程往返，满负载时那一拍先超时，丢拍计数又被垫上去。
+   改成有界逐拍重试，判据落在可轮询的 `health` 上。
+3. **`file_store` 等固定 50ms**：构造器里的 `ensureLayout()` 是 `unawaited` 的，
+   改成轮询目录存在性。**注意必须让出事件循环**——用阻塞式 sleep 会把那次异步建目录
+   永远排在后面，直接把用例做死。
+4. **fixture 的假前提**（这一条最值）：`fixtures/suspendable_plugin.dart` 的「沉默形态」
+   只发一个 `event('silent')` 就返回。核心关掉 stdin 之后，这个 isolate 已无任何待处理
+   句柄 ⇒ **Dart 虚拟机自己就退出了**，于是「彻底沉默但也不退」这个前提从来就不成立，
+   用例只是在赌进程死得比断言慢。补一个空转 `Timer.periodic` 钉住事件循环，沉默态
+   必须等核心收尸才退。
+
+改完再压 **15 轮全量连绿**（618 passed / 2 skipped，每轮一致）。
+
+**教训（口径）**：赌「进程死得比断言慢」和赌「挂钟到点证据就到了」是同一件事；
+断言的前提要用**核心状态**（台账行、确认帧、可轮询字段）表达，不要用时间和次数表达。
+
+---
+
+## #43 A5 撤了领域实现，没撤点位表：20 条内置命令"申报了、路由得到、执行必失败"，随包插件 compact 四条全踩在上面
+
+**状态**：未修复，**待拍板**（方向见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5）。
+**影响**：不是纸面漂移——`compact` 是核心内置插件条目之一（`builtin_plugins.dart:247`），
+它的总结调用、必读文件读取、todo 快照三条功能**在 A5 之后就是稳定失败**。
+**发现时间**：2026-10-31，做 L-25 契约登记时逐条对照命令表撞出来的。
+
+### 现象
+
+`station/command` 下 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 这类命令，
+回包固定是：
+
+```
+命令 llm.call 已不在核心平台面（A5 起由 local_executor / ssh_executor / tree.agent 等插件自建执行站承接）
+```
+
+压缩插件因此每次都记一条「插件未接管（回 null），回退内置 compact」——
+即 **#31 / #27 当年调前缀缓存那套流程现在整段跑不到**。
+
+### 根因（三步，全静态可证，没有侥幸分支）
+
+1. `258a28c refactor(core)!: 卸载领域实现` 删掉核心 52 个领域文件后，
+   `ExecuteStationMounts._handle` 只处理 `plugin.*` 与 `station.*` 两族，
+   其余一律回上面那句（`execute_mounts.dart:115-119`）。
+2. 但**点位申报表没跟着收**：`StationPoints.executes` 仍申报 `fs.*`(7) / `terminal.*`(4) /
+   `agent.*`(3) / `llm.*`(1) / `tool.*`(2) / `session.*`(1) / `ssh.*`(1) / `usage.*`(1)
+   共 **20 条**（`station_points.dart:232,269,287,300,315,326,338,415`）。
+3. `_handleStationCommand` 的查表是**内置点位优先**（`plugin_bus.dart:5101`），
+   这 20 条永远命中内置点位 ⇒ 落到第 1 步那个死挂载位置。而插件也**不能认领**它们：
+   `_checkExecuteCommands` 见到 `StationPoints.allCommands` 里的名字直接拒
+   （`plugin_bus.dart:4281-4282`「是核心内置命令，插件不得自建同名命令」）。
+
+调用方一侧在 A5 时只改了一半：`tree.agent` 的工作空间工具确实换成了本机执行器申报的
+`file.*` / `exec.command`（`station_workspace_io.dart:46-108`），
+所以文件读写正常；**compact 与 sample 的命令名一行没改**
+（`compact_plugin.dart:62-65`、`builtin_plugins.dart:230` 的四个演示开关），
+`tree.agent` 里还留着一个发 `ssh.reconnect` 的 `reconnectSsh()`（`agent_runtime.dart:458-465`，
+今天没有调用方——UI 的重连按钮走 REST 委派）和一段给 `fs.*` / `terminal.exec`
+继续注入 `lease_id` 的分支（`agent_runtime.dart:793-796`）。
+
+### 为什么门禁没兜住
+
+- 插件侧 `--selftest` 都是**进程内直接调实现**（`local_executor_plugin.dart:266-336`
+  就是 `executor.execute('fs.write', …)`），不经核心路由，所以旧名字在自检里照样绿；
+- `plugin_station_test.dart` 这类用例是**测试进程自己 `station.mount` 一个假执行器**
+  （`test/plugin_station_test.dart:578-596`），钉的是站点层的白名单与隔离语义，
+  不经过 `ExecuteStationMounts`，测不到"生产里没人挂这条命令"；
+- 全仓没有一条用例断言「点位表申报的每个命令，在真实接线下都有一个能跑的挂载位置」。
+  这正是 L-25 §5 要补的第一条门禁断言。
+
+### 待定方向（Q-5，两条都能收口，差别在改谁）
+
+- **A（推荐）删点位 + 让名**：领域族从 `StationPoints.executes` 摘掉，内置名拦截随之失去对象，
+  族名由真正实现了它们的插件认领（`llm.*` / `tool.*` / `agent.*` / `session.rename` ⇒ tree.agent，
+  `fs.*` / `terminal.*` ⇒ local_executor）。compact 的四个名字**零改动**即复活。
+  代价：已落盘的内置执行站实例仍带旧白名单，要做一次「点位表是唯一来源」的对账。
+- **B 保表 + 改调用方**：20 条继续躺着，compact / sample / tree.agent 全部改用插件自建站的名字，
+  文档与提示语写清"这些名字必失败"。改动最小，但功能缺口留着，`/api/meta` 会继续对外申报一批点不动的命令。
