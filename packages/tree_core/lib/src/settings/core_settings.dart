@@ -297,12 +297,6 @@ class CoreSettings {
   /// 推送刷新帧率上限。
   static const int frameRateMax = 1000;
 
-  /// token 获取帧率下限（与前端声明范围一致）。
-  static const int tokenRateMin = 20;
-
-  /// token 获取帧率上限（= 近似不限速）。
-  static const int tokenRateMax = 1000;
-
   /// 心跳间隔 I 的允许区间（秒）：1s 已经比本地回环的抖动密得多，600s 是"最松"。
   static const int heartbeatIntervalMin = 1;
   static const int heartbeatIntervalMax = 600;
@@ -342,11 +336,6 @@ class CoreSettings {
   /// 推送刷新帧率（帧/秒）：把同一轮回复内的流式增量攒帧后合并下发的频率。
   int _frameRate = frameRateMin;
 
-  /// token 获取帧率（帧/秒）：从 LLM 流中逐 token 取回复的节奏。
-  ///
-  /// 默认上限值（1000）= 近似不限速，保证未调校时行为与逐 token 直取一致。
-  int _tokenAcquisitionRate = tokenRateMax;
-
   /// 心跳间隔 I（秒）：判活节拍，落 settings.yaml 的 `heartbeat_interval`。
   int _heartbeatIntervalSeconds = defaultHeartbeatIntervalSeconds;
 
@@ -367,9 +356,6 @@ class CoreSettings {
 
   /// 推送刷新帧率（帧/秒）。
   int get frameRate => _frameRate;
-
-  /// token 获取帧率（帧/秒）。
-  int get tokenAcquisitionRate => _tokenAcquisitionRate;
 
   /// 心跳间隔 I（秒，判活节拍；设置页可调，默认 10）。
   int get heartbeatIntervalSeconds => _heartbeatIntervalSeconds;
@@ -398,9 +384,6 @@ class CoreSettings {
   /// 从 settings.yaml 的映射装载（未知键进入 [extra]）。
   void applyMap(Map<String, dynamic> map) {
     _frameRate = _clampFrameRate(_int(map, 'frame_rate', frameRateMin));
-    _tokenAcquisitionRate = _clampTokenRate(
-      _int(map, 'token_acquisition_rate', tokenRateMax),
-    );
     _dataCollectionEnabled = _bool(map, 'data_collection_enabled', false);
     // 心跳判活参数：手写 yaml 里的越界值 / 非法组合（例如 heartbeat_interval: 1
     // 配 missed_heartbeat_limit: 1，窗口 1s ≤ 前端 10s 心跳）在这里就被修好，原因
@@ -419,7 +402,10 @@ class CoreSettings {
     );
     extra = Map<String, dynamic>.from(map)
       ..remove('frame_rate')
+      // 领域键（归 tree.agent）：消耗而不是当未知键透传，否则保存时又会被写回去。
       ..remove('token_acquisition_rate')
+      ..remove('models')
+      ..remove('fallback_max_seqlen')
       ..remove('heartbeat_interval')
       ..remove('missed_heartbeat_limit')
       ..remove('data_collection_enabled');
@@ -429,7 +415,6 @@ class CoreSettings {
   Map<String, dynamic> toMap() => <String, dynamic>{
     ...extra,
     'frame_rate': _frameRate,
-    'token_acquisition_rate': _tokenAcquisitionRate,
     'heartbeat_interval': _heartbeatIntervalSeconds,
     'missed_heartbeat_limit': _missedHeartbeatLimit,
     'data_collection_enabled': _dataCollectionEnabled,
@@ -504,20 +489,9 @@ class CoreSettings {
     return _frameRate;
   }
 
-  /// token 获取帧率夹取到 [tokenRateMin, tokenRateMax]。
-  int setTokenAcquisitionRate(int value) {
-    _tokenAcquisitionRate = _clampTokenRate(value);
-    sink?.saveSettings(this);
-    return _tokenAcquisitionRate;
-  }
-
   static int _clampFrameRate(int value) => value < frameRateMin
       ? frameRateMin
       : (value > frameRateMax ? frameRateMax : value);
-
-  static int _clampTokenRate(int value) => value < tokenRateMin
-      ? tokenRateMin
-      : (value > tokenRateMax ? tokenRateMax : value);
 
   /// 写入心跳间隔 I（单字段；与 [setFrameRate] 同风格：夹取后返回生效值）。
   int setHeartbeatIntervalSeconds(int value) =>

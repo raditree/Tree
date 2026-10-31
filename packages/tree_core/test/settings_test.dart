@@ -107,17 +107,6 @@ void main() {
       expect(CoreModelConfig(modelId: 'm').effectiveMaxSeqlen, 128000);
     });
 
-    test('token 获取帧率默认上限，夹取到 20~1000', () {
-      final CoreSettings settings = CoreSettings();
-      expect(settings.tokenAcquisitionRate, CoreSettings.tokenRateMax);
-      expect(settings.setTokenAcquisitionRate(1), CoreSettings.tokenRateMin);
-      expect(
-        settings.setTokenAcquisitionRate(99999),
-        CoreSettings.tokenRateMax,
-      );
-      expect(settings.setTokenAcquisitionRate(60), 60);
-      expect(settings.tokenAcquisitionRate, 60);
-    });
   });
 
   group('CoreSettings 与配置文件的映射', () {
@@ -125,7 +114,6 @@ void main() {
       final CoreSettings settings = CoreSettings();
       settings.applyMap(<String, dynamic>{
         'frame_rate': 90,
-        'token_acquisition_rate': 45,
         'data_collection_enabled': true,
         'my_custom_key': <String, dynamic>{
           'nested': <int>[1, 2],
@@ -133,7 +121,6 @@ void main() {
         'another': 'x',
       });
       expect(settings.frameRate, 90);
-      expect(settings.tokenAcquisitionRate, 45);
       expect(settings.dataCollectionEnabled, isTrue);
       expect(
         settings.extra.keys,
@@ -141,7 +128,6 @@ void main() {
       );
       final Map<String, dynamic> out = settings.toMap();
       expect(out['frame_rate'], 90);
-      expect(out['token_acquisition_rate'], 45);
       expect(out['my_custom_key'], <String, dynamic>{
         'nested': <int>[1, 2],
       });
@@ -154,18 +140,13 @@ void main() {
       final CoreSettings settings = CoreSettings();
       settings.applyMap(<String, dynamic>{
         'frame_rate': '120',
-        'token_acquisition_rate': '240',
         'data_collection_enabled': 1,
       });
       expect(settings.frameRate, 120);
-      expect(settings.tokenAcquisitionRate, 240);
       expect(settings.dataCollectionEnabled, isTrue);
       // 非法帧率被夹取
       settings.applyMap(<String, dynamic>{'frame_rate': 'abc'});
       expect(settings.frameRate, CoreSettings.frameRateMin);
-      // 非法 token 帧率回退到上限（近似不限速）
-      settings.applyMap(<String, dynamic>{'token_acquisition_rate': 'abc'});
-      expect(settings.tokenAcquisitionRate, CoreSettings.tokenRateMax);
     });
   });
 
@@ -176,9 +157,8 @@ void main() {
 
       settings.dataCollectionEnabled = true;
       settings.dataCollectionEnabled = true; // 相同值不重复落盘
-      settings.setTokenAcquisitionRate(120);
       settings.setFrameRate(120);
-      expect(sink.settingsSaved, 3);
+      expect(sink.settingsSaved, 2);
 
       settings.createModel(<String, dynamic>{
         'model_id': 'm1',
@@ -193,14 +173,12 @@ void main() {
 
     test('无 sink 时全部改动只留内存（不抛错）', () {
       final CoreSettings settings = CoreSettings();
-      settings.setTokenAcquisitionRate(120);
       settings.setFrameRate(50);
       settings.createModel(<String, dynamic>{
         'model_id': 'm1',
         'base_url': 'https://x',
         'api_key': 'k',
       });
-      expect(settings.tokenAcquisitionRate, 120);
       expect(settings.models(), hasLength(1));
     });
   });

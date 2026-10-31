@@ -39,6 +39,10 @@ class FileSettingsSink implements CoreSettingsSink {
   /// 装载阶段的 `putModel` 不触发落盘（见 [CoreSettings.putModel]），因此
   /// 启动过程不会把用户的文件重写一遍。
   void load(CoreSettings settings) {
+    // L-22 乙方案（阶段 1）：领域键归 `tree.agent`。插件已把 token 速率写进
+    // `config/agent_settings.yaml` 时，核心把旧键从 settings.yaml 删掉（删前备份，
+    // 只做一次）；插件从未启动过（新文件不存在）则原样保留，不丢用户设置。
+    _dropMigratedDomainKeys();
     final File file = File(paths.settingsFile);
     if (file.existsSync()) {
       try {
@@ -54,40 +58,118 @@ class FileSettingsSink implements CoreSettingsSink {
         log?.call('settings.yaml 解析失败，本次使用默认设置：${file.path}：$error');
       }
     }
-    final Directory dir = Directory(paths.modelsDir);
+    // 模型池归 tree.agent（写者已是插件）：核心**不再装载** `config/models/*.yaml`，
+    // 也不再把它们写回任何地方。
+    settings.sink = this;
+  }
+
+  /// 删除已迁移到 `agent_settings.yaml` 的领域键（目前只有 `token_acquisition_rate`）。
+  ///
+  /// 条件（顺序无关的关键）：**新文件存在且含有效值**才删旧键 —— 插件从未启动过的
+  /// 老用户不会丢设置；插件一写成功，核心下一次启动/保存就收口。
+  /// 删前把 settings.yaml 备份成 `.bak.<时间戳>`，且只保留最近一份（回滚用）。
+  void _dropMigratedDomainKeys() {
+    final File file = File(paths.settingsFile);
+    if (!file.existsSync()) return;
+    final int? migrated = _readMigratedTokenRate();
+    if (migrated == null) return;
+    Map<String, dynamic> map;
+    try {
+      final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
+        file.readAsBytesSync(),
+      );
+      map = YamlCodec.decode(decoded.text);
+    } catch (error) {
+      log?.call('settings.yaml 解析失败，跳过领域键迁移：${file.path}：$error');
+      return;
+    }
+    if (!map.containsKey('token_acquisition_rate')) return;
+    try {
+      _backupSettingsFile(file);
+      map = Map<String, dynamic>.from(map)..remove('token_acquisition_rate');
+      // 同步写：load 是同步入口，异步写会与随后的 saveSettings 抢同一个 `.tmp` 名。
+      AtomicFile.writeStringAtomicSync(
+        file.path,
+        YamlCodec.encode(map, header: _settingsHeader),
+      );
+      log?.call(
+        'settings.yaml 的 token_acquisition_rate 已归 tree.agent'
+        '（agent_settings.yaml=$migrated）；旧键已删除，备份保留最近一份',
+      );
+    } catch (error) {
+      log?.call('删除 settings.yaml 的领域键失败（旧键原样保留）：$error');
+    }
+  }
+
+  /// 读 `agent_settings.yaml` 里的有效 token 速率（文件不存在/坏值 ⇒ null）。
+  int? _readMigratedTokenRate() {
+    final File agentFile = File(paths.agentSettingsFile);
+    if (!agentFile.existsSync()) return null;
+    try {
+      final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
+        agentFile.readAsBytesSync(),
+      );
+      final Object? raw = YamlCodec.decode(decoded.text)['token_acquisition_rate'];
+      if (raw is num) return raw.toInt();
+      if (raw is String) return int.tryParse(raw.trim());
+    } catch (error) {
+      log?.call('agent_settings.yaml 解析失败（本轮不删旧键）：${agentFile.path}：$error');
+    }
+    return null;
+  }
+
+  /// 备份 settings.yaml（`.bak.<yyyyMMddHHmmss>`），并清掉旧的同类备份。
+  void _backupSettingsFile(File file) {
+    final Directory dir = Directory(paths.configDir);
     if (dir.existsSync()) {
       for (final FileSystemEntity entity in dir.listSync()) {
-        if (entity is! File || !entity.path.endsWith('.yaml')) continue;
+        if (entity is! File) continue;
+        final String name = entity.uri.pathSegments.last;
+        if (!name.startsWith('settings.yaml.bak.')) continue;
         try {
-          final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
-            entity.readAsBytesSync(),
-          );
-          if (decoded.decoding == TextDecoding.utf8Malformed) {
-            log?.call('模型配置含非法 UTF-8 字节，已按 U+FFFD 顶替后解析：${entity.path}');
-          }
-          final Map<String, dynamic> map = YamlCodec.decode(decoded.text);
-          final CoreModelConfig model = CoreModelConfig.fromJson(map);
-          if (model.modelId.isEmpty) {
-            log?.call('模型配置缺少 model_id，已跳过：${entity.path}');
-            continue;
-          }
-          settings.putModel(model);
-        } catch (error) {
-          log?.call('模型配置解析失败（已跳过）：${entity.path}：$error');
+          entity.deleteSync();
+        } catch (_) {
+          // 旧备份删不掉不影响本次迁移（下一份覆盖语义仍成立）。
         }
       }
     }
-    settings.sink = this;
+    final DateTime now = DateTime.now();
+    String two(int value) => value.toString().padLeft(2, '0');
+    final String stamp =
+        '${now.year}${two(now.month)}${two(now.day)}'
+        '${two(now.hour)}${two(now.minute)}${two(now.second)}';
+    file.copySync('${file.path}.bak.$stamp');
   }
 
   @override
   void saveSettings(CoreSettings settings) {
     final String file = paths.settingsFile;
-    final String content = YamlCodec.encode(
-      settings.toMap(),
-      header: _settingsHeader,
-    );
+    final Map<String, dynamic> map = settings.toMap();
+    // 过渡期不丢设置：插件还没写过 agent_settings.yaml 时，磁盘上的旧键原样带回去
+    // （核心不解释它的值）。插件一落新文件，下一次保存就把它彻底删掉。
+    final int? legacy = File(paths.agentSettingsFile).existsSync()
+        ? null
+        : _legacyTokenRateOnDisk();
+    if (legacy != null) map['token_acquisition_rate'] = legacy;
+    final String content = YamlCodec.encode(map, header: _settingsHeader);
     _queue.enqueue(file, () => AtomicFile.writeStringAtomic(file, content));
+  }
+
+  /// 磁盘 settings.yaml 里遗留的 token 速率（模型未迁移时用于原样保留）。
+  int? _legacyTokenRateOnDisk() {
+    final File file = File(paths.settingsFile);
+    if (!file.existsSync()) return null;
+    try {
+      final DecodedText decoded = PlatformTextDecoder.decodeTolerant(
+        file.readAsBytesSync(),
+      );
+      final Object? raw = YamlCodec.decode(decoded.text)['token_acquisition_rate'];
+      if (raw is num) return raw.toInt();
+      if (raw is String) return int.tryParse(raw.trim());
+    } catch (_) {
+      return null;
+    }
+    return null;
   }
 
   @override

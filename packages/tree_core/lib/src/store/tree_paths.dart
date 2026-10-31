@@ -81,6 +81,10 @@ class TreePaths {
   /// 全局设置文件。
   String get settingsFile => p.join(configDir, 'settings.yaml');
 
+  /// `config/agent_settings.yaml`：领域设置（由 `tree.agent` 拥有，核心只读它做
+  /// 旧键迁移判定，不装载、不写回）。
+  String get agentSettingsFile => p.join(configDir, 'agent_settings.yaml');
+
   /// MCP 服务配置（可直接手改的 yaml）。
   String get mcpConfigFile => p.join(configDir, 'mcp.yaml');
 

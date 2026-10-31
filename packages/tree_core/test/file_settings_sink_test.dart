@@ -19,11 +19,10 @@ void main() {
     if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
   });
 
-  test('装载手写的 settings.yaml 与 models/*.yaml（未知键保留）', () {
+  test('装载手写的 settings.yaml（模型池归插件，核心不再装载；未知键保留）', () {
     File(paths.settingsFile).writeAsStringSync('''
 # 手写注释
 frame_rate: 120
-token_acquisition_rate: "240"
 custom_extra_key: 保留我
 ''');
     File(paths.modelFile('demo')).writeAsStringSync('''
@@ -31,69 +30,98 @@ model_id: demo
 name: 我的手写模型
 base_url: https://api.example.com/v1
 api_key: sk-handwritten
-thinking: true
-max_seqlen: 32000
 ''');
-    // 未闭合的 flow 序列：必定解析失败
-    File(paths.modelFile('broken')).writeAsStringSync('a: [1, 2\n');
 
     final CoreSettings settings = CoreSettings();
     FileSettingsSink(paths, log: logs.add).load(settings);
 
     expect(settings.frameRate, 120);
-    expect(settings.tokenAcquisitionRate, 240);
     expect(settings.extra['custom_extra_key'], '保留我');
-    expect(settings.model('demo')?.name, '我的手写模型');
-    expect(settings.model('demo')?.apiKey, 'sk-handwritten');
-    expect(settings.model('demo')?.thinking, isTrue);
-    expect(settings.model('demo')?.maxSeqlen, 32000);
-    expect(settings.model('broken'), isNull);
-    expect(logs.join('\n'), contains('模型配置解析失败'));
+    // L-22：模型池的写者已是 tree.agent，核心不再装载 models/*.yaml。
+    expect(settings.model('demo'), isNull);
+    expect(logs.join('\n'), isNot(contains('模型配置')));
   });
 
-  test('改动后落盘：settings.yaml 保留未知键，模型文件含明文密钥与注释', () async {
+  test('改动后落盘：settings.yaml 保留未知键；插件未落新文件时旧领域键原样保留', () async {
+    File(paths.settingsFile).writeAsStringSync('token_acquisition_rate: 240\n');
     final FileSettingsSink sink = FileSettingsSink(paths, log: logs.add);
     final CoreSettings settings = CoreSettings();
     sink.load(settings);
 
     settings.extra['custom_extra_key'] = '保留我';
     settings.setFrameRate(300);
-    settings.setTokenAcquisitionRate(240);
-    settings.createModel(<String, dynamic>{
-      'model_id': 'demo',
-      'name': '新模型',
-      'base_url': 'https://api.example.com/v1',
-      'api_key': 'sk-plain',
-    });
     await sink.flush();
 
     final String settingsYaml = File(paths.settingsFile).readAsStringSync();
     expect(settingsYaml, contains('frame_rate: 300'));
-    expect(settingsYaml, contains('token_acquisition_rate: 240'));
     expect(settingsYaml, contains('# Tree 全局设置'));
     // 值含中日韩字符会被保守地加引号（读回来仍是字符串）
     expect(settingsYaml, contains('custom_extra_key:'));
     expect(settingsYaml, contains('保留我'));
+    // 插件从没启动过 ⇒ 旧键不能被核心抹掉（顺序无关的关键条件）。
+    expect(settingsYaml, contains('token_acquisition_rate: 240'));
 
-    final String modelYaml = File(paths.modelFile('demo')).readAsStringSync();
-    expect(modelYaml, contains('# Tree 模型配置'));
-    expect(modelYaml, contains('model_id: demo'));
-    // 明文密钥（用户需要能直接看到并替换）
-    expect(modelYaml, contains('api_key: sk-plain'));
-
-    // 重新装载：值一致
     final CoreSettings reloaded = CoreSettings();
     FileSettingsSink(paths).load(reloaded);
     expect(reloaded.frameRate, 300);
-    expect(reloaded.tokenAcquisitionRate, 240);
-    expect(reloaded.model('demo')?.apiKey, 'sk-plain');
     expect(reloaded.extra['custom_extra_key'], '保留我');
+  });
 
-    // 删除模型：文件消失（必须 flush **装载时挂上的那个 sink**——落盘任务
-    // 排在它的队列里，新建 sink 的队列是空的）
-    reloaded.deleteModel('demo');
-    await reloaded.sink!.flush();
-    expect(File(paths.modelFile('demo')).existsSync(), isFalse);
+  test('插件已写 agent_settings.yaml ⇒ 核心删旧键并备份一次', () async {
+    File(paths.settingsFile).writeAsStringSync(
+      'frame_rate: 60\ntoken_acquisition_rate: 240\n',
+    );
+    File(paths.agentSettingsFile).writeAsStringSync('token_acquisition_rate: 250\n');
+
+    final FileSettingsSink sink = FileSettingsSink(paths, log: logs.add);
+    final CoreSettings settings = CoreSettings();
+    sink.load(settings);
+    await sink.flush();
+
+    final String settingsYaml = File(paths.settingsFile).readAsStringSync();
+    expect(settingsYaml, contains('frame_rate: 60'));
+    expect(settingsYaml, isNot(contains('token_acquisition_rate')));
+    expect(settings.frameRate, 60);
+    // 备份恰好一份，且含被删的旧键（回滚用）。
+    final List<String> backups = Directory(paths.configDir)
+        .listSync()
+        .whereType<File>()
+        .map((File file) => file.uri.pathSegments.last)
+        .where((String name) => name.startsWith('settings.yaml.bak.'))
+        .toList();
+    expect(backups, hasLength(1));
+    expect(
+      File('${paths.settingsFile}.bak.${backups.single.split('bak.').last}')
+          .readAsStringSync(),
+      contains('token_acquisition_rate: 240'),
+    );
+    expect(logs.join('\n'), contains('已归 tree.agent'));
+
+    // 再启动一次：旧键已不存在 ⇒ 不重复备份、不再改文件。
+    FileSettingsSink(paths).load(CoreSettings());
+    expect(
+      Directory(paths.configDir)
+          .listSync()
+          .whereType<File>()
+          .map((File file) => file.uri.pathSegments.last)
+          .where((String name) => name.startsWith('settings.yaml.bak.')),
+      hasLength(1),
+    );
+  });
+
+  test('agent_settings.yaml 无效值 ⇒ 核心不动旧键', () async {
+    File(paths.settingsFile).writeAsStringSync('token_acquisition_rate: 240\n');
+    File(paths.agentSettingsFile).writeAsStringSync('token_acquisition_rate: abc\n');
+
+    final FileSettingsSink sink = FileSettingsSink(paths, log: logs.add);
+    final CoreSettings settings = CoreSettings();
+    sink.load(settings);
+    await sink.flush();
+
+    expect(
+      File(paths.settingsFile).readAsStringSync(),
+      contains('token_acquisition_rate: 240'),
+    );
   });
 
   test('损坏的 settings.yaml：记录日志并使用默认设置（不崩）', () {
