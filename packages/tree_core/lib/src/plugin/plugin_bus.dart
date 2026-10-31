@@ -1,7 +1,11 @@
 import 'dart:async';
 
 import 'package:tree_protocol/tree_protocol.dart'
-    show ApiMetaBranding, PluginRpcMethods;
+    show
+        ApiMetaBranding,
+        ExecStationEnvelopeKeys,
+        ExecStationErrorCodes,
+        PluginRpcMethods;
 import 'package:tree_tunnel_protocol/tree_tunnel_protocol.dart';
 
 import '../server/http_router.dart';
@@ -2678,7 +2682,10 @@ class PluginBus {
   ) async {
     final PluginHost? host = _hosts[pluginId];
     if (host == null || host.isClosed) {
-      return StationCommandOutcome.failed('插件 $pluginId 未运行，命令未执行');
+      return StationCommandOutcome.failed(
+        '插件 $pluginId 未运行，命令未执行',
+        code: ExecStationErrorCodes.pluginOffline,
+      );
     }
     final StationReply reply = await host.requestStation(
       StationRequest(
@@ -2700,12 +2707,20 @@ class PluginBus {
     if (reply.isFailed) {
       // 失败也带载荷（`failedWith` 的语义）：`llm.call` 这类"命令没跑成、产出有价值"
       // 的场景靠它把已付费的模型正文交给调用方（known-issues #31）。
-      return StationCommandOutcome.failedWith(reply.error, reply.payload);
+      // 码：插件回什么就带什么；不带（老产物）⇒ 这里补 `unknown` 并留一条日志
+      // （契约 §4.1 第 4 条：缺码必须可见，不许静默当成无码可判）。
+      final String code = _settleReplyCode(pluginId, context.command, reply.code);
+      return StationCommandOutcome.failedWith(
+        reply.error,
+        reply.payload,
+        code: code,
+      );
     }
     final Object? payload = reply.payload;
     if (payload is! Map) {
       return StationCommandOutcome.failed(
         '执行器插件 $pluginId 的回包缺少 payload 对象（command=${context.command}）',
+        code: ExecStationErrorCodes.badReply,
       );
     }
     final Map<String, dynamic> result = payload.map(
@@ -2713,11 +2728,32 @@ class PluginBus {
     );
     final String error = (result['error'] ?? '').toString();
     if (error.isNotEmpty || result['ok'] == false) {
+      final String code = _settleReplyCode(
+        pluginId,
+        context.command,
+        (result['code'] ?? '').toString(),
+      );
       return StationCommandOutcome.failed(
         error.isEmpty ? '执行器插件 $pluginId 报失败但未给原因' : error,
+        code: code,
       );
     }
     return StationCommandOutcome.ok(result);
+  }
+
+  /// 失败码兜底：已登记的原样用；空 / 未登记的补 `unknown` 并留一条日志。
+  ///
+  /// 为什么日志写在这里而不是 `StationInstance`：那里只有数据、没有 logger；
+  /// 而"缺码"正是**老产物与新核心并存**的可见证据，事后排障要能看到是谁没带码。
+  String _settleReplyCode(String pluginId, String command, String code) {
+    final String trimmed = code.trim();
+    if (ExecStationErrorCodes.isKnown(trimmed)) return trimmed;
+    log?.call(
+      '执行站命令 $command 的失败回包没有可用的 code'
+      '（plugin=$pluginId，收到「${trimmed.isEmpty ? '空' : trimmed}」）'
+      ' ⇒ 兜底成 ${ExecStationErrorCodes.unknown}；调用方只能当可读原因处理',
+    );
+    return ExecStationErrorCodes.unknown;
   }
 
   Future<Map<String, dynamic>> _runPluginCommand({
@@ -5056,11 +5092,13 @@ class PluginBus {
       }.toList()
         ..sort();
       return <String, dynamic>{
-        'command': command,
-        'ok': false,
-        'mount_id': '',
-        'payload': null,
-        'error': '未知命令 $command（可用命令：${allowed.join('、')}）',
+        ExecStationEnvelopeKeys.command: command,
+        ExecStationEnvelopeKeys.ok: false,
+        ExecStationEnvelopeKeys.mountId: '',
+        ExecStationEnvelopeKeys.payload: null,
+        ExecStationEnvelopeKeys.error:
+            '未知命令 $command（可用命令：${allowed.join('、')}）',
+        ExecStationEnvelopeKeys.code: ExecStationErrorCodes.commandUnknown,
       };
     }
     final StationCommandResult result = await station.execute(
@@ -5069,13 +5107,16 @@ class PluginBus {
       arguments: arguments,
       sourcePluginId: config.id,
     );
-    // 结果原样回给插件（ok / payload / error 三件套，执行站说什么就回什么）
+    // 结果原样回给插件（ok / payload / error / code 四件套，执行站说什么就回什么）。
+    // `code` 的口径见契约 §4.1：`ok:true` 恒为空串，`ok:false` 必非空且在码表里
+    // （`StationInstance.execute` 已把缺码兜底成 `unknown`）。
     return <String, dynamic>{
-      'command': result.command,
-      'ok': result.ok,
-      'mount_id': result.mountId,
-      'payload': result.payload,
-      'error': result.error,
+      ExecStationEnvelopeKeys.command: result.command,
+      ExecStationEnvelopeKeys.ok: result.ok,
+      ExecStationEnvelopeKeys.mountId: result.mountId,
+      ExecStationEnvelopeKeys.payload: result.payload,
+      ExecStationEnvelopeKeys.error: result.error,
+      ExecStationEnvelopeKeys.code: result.code,
     };
   }
 

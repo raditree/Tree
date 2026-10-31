@@ -10,6 +10,8 @@ library;
 export 'src/api_paths.dart';
 export 'src/core_event.dart';
 export 'src/core_handshake.dart';
+export 'src/exec_station_envelope.dart';
+export 'src/exec_station_error_codes.dart';
 export 'src/meta.dart';
 export 'src/non_protocol_literals.dart';
 export 'src/plugin_rpc_methods.dart';

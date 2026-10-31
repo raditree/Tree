@@ -6,6 +6,8 @@ library;
 
 import 'dart:async';
 
+import 'package:tree_protocol/tree_protocol.dart';
+
 import 'station_schema.dart';
 import 'station_scope.dart';
 
@@ -174,19 +176,35 @@ class StationRequest {
 /// - 中转站：payload = str 时回填（替换原数据），null 时「不改动」放行原数据；
 /// - 广播站：payload 仅作为送达确认（多数订阅者回空即可）。
 class StationReply {
-  const StationReply.ok([this.payload, this.reason = '']) : error = '';
+  const StationReply.ok([this.payload, this.reason = ''])
+    : error = '',
+      code = ExecStationErrorCodes.none;
 
-  const StationReply.failed(this.error) : payload = null, reason = '';
+  const StationReply.failed(
+    this.error, {
+    this.code = ExecStationErrorCodes.none,
+  }) : payload = null,
+       reason = '';
 
   /// **失败但带载荷**：插件回 `{error, payload}` 时用它（典型是 `llm.call` 拿到 200、
   /// 正文却解析不出 JSON——原文是已付费的产出，不能丢，见 known-issues #31）。
-  const StationReply.failedWith(this.error, this.payload) : reason = '';
+  ///
+  /// [code] = 插件回包里的稳定错误码（契约 §4）；老插件不回码时留空，核心按
+  /// [ExecStationErrorCodes.unknown] 兜底并记一条日志（缺码可见，不静默）。
+  const StationReply.failedWith(
+    this.error,
+    this.payload, {
+    this.code = ExecStationErrorCodes.none,
+  }) : reason = '';
 
   /// 回包内容（语义随站点类型）。
   final Object? payload;
 
   /// 失败原因（可读中文；成功时为空串）。
   final String error;
+
+  /// 稳定错误码（成功时恒为空串；见 `exec_station_error_codes.dart`）。
+  final String code;
 
   /// **"我为什么这么回"的可读原因**（可选；纯增量字段）。
   ///
@@ -207,7 +225,12 @@ class StationReply {
     if (error.isNotEmpty) {
       // 失败也保留载荷：`{error, payload}` 是执行站允许的形态（与
       // `StationCommandOutcome.failedWith` 同一口径）。其它站点在失败时忽略载荷。
-      return StationReply.failedWith(error, raw['payload']);
+      // 码同理照收：老产物不带 `code` 时留空，由核心在出站处兜底成 `unknown`。
+      return StationReply.failedWith(
+        error,
+        raw['payload'],
+        code: (raw['code'] ?? '').toString(),
+      );
     }
     return StationReply.ok(raw['payload'], (raw['reason'] ?? '').toString());
   }
@@ -378,9 +401,14 @@ class StationCommandContext {
 
 /// 挂载位置的执行结果。
 class StationCommandOutcome {
-  const StationCommandOutcome.ok([this.payload]) : error = '';
+  const StationCommandOutcome.ok([this.payload])
+    : error = '',
+      code = ExecStationErrorCodes.none;
 
-  const StationCommandOutcome.failed(this.error) : payload = null;
+  const StationCommandOutcome.failed(
+    this.error, {
+    this.code = ExecStationErrorCodes.none,
+  }) : payload = null;
 
   /// **失败，但把载荷一起带回去**：用于"命令确实跑起来了、只是产出不可用"的情形
   /// （典型：`llm.call` 拿到 200、模型正文却解析不出 JSON）。
@@ -389,13 +417,20 @@ class StationCommandOutcome {
   /// 只回一句 `error` 等于把那次**已经付过钱**的调用彻底丢掉——现场就是一次 734k
   /// prompt（≈100% 命中缓存）的总结解析失败后整包被弃、回退内置压缩
   /// （见 `docs/known-issues.md` #31）。
-  const StationCommandOutcome.failedWith(this.error, this.payload);
+  const StationCommandOutcome.failedWith(
+    this.error,
+    this.payload, {
+    this.code = ExecStationErrorCodes.none,
+  });
 
   /// 结果载荷（回给下命令的插件）。
   final Object? payload;
 
   /// 失败原因（可读中文）。
   final String error;
+
+  /// 稳定错误码（成功恒为空串；失败时由核心兜底成 `unknown`）。
+  final String code;
 
   /// 是否失败。
   bool get isFailed => error.isNotEmpty;
@@ -409,6 +444,7 @@ class StationCommandResult {
     this.mountId = '',
     this.payload,
     this.error = '',
+    this.code = ExecStationErrorCodes.none,
   });
 
   /// 命令名。
@@ -428,6 +464,9 @@ class StationCommandResult {
 
   /// 拒绝 / 失败原因（可读中文）。
   final String error;
+
+  /// 稳定错误码（契约 §4.1）：`ok:true` 恒为空串，`ok:false` 必非空且在码表里。
+  final String code;
 
   /// 可读摘要。
   String describe() =>

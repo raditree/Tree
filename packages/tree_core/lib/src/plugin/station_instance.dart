@@ -1,5 +1,8 @@
 import 'dart:async';
 
+import 'package:tree_protocol/tree_protocol.dart'
+    show ExecStationErrorCodes;
+
 import 'station_points.dart';
 import 'station_runtime.dart';
 import 'station_schema.dart';
@@ -991,7 +994,12 @@ final class ExecuteStation extends StationInstance {
     final String? off = stationDisabledReason;
     if (off != null) {
       counters.bump('skipped_disabled');
-      return StationCommandResult(command: command, ok: false, error: off);
+      return StationCommandResult(
+        command: command,
+        ok: false,
+        error: off,
+        code: ExecStationErrorCodes.stationDisabled,
+      );
     }
     final StationIsolationVerdict verdict =
         StationIsolation.checkCommandScope(scope);
@@ -1001,6 +1009,7 @@ final class ExecuteStation extends StationInstance {
         command: command,
         ok: false,
         error: '命令被拒（隔离）：${verdict.reason}',
+        code: ExecStationErrorCodes.scopeDenied,
       );
     }
     if (!commands.contains(command)) {
@@ -1010,6 +1019,7 @@ final class ExecuteStation extends StationInstance {
         command: command,
         ok: false,
         error: '命令 $command 不属于点位 $id（本点位允许：${allowed.join('、')}）',
+        code: ExecStationErrorCodes.commandNotOnStation,
       );
     }
     final List<StationCommandMount> candidates =
@@ -1028,6 +1038,7 @@ final class ExecuteStation extends StationInstance {
         error:
             '命令 $command 暂无挂载位置（没有执行器接管；'
             '「执行器」只是执行站的一种挂载位置）',
+        code: ExecStationErrorCodes.noMount,
       );
     }
     final StationCommandMount mount = candidates.first;
@@ -1058,6 +1069,9 @@ final class ExecuteStation extends StationInstance {
           mountId: mount.mountId,
           payload: outcome.payload,
           error: outcome.error,
+          // 插件给了码就原样带出；没给（老产物）在这里兜底成 `unknown`
+          // （"缺码可见"由出站处记日志，见契约 §4.1 第 4 条）。
+          code: ExecStationErrorCodes.settle(outcome.code),
         );
       }
       counters.bump('responded');
@@ -1074,6 +1088,7 @@ final class ExecuteStation extends StationInstance {
         ok: false,
         mountId: mount.mountId,
         error: '挂载位置 ${mount.mountId} 执行异常：$error',
+        code: ExecStationErrorCodes.mountException,
       );
     }
   }
