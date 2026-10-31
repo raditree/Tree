@@ -349,6 +349,71 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 
 拆分完成前不得开始 A1 的数据接管；否则插件会继续被迫感知核心设置模型。
 
+### 4.8.1 落地细则（2026-11-01 拍板：分文件，不做共用文件）
+
+**目标布局**
+
+| 文件 | 归属 | 键 |
+| --- | --- | --- |
+| `config/settings.yaml` | 核心（平台） | `frame_rate` / `heartbeat_interval` / `missed_heartbeat_limit` / `data_collection_enabled` + 未知键透传（`extra`） |
+| `config/agent_settings.yaml`（新） | `tree.agent` | `token_acquisition_rate`；后续领域键（`fallbackMaxSeqlen` 等）也落这里 |
+| `config/models/*.yaml` | `tree.agent`（路径不变） | 每模型一份；核心**停止装载** |
+
+HTTP 面**已经迁完**（核心 router 无 `/api/settings/token-rate`，插件
+`delegate.dart:531-552` 实现，契约里在 `ApiPaths.delegated`），本细则只处理**存储归属**。
+
+**现状风险（必须先消掉再谈拆分）**
+
+插件写 `token_acquisition_rate` 是**局部写**（`plugins/tree.agent/lib/src/settings/file_settings_sink.dart:58`
+只改这一个键），但核心 `saveSettings` 是**全量重写**（`packages/tree_core/lib/src/settings/file_settings_sink.dart:83-91`
+用 `CoreSettings.toMap()`，其中 `core_settings.dart:432` 仍带该键，值来自启动时装载后从不刷新的
+`_tokenAcquisitionRate`）。后果：用户在设置页改速率后，核心只要再保存任意平台设置，
+就会把旧值**静默覆盖**回去。这是"设置已归插件、存储未归插件"的典型半迁移症状。
+
+**迁移三步（条件化，与两侧启动顺序无关）**
+
+1. **插件读**：优先读 `config/agent_settings.yaml`；不存在则回退读 `settings.yaml` 的
+   `token_acquisition_rate`（缺失 = 默认 1000），**原子写**成功后继续。
+2. **核心删键**：启动装载/保存前，若 `config/agent_settings.yaml` 存在且含有效值 ⇒
+   先把 `settings.yaml` 备份为 `settings.yaml.bak.<yyyyMMddHHmmss>`（**只做一次**），
+   再从 map 删除 `token_acquisition_rate`，原子重写。
+3. **核心彻底退出该键**：`CoreSettings.toMap()` 不再写它、`applyMap` 不再读它、
+   `_tokenAcquisitionRate` 字段与 `_clampTokenRate` / `tokenRateMin` / `tokenRateMax` 删除。
+
+第 2 步的条件（"新文件存在才删旧键"）是顺序无关的关键：插件从未启动过的老用户不会丢设置；
+插件一启动写成功，核心下一次保存就收口。**不采用**"靠 `extra` 原样保留"的写法——那是共用文件
+的过渡解，与本节"分文件"的目标相悖。
+
+**回滚**
+
+- 删键前必有备份（第 2 步）；回滚 = 用 `.bak` 覆盖 `settings.yaml` + 删除
+  `agent_settings.yaml`，插件随即回退到"读旧键"，行为与迁移前一致。
+- 备份只保留最近一份，避免堆积。
+
+**门禁与测试**
+
+- 新增门禁：`CoreSettings.toMap()` 的键集**恰好等于**平台键集（出现任何领域键即红）；
+  核心源码里 `token_acquisition_rate` 只允许出现在迁移代码与测试中。
+- 插件侧：阶段收尾后 `DomainSettings` 不得再回退读 `settings.yaml`（删掉兼容分支即验证）。
+- 契约数字不变（`delegated` 54 / agent 36 / `kept` 71），前端与 `delegate.dart` 行为不变。
+- 要改的既有测试：`packages/tree_core/test/settings_test.dart`（5 条 token 用例）、
+  `file_settings_sink_test.dart`（2 条）；新增迁移用例——旧键存在 ⇒ 新文件生成；
+  新文件已存在 ⇒ 不重复读旧；无新文件 ⇒ 核心不动旧键；有则删键且只备份一次。
+- 插件 `--selftest` 增一项：写速率后读一致，且 `settings.yaml` 不再出现该键。
+
+**分期**
+
+- **阶段 1（随 `1.0.5+1`）**：核心停写/停读该键 + 插件"新文件优先、旧键兜底" + 核心条件化删键
+  （带备份）。完成后覆盖风险归零。
+- **阶段 2（下一版）**：删掉插件的旧键兜底分支与核心迁移代码（此后 `settings.yaml` 里出现该键
+  即视为手改污染，按未知键透传处理）。
+
+**不在本期**
+
+- 模型池文件不需要搬家：写者已是插件（`plugins/tree.agent/lib/src/settings/file_settings_sink.dart:28`），
+  核心只需**停止装载**（`FileSettingsSink.load` 里的 `putModel` 循环），属清理项，可随阶段 1 一起做。
+- `scope` 去领域化（L-23）与本条无关，见 [scope-de-domainization-recon.md](scope-de-domainization-recon.md)。
+
 ---
 
 ## 5. 功能对等清单（验收必须逐条打勾）

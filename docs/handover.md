@@ -368,5 +368,5 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 | D-7 | REST 面错误结构（契约 Q-4） | **统一为 `{status, code, message}`**，REST 面同批做，不另开片 |
 | D-8 | P1 真机 SSH 环境 | **本机 docker 跑 sshd 容器**（不依赖 WSL / 外部机器），跑 `ssh.file.*` 分块、`rename` 原子性、SSH 终端 |
 | D-9 | 插件仓 CI | **两仓都加 `.github`**：插件仓独立 workflow 跑 `check_plugin_repo_contract.dart` + 各插件 `dart analyze` / `dart test` |
-| D-10 | P0 前置 L-22 | **拆** `core_settings`（平台级 vs 领域级），按 [agent_pluginization.md §4.8](pluginization/agent_pluginization.md) 的方案；不拆则数据接管无法开工 |
+| D-10 | P0 前置 L-22 | **拆** `core_settings`（平台级 vs 领域级），**按乙方案·分文件**：领域键落 `config/agent_settings.yaml`、核心退出该键并条件化删旧键（带备份）；细则、覆盖风险与迁移顺序见 [agent_pluginization.md §4.8.1](pluginization/agent_pluginization.md)。不拆则数据接管无法开工 |
 | D-11 | P1 的 E2E 口径 | **先手工跑 + 逐条记录证据**；只把事件面三项（E2E-03/04/05）脚本化（替身已成熟），其余等环境稳定再脚本化 |
