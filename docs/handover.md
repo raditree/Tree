@@ -99,7 +99,7 @@ UI 插件（WebSocket 客户端）
 
 | 套件 | 结果 |
 | --- | --- |
-| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped**（#42 修复后连续多轮全量稳定复现） |
+| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped**（#42 修复后 15 轮全量连绿，含 5 轮 `-j 16` 超订） |
 | `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁） |
 | 根仓 | `flutter analyze` 仅既有 10 issues（`tree_tunnel_protocol` + `thinking_window_test`，与插件化无关）；`flutter test` **886 passed** |
 | `plugins/tree.agent` | **363 passed** |
@@ -146,12 +146,15 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 3. 执行器 `file.*` 的条目必须是**工作空间根相对**，本机与 SSH 同形（否则 spec reset 路径会多一层）。
 4. 核心 `stdout` 只允许握手行，日志走 `stderr`；核心 stderr 若无人读且是管道，会在 shutdown 时卡住。
 5. 网络/LLM/时钟不进单测：用假传输、假时钟、可注入节拍器。
-6. 站点用例**等确认，不要等挂钟**（known-issues #42）：`publish` / 插件下线 / 站点注销
-   都只作用于「通道已建好」的订阅，用固定 sleep 等同一条连接的订阅帧处理完，
-   满负载跑全量时会假红。订阅成功的同步回证是点名本站的 `reset` 帧；
-   注册 / 注销没有确认帧，轮询核心状态或 `/api/meta` 的 `ui[].connections`。
-   同一连接内的帧按序处理（`_handleHello`/`_handleSubscribe`/`_handleRegister` 都是同步
-   `void`），所以 hello 之后紧跟的同连接帧不需要等。
+6. 用例判据**挂在证据上，不要挂在挂钟上**（known-issues #42，已修两处）：
+   - 站点面：`publish` / 插件下线 / 站点注销都只作用于「通道已建好」的订阅，用固定
+     sleep 等另一条连接的订阅帧处理完，满负载跑全量时会假红。订阅成功的同步回证是
+     **点名本站的 `reset` 帧**；注册 / 注销没有确认帧，轮询核心状态或 `/api/meta` 的
+     `ui[].connections`。同一连接内的帧按序处理（`_handleHello` / `_handleSubscribe` /
+     `_handleRegister` 都是同步 `void`），所以 hello 之后紧跟的同连接帧不需要等。
+   - 收尸面：看门狗每轮记一次丢拍，判活窗口只有 3 拍，用例不能靠「跑很多轮 × 固定
+     sleep」间接假设证据会到——每轮前先确认 `missed_heartbeats` 已被新入站心跳清零。
+   - 放宽 sleep 治不了这一类：360ms 窗口照样被满负载跨过。
 
 ---
 
