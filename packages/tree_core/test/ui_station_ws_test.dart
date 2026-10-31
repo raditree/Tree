@@ -161,6 +161,44 @@ plugins:
 
     Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 40));
 
+    /// 等这条订阅通道**真的建好**：订阅成功必回一帧点名本站的 `reset`。
+    ///
+    /// 投递只给通道已建好的订阅。跨主体时序（测试直接 `station.publish`）不能靠
+    /// 挂钟：满负载跑全量时 40ms 内核心还没处理到该连接的订阅帧，publish 就先跑完，
+    /// 那个窗口只收到稍后的 `reset`，之后永远等不到 `data`（假红）。
+    Future<void> awaitSubscribed(_WsClient ws, String stationId) => ws.until(
+      (Map<String, dynamic> f) =>
+          f['type'] == WsOutboundType.stationDelivery &&
+          f['station_id'] == stationId &&
+          f['state'] == StationDeliveryState.reset.wire,
+      reason: '订阅 $stationId 应回带 reset',
+    );
+
+    /// 等核心侧状态到位：注册成功 / 站点注销**没有确认帧**，只能轮询核心。
+    /// 条件可以是同步读核心，也可以是异步打 `/api/meta`。
+    Future<void> waitUntil(
+      FutureOr<bool> Function() condition, {
+      Duration timeout = const Duration(seconds: 5),
+      required String reason,
+    }) async {
+      final DateTime deadline = DateTime.now().add(timeout);
+      while (DateTime.now().isBefore(deadline)) {
+        if (await condition()) return;
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      throw TimeoutException('超时等待$reason');
+    }
+
+    /// `/api/meta` 的 `ui[].connections` 就是窗口数（见条例 20），用来观察连接增减。
+    Future<int> windowCount(String pluginId) async {
+      final _Res res = await client.send('GET', ApiPaths.meta);
+      for (final dynamic row in (res.json['ui'] as List<dynamic>)
+          .cast<Map<String, dynamic>>()) {
+        if (row['plugin_id'] == pluginId) return (row['connections'] as num).toInt();
+      }
+      return 0;
+    }
+
     test('订阅广播站收到 data；topics 过滤；空 scope 通配', () async {
       final _WsClient ws = await _connect(server);
       sockets.add(ws);
@@ -174,17 +212,9 @@ plugins:
           'topics': <String>['ping'],
         },
       });
-      await settle();
-
       // 每条新通道订阅成功都先发 reset（seq 从 1 重新计数）：断线重连后 UI 靠它
       // 清掉旧水位，否则会把重放的首批帧当"重复"丢掉（E2E-04 丢帧根因）。
-      // 用 until 等帧（固定 sleep 在满负载跑全量时会不够）。
-      await ws.until(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.stationDelivery &&
-            f['state'] == StationDeliveryState.reset.wire,
-        reason: '首次订阅也要 reset',
-      );
+      await awaitSubscribed(ws, 'system.broadcast');
 
       final BroadcastStation station =
           bus.stations.pointFor('system.broadcast')! as BroadcastStation;
@@ -349,7 +379,7 @@ plugins:
         'type': WsInboundType.stationSubscribe,
         'data': <String, dynamic>{'station_id': stationId, 'scope': <String, dynamic>{}},
       });
-      await settle();
+      await awaitSubscribed(ws, stationId);
 
       bus.onPluginOffline?.call('headless.one');
       await ws.until(
@@ -378,7 +408,7 @@ plugins:
         'type': WsInboundType.stationSubscribe,
         'data': <String, dynamic>{'station_id': builtId, 'scope': <String, dynamic>{}},
       });
-      await settle();
+      await awaitSubscribed(ws, builtId);
       bus.stations.unregister(builtId);
       await ws.until(
         (Map<String, dynamic> f) =>
@@ -403,7 +433,10 @@ plugins:
           'data': <String, dynamic>{'station_id': 'system.broadcast', 'scope': <String, dynamic>{}},
         });
       }
-      await settle();
+      // 两个窗口都等到各自通道建好，再 publish：投递只给已建好的订阅。
+      for (final _WsClient ws in <_WsClient>[a, b]) {
+        await awaitSubscribed(ws, 'system.broadcast');
+      }
       final BroadcastStation station =
           bus.stations.pointFor('system.broadcast')! as BroadcastStation;
       await station.publish(
@@ -449,7 +482,11 @@ plugins:
       });
       await settle();
       final String stationId = 'plugin.ui.alpha.broadcast.notice';
-      expect(bus.stations.station(stationId), isNotNull, reason: '广播自建站应注册成功');
+      // 注册成功没有确认帧，只能轮询核心状态（挂钟等待在满负载跑全量时会假红）。
+      await waitUntil(
+        () => bus.stations.station(stationId) != null,
+        reason: '广播自建站注册到位',
+      );
 
       // 收集 / 执行：WS 侧不允许。
       for (final String kind in <String>['collect', 'execute', 'relay']) {
@@ -472,7 +509,10 @@ plugins:
           'data': <String, dynamic>{'station_id': stationId, 'scope': <String, dynamic>{}},
         });
       }
-      await settle();
+      // 两窗口的通道都建好后再触发，否则慢的那个窗口收不到这一条。
+      for (final _WsClient ws in <_WsClient>[a, b]) {
+        await awaitSubscribed(ws, stationId);
+      }
       a.send(<String, dynamic>{
         'type': WsInboundType.stationTrigger,
         'data': <String, dynamic>{
@@ -498,17 +538,23 @@ plugins:
         expect((data['payload'] as Map<String, dynamic>)['text'], 'hello');
       }
 
-      // 关一个窗口：站还在（最后一个连接才销毁）。
+      // 关一个窗口：站还在（最后一个连接才销毁）。先等核心连接表真少一条，
+      // 否则这条 expect 只是在「还没处理完关闭」时侥幸通过。
       await a.close();
       sockets.remove(a);
-      await settle();
+      await waitUntil(
+        () async => await windowCount('ui.alpha') == 1,
+        reason: '关一个窗口后连接数降到 1',
+      );
       expect(bus.stations.station(stationId), isNotNull, reason: '还有一条连接时不能注销自建站');
 
       // 最后一个窗口关：站点注销，其它订阅者（无）不会留残。
       await b.close();
       sockets.remove(b);
-      await settle();
-      expect(bus.stations.station(stationId), isNull, reason: '最后一条连接断开应注销自建站');
+      await waitUntil(
+        () => bus.stations.station(stationId) == null,
+        reason: '最后一条连接断开应注销自建站',
+      );
     });
 
     test('/api/meta：版本、ui 聚合、can_manage_plugins、广播站与空 routes', () async {
@@ -530,7 +576,11 @@ plugins:
       sockets.addAll(<_WsClient>[a, b]);
       a.send(_hello('ui.alpha', capabilities: <Object?>['plugin.manage', 'ui.custom']));
       b.send(_hello('ui.alpha', version: '9.9.9', capabilities: <Object?>['ui.custom', <String, dynamic>{'x': 1}]));
-      await settle();
+      // 两个 hello 都进了连接表再读 meta：挂钟等待会让聚合面读到旧状态。
+      await waitUntil(
+        () async => await windowCount('ui.alpha') == 2,
+        reason: '两个窗口的 hello 都入表',
+      );
 
       final _Res after = await client.send('GET', ApiPaths.meta);
       expect(after.json['can_manage_plugins'], isTrue, reason: '存在声明 plugin.manage 的活连接');
@@ -563,12 +613,16 @@ plugins:
       final _WsClient beta = await _connect(server);
       sockets.add(beta);
       beta.send(_hello('ui.beta'));
-      await settle();
       beta.send(<String, dynamic>{
         'type': WsInboundType.stationRegister,
         'data': <String, dynamic>{'kind': 'broadcast', 'name': 'beta', 'readme': 'beta 的自建站'},
       });
-      await settle();
+      // 同一条连接的帧按序处理，注册无需再等 hello；但要等站真的在，
+      // 否则 alpha 触发时拿到的是「站点不存在」而不是「不是插件 ui.alpha」的拒绝。
+      await waitUntil(
+        () => bus.stations.station('plugin.ui.beta.broadcast.beta') != null,
+        reason: 'beta 的自建站注册到位',
+      );
 
       final _WsClient alpha = await _connect(server);
       sockets.add(alpha);
