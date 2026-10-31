@@ -133,35 +133,32 @@ void main() {
     }
   });
 
-  test('相对热重启基线只新增登记过的 3 个 method（D10 + 插件化片 A）', () {
+  test('相对热重启基线只新增登记过的 2 个 method（D10 + 插件化片 A）', () {
     expect(
       PluginRpcMethods.addedSinceBaseline(),
       <String>{
         PluginRpcMethods.suspend,
         PluginRpcMethods.apiDelegate,
-        PluginRpcMethods.workspaceRegister,
       },
       reason:
-          'D10 只允许 suspend；插件化片 A 只允许 api/delegate 与 '
-          'workspace/register（见 ui-pluginization.md §3.3）',
+          'D10 只允许 suspend；插件化片 A 只允许 api/delegate'
+          '（另一条 workspace/register 已于 2026-10-31 片 3 撤除，见 §3.3）',
     );
     expect(
       PluginRpcMethods.all.length,
-      PluginRpcMethods.baselineBeforeHotRestart.length + 3,
-      reason: 'all 只应比热重启基线多 suspend / api-delegate / workspace-register',
+      PluginRpcMethods.baselineBeforeHotRestart.length + 2,
+      reason: 'all 只应比热重启基线多 suspend / api-delegate',
     );
   });
 
-  test('相对插件化片 A 基线只新增 api/delegate 与 workspace/register', () {
+  test('相对插件化片 A 基线只新增 api/delegate（workspace/register 已撤）', () {
     expect(
       PluginRpcMethods.addedSinceUiPluginization(),
-      <String>{
-        PluginRpcMethods.apiDelegate,
-        PluginRpcMethods.workspaceRegister,
-      },
+      <String>{PluginRpcMethods.apiDelegate},
       reason:
-          '片 A 是「只增不删」的协议面：除这两条外任何新增都算协议漂移，'
-          '请先更新设计文档与基线',
+          '片 A 是「只增不删」的协议面——唯一例外是契约 §8.3 片 3 撤掉的 '
+          'workspace/register（租约整体归执行器插件，留着常量就是一张不存在的路）；'
+          '除这两条外任何变化都算协议漂移，请先更新设计文档与基线',
     );
     expect(
       PluginRpcMethods.baselineBeforeUiPluginization.contains(

@@ -25,9 +25,12 @@
    `StationWorkspace`（`plugins/tree.agent/lib/src/workspace/station_command.dart:12-28`）
    只按**本机那一套**的能力形状定义，所以 SSH 的四个增强**目前用不上**——
    这不是 bug，但必须写明，否则下一个改 `file.list` 的人会把 `details` 当通用字段。
-4. **租约有两套并行系统**，键名不同：核心侧 `lease_id` / `workspace_id`
+4. **租约曾有两套并行系统**，键名不同：核心侧 `lease_id` / `workspace_id`
    （由 `workspace/register` 通知登记）与插件侧 `ssh_lease_id`
    （由执行站命令 `ssh.lease.register` 登记）。混用一律 fail-closed（§1.3 前两行）。
+   → **已统一（2026-10-31 片 3）**：核心那张表与 `workspace/register` 已撤，
+   两族都改由执行器插件自己登记（`local.lease.register` / `ssh.lease.register`）。
+   本段保留为"当时的现场"，当前口径见 §8.3。
 5. **点位表里躺着 20 条"申报了、路由得到、执行必失败"的内置命令**，而且
    **有随包插件正踩在上面**：`compact` 的四条命令名（`llm.call` / `fs.read` /
    `tool.call` / `agent.compact`，`plugins/compact/compact_plugin.dart:62-65`）
@@ -66,8 +69,8 @@ RPC 层错误**不走这个信封**：`command` 缺失、`arguments` 不是对�
 
 | # | 来源 | 位置 | 现在的原因文案（逐字节选） |
 | --- | --- | --- | --- |
-| 1 | 租约未登记 | `plugin_bus.dart:5076-5084` | `工作空间租约 X 未登记（先发 workspace/register，再下带 lease_id 的命令）` |
-| 2 | 租约跨插件使用 | `plugin_bus.dart:5087-5095` | `工作空间租约 X 属于插件 P，不能跨插件使用（fail-closed）` |
+| 1 | 租约未登记 | ~~`plugin_bus.dart:5076-5084`~~ | **片 3 撤除**：核心不再持有租约表；本机/远端未登记改由执行器插件报 `local_lease_unknown` / `ssh_lease_unknown`（§3 同一条判据） |
+| 2 | 租约跨插件使用 | ~~`plugin_bus.dart:5087-5095`~~ | **片 3 撤除**：核心不再做这道 fail-closed；执行器插件按 `meta.source_plugin_id` 比对，不一致 ⇒ `lease_denied`（§8.3） |
 | 3 | 未知命令 | `plugin_bus.dart:5118-5124` | `未知命令 C（可用命令：…）` |
 | 4 | 站点被停用 | `station_instance.dart:991-995` | 站点自己的 `stationDisabledReason` |
 | 5 | 隔离判定拒绝 | `station_instance.dart:998-1005` | `命令被拒（隔离）：…` |
@@ -118,12 +121,16 @@ RPC 层错误**不走这个信封**：`command` 缺失、`arguments` 不是对�
 | `file.rename` | **无此命令** | 有（原子改名：源不存在 / 目标已存在都显式报错，绝不覆盖） | `kExecutorCommands` ↔ `exec_station.dart:196-197,487-494` |
 | `file.read` 分块下载通道 `raw:true`（`base64`/`offset`/`size`/`eof`） | **无** | 有 | `executor.dart:84-119` ↔ `exec_station.dart:325-341` |
 | 非 UTF-8 内容读取 ⇒ **内联 `base64`** | 有 | 有 | `executor.dart:92-98,117` ↔ `exec_station.dart:346-351,373` |
-| 租约登记 | 走**核心**的 `workspace/register` 通知（`plugin_bus.dart:5067-5099`） | 走**执行站命令** `ssh.lease.register`（`exec_station.dart:180-181`） | 两套并行，键名不同 |
+| 租约登记 | 曾走**核心**的 `workspace/register` 通知（`plugin_bus.dart:5067-5099`） | 走**执行站命令** `ssh.lease.register`（`exec_station.dart:180-181`） | **已统一（片 3）**：两侧都走执行站命令（本机 `local.lease.register`），核心那张表已撤 |
 
 > 最后一行是本表里唯一"看着像差异、其实是两套系统"的项：本机命令带
 > `lease_id` / `workspace_id` 由**核心**注入 `root`；SSH 命令带 `ssh_lease_id`
 > 由**插件**自己查表（`exec_station.dart:282`）。给 SSH 命令塞 `lease_id`
 > 会被核心按"租约未登记"拒（§1.3 第 1 行），反之亦然。
+>
+> **片 3 之后**这两句都不再成立：核心不注入 `root`、也不拒"未登记的 lease_id"
+> ——两条 `lease_id` 都只对各自的执行器插件有意义，核心一律原样转发。
+> 唯一还成立的是"混用会失败"（执行器自己查不到就显式报错）。见 §8.3。
 >
 > 「非 UTF-8 一律内联 base64」与交接文档 §8 的硬约束（大文件只能走
 > `body_path` / `result_path`）之间有张力：小二进制没事，整份二进制读走内联
@@ -262,8 +269,8 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 
 | 分区 | 码 | 出处（§1.3 的哪一行） | 调用方该做什么 |
 | --- | --- | --- | --- |
-| 核心 | `lease_unknown` | 1 | 先 `workspace/register` 再重发 |
-| 核心 | `lease_foreign` | 2 | 别跨插件借租约，报错即可 |
+| ~~核心~~ | ~~`lease_unknown`~~ | ~~1~~ | **片 3 撤除**：核心不再判"租约未登记"；未登记由执行器插件报 `local_lease_unknown` / `ssh_lease_unknown`（§3） |
+| ~~核心~~ | ~~`lease_foreign`~~ | ~~2~~ | **片 3 撤除**：跨插件借用由执行器插件按 `meta.source_plugin_id` 比对 ⇒ `lease_denied`（§8.3） |
 | 核心 | `command_unknown` | 3 | 看 `error` 里的可用命令表，改命令名 |
 | 站点 | `station_disabled` | 4 | 等启用或换挂载 |
 | 站点 | `scope_denied` | 5 | 身份/隔离不对，**不重试** |
@@ -443,7 +450,7 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | --- | --- | --- | --- |
 | 1 | 点位表删八族（Q-5 A）+ 撤 `tool.` / `agent.` 前缀禁令 + 落盘空壳对账 + §5 门禁 + 文档口径 | 桌面 | 无 |
 | 2 | 执行器改名（§8.1）+ 四条能力补齐（§8.2）+ `local.lease.register` + 两侧补 `source_plugin_id` 比对（§8.3） | 插件 | 片 1 先合（否则名字被内置点位表挡着） |
-| 3 | 撤协议面 `workspace/register` 与核心租约簿记（§8.3） | 桌面 | **片 2 已上线**，两片之间不能发版断档 |
+| 3 | 撤协议面 `workspace/register` 与核心租约簿记（§8.3） | 桌面 | **片 2 已上线**，两片之间不能发版断档 → **已合（2026-10-31，插件仓 `2f30c5e`）** |
 | 4 | 调用方换口：tree.agent / compact / sample + 清 `reconnectSsh` 死代码 | 插件 | 片 2 |
 | 5+ | 已拍板的 `code` 字段链路（§4），码表新增 `lease_denied` | 两仓 | 片 1 |
 
@@ -477,7 +484,18 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
   重新 `ssh.lease.register`」（`down` ⇒ 清零退避重建，健康 ⇒ 复用）。
   桌面侧同步收了 `nonProtocolPluginMethodLiterals` 的六个命令名字面量与
   `builtin_plugins.dart:230` 的演示文案。
-- **片 3 / 片 5 未开始**；**#43 仍未收口**：compact 与 sample 的命令换口卡在 §7 Q-7
+- **片 3 已合（桌面仓本节 + 插件仓 `2f30c5e`，2026-10-31）**：核心那张
+  `_workspaces` 表、`root` 注入、`_handleWorkspaceRegister` 与 `_releasePluginExecutors`
+  里的清租约一起撤掉；协议面 `PluginRpcMethods.workspaceRegister` 移出
+  `pluginToCoreNotifications`，只留一条改名成 `retiredWorkspaceRegister` 的**墓碑常量**
+  ——收到旧产物的通知就记一条日志后丢弃，不静默、也不降级成 `plugin_event`。
+  门禁同步：两处增量基线断言（热重启基线 +2 = `suspend` / `api/delegate`；片 A 基线上
+  **只增** `api/delegate`），插件仓 `_kit` 的 `M` 表删掉同名常量（否则「骨架方法名逐个
+  已登记」会反向报）。`sanitizeStationArguments` 保留「丢弃调用方自带的 `root` /
+  `workspace_root`」——它现在是不变量里**唯一**的核心侧落点。
+  版本耦合：本轮两仓必须同发版；旧产物（`tree.agent` < 片 4）会发一条被丢弃的
+  `workspace/register`，旧 `file.*` 在片 1 起就已经不可用。
+- **片 5 未开始**；**#43 仍未收口**：compact 与 sample 的命令换口卡在 §7 Q-7
   （那四条名字到今天没有承接方，不是回归，是 A 的另一半没做）。片 2 落地前领域命令
   在真机上报「暂无挂载位置」，落地后 `local.*` / `ssh.*` 两族是**能打通**的，
   只有 `llm.* / tool.* / agent.* / session.*` 还悬着。

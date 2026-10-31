@@ -97,12 +97,17 @@ abstract final class PluginRpcMethods {
   /// 插件自报日志（核心不按名字分支，原样转成前端 `plugin_event`）。
   static const String log = 'log';
 
-  /// **登记工作空间租约**（插件化新增；插件 → 核心，通知）。
+  /// **已撤除的协议面**（2026-10-31 片 3，契约 §8.3）：工作空间租约登记通知。
   ///
-  /// `{lease_id, dir}`：核心按 `pluginId + lease_id` 记录「字符串 → 本机目录」，
-  /// 之后该插件发 `station/command` 带 `lease_id` 时，核心把 `root` 注入命令参数；
-  /// 租约只对登记方开放，跨插件使用 fail-closed。核心不解释目录语义。
-  static const String workspaceRegister = 'workspace/register';
+  /// 曾经 `{lease_id, dir}` 在核心登记「字符串 → 本机目录」，核心在
+  /// `station/command` 里注入 `root`。租约统一到插件侧之后（本机
+  /// `local.lease.register`、远端 `ssh.lease.register`），核心既没有目录表也不
+  /// 注入 `root`，这条通知没有承接方。
+  ///
+  /// 常量留在这里**只为认出旧产物**：收到就记一条日志后丢弃，不静默、也不降级成
+  /// `plugin_event`。它**不在** [coreToPlugin] / [pluginToCoreRequests] /
+  /// [pluginToCoreNotifications] 里，因此 [all] 与基线增量都不包含它。
+  static const String retiredWorkspaceRegister = 'workspace/register';
 
   // ── 集合与派生读数 ──────────────────────────────────────────────────
 
@@ -133,15 +138,16 @@ abstract final class PluginRpcMethods {
   /// 插件 → 核心的通知（不等应答）。
   ///
   /// ⚠ 口径：**按名字分流**的通知目前只有 [stationStream]（进流式回填的数据面）；
-  /// [workspaceRegister] 是插件化片 A **只登记协议**、核心处理在片 C；
   /// [log] 是**约定名**——核心不认它，而是把整条通知原样转成前端 `plugin_event`
   /// （见 `PluginBus._emitPluginEvent` 与 `PluginHost.notifications`）。把它列在本表里
   /// 是为了让门禁能识别它为已登记的协议名，而不是误报成飘的字面量。
   /// （插件也可以推 `event` 通知，那个名字已在 [event] 里登记，不重复列。）
+  ///
+  /// 2026-10-31 片 3 撤走了 [retiredWorkspaceRegister]（租约搬到执行器插件）：
+  /// 通知面因此只剩两条，增量基线断言跟着改。
   static const Set<String> pluginToCoreNotifications = <String>{
     stationStream,
     log,
-    workspaceRegister,
   };
 
   /// 全部方法名（门禁用例据此判定"字面量是否已登记"）。
@@ -182,10 +188,11 @@ abstract final class PluginRpcMethods {
   static Set<String> addedSinceBaseline() =>
       all.difference(baselineBeforeHotRestart);
 
-  /// **UI 插件化（协议片 A）之前的基线**（= [all] 去掉 [apiDelegate] /
-  /// [workspaceRegister]，即热重启任务收尾时的快照）。
+  /// **UI 插件化（协议片 A）之前的基线**（= [all] 去掉 [apiDelegate]，
+  /// 即热重启任务收尾时的快照）。
   ///
-  /// 为什么再钉一份：片 A 只允许新增这两条，其余一律视为协议漂移。
+  /// 为什么再钉一份：片 A 只允许新增 [apiDelegate]（`workspace/register` 已于
+  /// 2026-10-31 片 3 撤除并移出 [all]，基线快照保留历史、不再引用它）。
   static const Set<String> baselineBeforeUiPluginization = <String>{
     ...baselineBeforeHotRestart,
     suspend,

@@ -109,9 +109,11 @@
 | 方法                   | 方向             | 说明                                                                                        |
 | -------------------- | -------------- | ----------------------------------------------------------------------------------------- |
 | `api/delegate`       | 核心 → 插件（请求/应答） | 委派一次 HTTP 请求；回包 `{status, headers?, body}`                                                |
-| `workspace/register` | 插件 → 核心（通知）    | 登记 `{workspace_id, dir}`，供委派信封解析 `workspace_dir`。核心只做"字符串 → 路径"映射，不解释语义；写入仅限登记方，读取对所有插件开放 |
+| ~~`workspace/register`~~ | ~~插件 → 核心（通知）~~ | **已于 2026-10-31 撤除**（[契约 §8.3](../exec_station_contract.md) 片 3）：`lease_id → dir` 那张表改由 `local_executor` / `ssh_executor` 自己持有，核心没有目录簿记、不注入 `root`，也不再认这条通知（旧产物发过来 ⇒ 记一条日志后丢弃，不降级成 `plugin_event`） |
 
 `api/delegate` 必须登记进 `PluginRpcMethods.coreToPlugin`，并同步 `plugin_rpc_method_gate_test.dart` 的计数基线。
+
+`workspace/register` 是这条面上目前**撤掉**的一条：它当初「只登记协议、实现留给片 C」，而片 C 之后租约彻底归执行器插件，留着常量就是给插件作者一张不存在的路。撤它要同步四处——常量表、`pluginToCoreNotifications`、`plugin_rpc_method_gate_test.dart` 的两个增量基线断言、插件仓 `_kit/plugin_kit.dart` 的 `M` 表（否则「骨架方法名逐个已登记」那条门禁会反向报）。
 
 ### 3.4 点位新增（两站，各自六件同时交付，见 plugin/README 不变量 30）
 
@@ -670,7 +672,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 | 片 | 内容                   | 涉及文件                                                                                                                                                                                                | 验收                                                                                       |
 | - | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| A | 协议面新增                | `api_paths.dart`（+3 路径、`coreOwned` / `delegated` / `pendingHandoffRoutes` 集合与命名空间规则）、`ws_inbound.dart`（+6 帧）、`ws_outbound.dart`（+1 帧）、`station_ws.dart`、`meta.dart`、`plugin_rpc_methods.dart`（+`api/delegate`、`workspace/register`） | 契约集合自检、命名空间规则用例与新帧编解码用例全绿 |
+| A | 协议面新增                | `api_paths.dart`（+3 路径、`coreOwned` / `delegated` / `pendingHandoffRoutes` 集合与命名空间规则）、`ws_inbound.dart`（+6 帧）、`ws_outbound.dart`（+1 帧）、`station_ws.dart`、`meta.dart`、`plugin_rpc_methods.dart`（+`api/delegate`、`workspace/register`——后者已于片 3 撤除，见 §3.3） | 契约集合自检、命名空间规则用例与新帧编解码用例全绿 |
 | B | 站点接 WS + meta + 推送通道 | `core_server.dart`（连接身份、`ui.hello`、`/api/meta`）、`station_instance.dart`（订阅通道抽象、`closed` 终止帧）、`stations.dart`（订阅与注册权限、`topics[]` 过滤、按 `plugin_id` 归属）、`plugin_bus.dart`（投递分流）                        | 订广播收到投递 / 订自建站收到推送 / 下线收到 `closed` / 订中转被拒 / 身份不符被拒 / 申报后 `meta` 增长 / UI 自建站只限广播 / 关窗不销毁 |
 | C | 委派 + **18 条全搬**      | `http_router.dart`（`DelegatedRouter` 命名空间规则）、`core_server.dart`（查表点、核心路由冲突绑定、信封构造、`body_path`/`result_path` 落盘与清理）、`station_points.dart`（新收集站）、`station_ids.dart`、`plugin_bus.dart`（`api/delegate` 路由）、移除 18 条核心路由并同步删 `pendingHandoffRoutes` | 插件未装/停用/在位三态正确；核心 router 键集 == `coreOwned ∪ pendingHandoffRoutes`；大文件下载无完整内存驻留 |
 | D | runtime:ui           | `builtin_plugins.dart`（`runtime` 取值）、`plugin_config_store.dart`（`runtime` 两档）、`ui_host.dart`、`plugin_bus.dart`（`_startOne` 分叉）、`plugin_downloader.dart`（卸载目标）                                              | 多 UI 并存；卸一个不影响其他；全停用后核心健康                                                                |

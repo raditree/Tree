@@ -254,7 +254,7 @@
 | L-22 | `core_settings.dart` 拆分（平台级 / 领域级） | 未开始（复核维持） | 核心 `core_settings.dart` 仍同时持有 `CoreModelConfig` / `models` / `token_acquisition_rate` 与 `frame_rate` / heartbeat 等平台项 | 按 [§4.8](agent_pluginization.md#48-core_settingsdart-必须先拆分) 拆分；拆分前不得开始 A1 数据接管 |
 | L-23 | 插件 scope 去领域化（`team_id/agent_id/session_id/mode_key`） | 未开始（复核维持） | `station_scope.dart:47-65` 四字段仍在；`execute_mounts.dart` / `station_instance.dart` 仍以 team/agent/session/mode 做 fail-closed 授权（勘测见 [§10.3](agent_pluginization.md#103-勘测插件-scope-仍含领域字段应去掉)） | 三步走：通用 `context` 先扩后收；授权搬到「执行器插件 + workspace 租约」；最后删字段。协议破坏性变更，需单独立项 |
 | L-24 | 新建 `local_executor` 插件（本地 `Process.start` + 文件操作 + PTY） | **已闭环（2026-10-25）** | 本地站 `plugin.local_executor.execute.local`（23/23 自检）；SSH 站 `plugin.ssh_executor.execute.ssh_workspace`（`8a5f6ee`）；本地 PTY 随插件分发（`lib/src/pty/`），终端 REST + 广播已接（见 L-26） | SSH 后台 hook 不支持 | — |
-| L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | **部分落地（2026-10-25）**：本地/SSH 两个自建执行站、命令表、`lease_id`、相对路径与可读错误已成型；terminal 改由 REST + 广播承载（不再进执行站命令表） | 后台 hook 的交互闭环未接；执行站错误码与幂等尚未统一登记 | 把站点名、参数、错误码、幂等写进契约（执行站仍由插件内部定义）；核心只登记 `lease_id → dir` 并路由 |
+| L-25 | 执行器执行站契约（`exec.command` / `file.*` / `terminal.*`）与 workspace 租约 | **部分落地（2026-10-31 收到契约 §8 的片 1 / 2 / 3 / 4）**：本地/SSH 两个自建执行站命令表已对称成 `local.*` / `ssh.*` 各 10 条，`lease_id`、相对路径与可读错误已成型；terminal 改由 REST + 广播承载（不再进执行站命令表） | 错误码 `code` 字段链路与幂等还没落（契约 §4，片 5）；`llm.*` / `tool.*` / `agent.*` / `session.*` 无承接方（契约 §7 Q-7） | 把站点名、参数、错误码、幂等写进契约（执行站仍由插件内部定义）；**租约由执行器插件登记，核心只转发** |
 | L-26 | ~~核心通用流中继原语~~ → **执行器插件提供终端 REST + 广播站** | **已闭环（2026-10-25）** | 本地：`/api/terminal/local/sessions...` + 站 `plugin.local_executor.broadcast.terminal`；SSH：`/api/terminal/ssh/sessions...` + 站 `plugin.ssh_executor.broadcast.terminal`；topic `terminal.<session>.output/.exit`；UI 传输面 `lib/ui/services/terminal_transport.dart` | SSH 侧复用 tree.agent 的租约（UI 无密码），无租约 ⇒ 409 | 详见 [known-issues #37](../known-issues.md) |
 | L-19 | G-1 对照表本身（36 行，含样例） | **已闭环**（`bda9df9`，2026-10-25） | — | 见 [agent_api_contract.md](agent_api_contract.md)：36 条 G-1 + 2 条 spec 附录，含全局约定、逐条样例与 C-01~C-12 契约缺口 |
 | L-28 | 委派白名单 `ApiPaths.delegated` 去静态化 | **已闭环**（`6a30e81`，2026-10-25） | — | 已落地命名空间规则 + 保留前缀 + 归属表冲突检测；双跑期同键申报接受并标 shadowed（2026-10-25 修正，见 A-5）。门禁改为「核心 router 键集 == `coreOwned`；`pendingHandoffRoutes` 为空」。证据：`ui-pluginization.md` §4.5、`http_router.dart`、`server_test.dart`、`delegated_rest_test.dart` |
@@ -296,7 +296,7 @@
 | settings 拆分 | **已定**：平台级留核心（frame_rate/heartbeat/telemetry）、领域级随迁（模型池/token 节奏）→ L-22 |
 | scope 去领域化 | **已定方向**：移除 `team_id/agent_id/session_id/mode_key`，授权搬到「执行器插件 + workspace 租约」→ L-23 |
 | 执行与文件 | **已定**：核心零 PTY / 零文件操作；本地执行、文件修改、终端归 `local_executor`，远端归 `ssh_executor`；执行站由**两个插件内部定义**（非核心内置）→ L-24~L-26 |
-| 核心职责 | 只做插件生命周期 / 站点总线 / 传输 / 通用键值存储与日志 / 租约登记 / 认证；业务数据与领域授权一律归插件 |
+| 核心职责 | 只做插件生命周期 / 站点总线 / 传输 / 通用键值存储与日志 / 认证；租约簿记与领域授权一律归插件（契约 §8.3） |
 | 路由基线 | **已定**：冻结实测 36 条（34 存量 + 2 新增）为基线；核心永久面 **39 条**（36 + UI 多窗口 3）；是否裁剪另立 L-27 |
 | 路由申报 | **目标形态（L-28 已落地）**：核心只硬编码自己的 **39 条**（36 基线 + UI 多窗口 3）；其余 **54 条**由插件经 `system.collect.api.routes` 运行期申报，核心只维护归属表并转发（详见 [agent_pluginization.md](agent_pluginization.md) §10.4）；放行规则为命名空间规则 + 保留前缀 + 同键申报标 shadowed（coreOwned 拒收），无静态白名单 |
 

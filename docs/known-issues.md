@@ -2406,8 +2406,9 @@ test/plugin_close_no_hard_timeout_test.dart: A 心跳在、只是慢 ⇒ 跑很�
 
 ## #43 A5 撤了领域实现，没撤点位表：20 条内置命令"申报了、路由得到、执行必失败"，随包插件 compact 四条全踩在上面
 
-**状态**：**片 1（桌面侧）+ 片 2 / 片 4（插件侧）已修，2026-10-31**；文件与终端两族
-在真机上**已经能打通**（`local.*` / `ssh.*` 各 10 条、两侧对称、租约在插件侧）。
+**状态**：**片 1（桌面侧）+ 片 2 / 片 3 / 片 4（两侧）已修，2026-10-31**；文件与终端
+两族在真机上**已经能打通**（`local.*` / `ssh.*` 各 10 条、两侧对称、租约全部在插件侧，
+核心那张 `_workspaces` 表与 `workspace/register` 协议面已随片 3 撤除）。
 剩下的是"让名"的另一半：`llm.* / tool.* / agent.* / session.*` 还没有实现方申报，
 compact 与 sample 因此仍踩在空名字上（见下方「片 2 / 片 4 收口记录」与契约 §7 Q-7）。
 方向已拍板走 A，见 [exec_station_contract.md](exec_station_contract.md) §7 Q-5
@@ -2492,9 +2493,11 @@ compact 与 sample 因此仍踩在空名字上（见下方「片 2 / 片 4 收�
    执行器那一侧）/ §5.6（`station/call` + `system.execute.tool` 的错误示例）/ §6.1
    （两类命令分开读）/ §11，以及 `agent_pluginization.md` 那句"A5 删除"的过渡期说明。
 
-**没做**：`workspace/register` 与核心租约簿记仍在（片 3，协议破坏性改动，必须整片落）；
-`builtin_plugins.dart:230` 示例插件描述里的四个演示开关仍写旧名（随片 2 一起改，改早了
-会与还没动的插件产物更不符）。
+**没做**（片 1 时点）：`workspace/register` 与核心租约簿记仍在（片 3，协议破坏性
+改动，必须整片落）；`builtin_plugins.dart:230` 示例插件描述里的四个演示开关仍写旧名
+（随片 2 一起改，改早了会与还没动的插件产物更不符）。
+→ **两项都已收口**：前者随片 3（桌面 + 插件仓 `2f30c5e`，2026-10-31）撤除，
+后者随片 4 改掉。见下「片 3 收口记录」。
 
 ### 片 2 / 片 4 收口记录（2026-10-31，插件仓 `fb496e0` + `7313ae7`）
 
@@ -2510,6 +2513,22 @@ compact 与 sample 因此仍踩在空名字上（见下方「片 2 / 片 4 收�
   桌面侧同步：`nonProtocolPluginMethodLiterals` 六个命令名字面量改登记 `local.*`
   （否则门禁的"死条目"断言会红），`builtin_plugins.dart` 的示例文案不再承诺那四条
   演示命令跑得通。
+
+### 片 3 收口记录（2026-10-31，桌面仓 + 插件仓 `2f30c5e`）
+
+- 桌面侧：`plugin_bus.dart` 的 `_workspaces` 表、`_workspaceKey`、`_handleWorkspaceRegister`、
+  `_handleStationCommand` 里的 `root` 注入与「租约命令直送」分支、`_releasePluginExecutors`
+  里的清租约全部删除；一条命令的执行路径只剩「按 command 找站点 → 交给执行器」。
+- 协议面：`PluginRpcMethods.workspaceRegister` 移出 `pluginToCoreNotifications`，改名为
+  `retiredWorkspaceRegister` 的**墓碑常量**——只为认出旧产物并在通知入口记一条日志后丢弃
+  （不静默、不降级成 `plugin_event`）。门禁两处增量断言同步：热重启基线 +2
+  （`suspend` / `api/delegate`）、片 A 基线上**只增** `api/delegate`。
+- 插件侧：骨架 `_kit/plugin_kit.dart` 的 `M` 表删掉同名常量（否则「骨架方法名逐个已登记」
+  那条门禁会反向报）。
+- 保留的那一半：`sanitizeStationArguments` 仍丢弃调用方自带的 `root` / `workspace_root`
+  ——核心不再注入 `root` 之后，这是不变量「root 只来自租约表」在核心侧的唯一落点。
+- 发版约束：两仓必须同发版。旧产物（`tree.agent` < 片 4）会发一条被丢弃的
+  `workspace/register`；旧 `file.*` 从片 1 起就已不可用。
 
 **这条 issue 还没收口**：compact 的四条（`llm.call` / `fs.read` / `tool.call` /
 `agent.compact`）与 sample 的四个演示开关**至今没有承接方**。换名解决不了——

@@ -1,7 +1,4 @@
 import 'dart:async';
-import 'dart:io';
-
-import 'package:path/path.dart' as p;
 
 import 'package:tree_protocol/tree_protocol.dart'
     show ApiMetaBranding, PluginRpcMethods;
@@ -287,14 +284,6 @@ class PluginBus {
 
   final List<PluginConfig> _configs = <PluginConfig>[];
   final Map<String, PluginHost> _hosts = <String, PluginHost>{};
-
-  /// 插件登记的工作空间租约：`workspace_id` → (绝对根目录, 登记方)。
-  ///
-  /// 只做「字符串 → 路径」映射与归属校验；执行站收到带 `workspace_id` 的命令时
-  /// 把 `root` 注入 arguments 并**直接交给插件执行器**，核心不再解析
-  /// agent/team/mode 这类领域身份，也不碰文件。
-  final Map<String, ({String root, String pluginId})> _workspaces =
-      <String, ({String root, String pluginId})>{};
 
   /// **UI 插件实例**（片 D）。
   ///
@@ -1346,8 +1335,16 @@ class PluginBus {
     final Map<String, dynamic> params = rawParams is Map
         ? rawParams.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
         : <String, dynamic>{};
-    if (method == PluginRpcMethods.workspaceRegister) {
-      _handleWorkspaceRegister(pluginId, params);
+    if (method == PluginRpcMethods.retiredWorkspaceRegister) {
+      // 片 3（2026-10-31）：租约整体搬到执行器插件（local.lease.register /
+      // ssh.lease.register），核心不再持有目录表、不注入 root，这条通知没有
+      // 承接方。旧产物还会发它 —— 记一条日志后丢弃，不让它降级成
+      // plugin_event 推给前端（那是插件事件通道，不是协议面）。
+      log?.call(
+        '插件 $pluginId 的 workspace/register 已撤除（契约 §8.3：租约改为执行器'
+        '插件内的 local.lease.register / ssh.lease.register，核心不再注入 root），'
+        '本条已丢弃：${params['lease_id'] ?? params['workspace_id'] ?? ''}',
+      );
       return;
     }
     if (method == PluginRpcMethods.log) {
@@ -3981,42 +3978,6 @@ class PluginBus {
     return a == b;
   }
 
-  /// 租约键：插件命名空间 + 插件给的名字（跨插件同名不冲突）。
-  static String _workspaceKey(String pluginId, String leaseId) =>
-      '$pluginId#$leaseId';
-
-  /// 插件登记工作空间根目录（通知）。只做路径校验与归属记录，不解读语义。
-  void _handleWorkspaceRegister(
-    String pluginId,
-    Map<String, dynamic> params,
-  ) {
-    final String id =
-        (params['lease_id'] ?? params['workspace_id'] ?? '').toString().trim();
-    final String dir = (params['dir'] ?? '').toString().trim();
-    if (id.isEmpty || dir.isEmpty) {
-      log?.call('插件 $pluginId 的 workspace/register 缺少 workspace_id / dir，已忽略');
-      return;
-    }
-    if (!p.isAbsolute(dir)) {
-      log?.call('插件 $pluginId 登记的工作空间不是绝对路径（$dir），已忽略');
-      return;
-    }
-    final String normalized = p.normalize(dir);
-    if (!Directory(normalized).existsSync()) {
-      log?.call('插件 $pluginId 登记的工作空间不存在（$normalized），已忽略');
-      return;
-    }
-    // 租约键按插件命名空间隔离：同名 lease_id 不属于别的插件，也不可能被抢。
-    final String key = _workspaceKey(pluginId, id);
-    final ({String root, String pluginId})? existing = _workspaces[key];
-    if (existing != null && existing.pluginId != pluginId) {
-      log?.call('插件 $pluginId 不能改写别人的工作空间租约 $id');
-      return;
-    }
-    _workspaces[key] = (root: normalized, pluginId: pluginId);
-    log?.call('插件 $pluginId 登记工作空间 $id → $normalized');
-  }
-
   // ── 插件 → 核心的请求通道（M9 §3「插件主动下命令」） ────────────────────
 
   /// 插件主动发起的请求（JSON-RPC `method` + `id`）的总入口（宿主
@@ -5022,10 +4983,13 @@ class PluginBus {
   /// 执行站的结论（含**可读错误**）原样放进 result 回给插件：命令被拒 / 挂载位置
   /// 失败不是 JSON-RPC 错误，而是 {ok: false, error: ...}——插件据此自查原因，
   /// 不会被吞成一句“调用失败”。
-  /// 执行站命令参数的**边界清洗**：租约是 root 的唯一来源。
+  /// 执行站命令参数的**边界清洗**：调用方（任何插件）自带的 root /
+  /// workspace_root 一律丢弃。
   ///
-  /// 调用方（任何插件）自带的 root / workspace_root 一律丢弃；需要根的命令
-  /// 没有租约时由执行器显式失败，不能借无租约命令把执行器指到任意目录。
+  /// `root` 的唯一来源是**执行器插件自己那张租约表**（`local.lease.register` /
+  /// `ssh.lease.register`，契约 §8.3）：核心既没有目录表也不注入 root，所以这里
+  /// 只需要保证"问的人不能把 root 塞进命令参数"这一半；没有租约的命令由执行器
+  /// 显式失败，不能借无租约命令把执行器指到任意目录。
   static Map<String, dynamic> sanitizeStationArguments(Object? raw) {
     final Map<String, dynamic> arguments = raw is Map
         ? raw.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
@@ -5065,42 +5029,10 @@ class PluginBus {
       params,
       arguments,
     );
-    // 工作空间租约（L-24）：带 lease_id 的命令由**插件执行器**在自己登记的
-    // 根目录里执行；核心只注入 root、把命令直送插件，不解析 agent/team/mode、
-    // 不碰文件、不起进程。租约只对登记方开放（跨插件 fail-closed）。
-    final String leaseId =
-        (arguments['lease_id'] ?? arguments['workspace_id'] ?? '')
-            .toString()
-            .trim();
-    String leaseRoot = '';
-    if (leaseId.isNotEmpty) {
-      final ({String root, String pluginId})? lease =
-          _workspaces[_workspaceKey(config.id, leaseId)];
-      if (lease == null) {
-        return <String, dynamic>{
-          'command': command,
-          'ok': false,
-          'mount_id': '',
-          'payload': null,
-          'error':
-              '工作空间租约 $leaseId 未登记（先发 workspace/register，'
-              '再下带 lease_id 的命令）',
-        };
-      }
-      if (lease.pluginId != config.id) {
-        return <String, dynamic>{
-          'command': command,
-          'ok': false,
-          'mount_id': '',
-          'payload': null,
-          'error':
-              '工作空间租约 $leaseId 属于插件 ${lease.pluginId}，'
-              '不能跨插件使用（fail-closed）',
-        };
-      }
-      leaseRoot = lease.root;
-      arguments['root'] = leaseRoot;
-    }
+    // 片 3（2026-10-31）：这里原来有一张 `_workspaces` 租约表 + `root` 注入。
+    // 租约统一到执行器插件侧之后（契约 §8.3），带 `lease_id` 的命令由**插件
+    // 执行器**按自己的租约表解析根目录；核心不解析 agent/team/mode、不碰文件、
+    // 不起进程，也不需要知道租约是否存在（未登记由执行器显式失败）。
     // 命令 → 点位：先查核心内置点位，再查**插件自建执行站**的命令表。
     ExecuteStation? station = stations.executeForCommand(command);
     if (station == null) {
@@ -5125,22 +5057,6 @@ class PluginBus {
         'mount_id': '',
         'payload': null,
         'error': '未知命令 $command（可用命令：${allowed.join('、')}）',
-      };
-    }
-    // 租约命令跳过内置挂载的 _resolveTarget：直接交给插件执行器。
-    if (leaseRoot.isNotEmpty) {
-      final StationCommandResult leased = await station.execute(
-        command: command,
-        scope: scope,
-        arguments: arguments,
-        sourcePluginId: config.id,
-      );
-      return <String, dynamic>{
-        'command': leased.command,
-        'ok': leased.ok,
-        'mount_id': leased.mountId,
-        'payload': leased.payload,
-        'error': leased.error,
       };
     }
     final StationCommandResult result = await station.execute(
@@ -5855,22 +5771,21 @@ class PluginBus {
     );
   }
 
-  /// 撤掉某插件的执行站挂载与工作空间租约（下线 / 停用 / 卸载共用）。
+  /// 撤掉某插件的执行站挂载（下线 / 停用 / 卸载共用）。
+  ///
+  /// 工作空间租约不用在这里清：那张表在**执行器插件自己**那里（契约 §8.3），
+  /// 插件进程一退，租约随进程消失。
   void _releasePluginExecutors(String pluginId) {
     for (final StationInstance station in stations.stationList()) {
       if (station is ExecuteStation) {
         station.unmount('plugin.$pluginId');
       }
     }
-    _workspaces.removeWhere(
-      (String _, ({String root, String pluginId}) lease) =>
-          lease.pluginId == pluginId,
-    );
   }
 
   Future<void> _disconnect(String pluginId, {bool awaitExit = false}) async {
     final PluginHost? host = _hosts.remove(pluginId);
-    // 执行器插件下线 / 卸载 ⇒ 撤掉它挂到执行站的命令与它登记的工作空间租约。
+    // 执行器插件下线 / 卸载 ⇒ 撤掉它挂到执行站的命令。
     // 否则 100 优先级的挂载会永久压住核心实现，卸载即坏。
     _releasePluginExecutors(pluginId);
     // 片 D：UI 宿主与 stdio 宿主是两张表。断开时两边都收：哪怕配置刚改成 ui
