@@ -128,6 +128,25 @@ void main() {
   Future<void> settle(int ms) =>
       Future<void>.delayed(Duration(milliseconds: ms));
 
+  /// 等总线**真的又收到过一条入站证据**（丢拍被清零）——把「心跳在」这件事
+  /// 挂在证据上，而不是挂在挂钟上。
+  ///
+  /// 为什么必须等：收尸判据是「连续 N 拍没有入站证据」，而证据是否到位取决于
+  /// 测试 isolate 有没有被调度到。全量并发（真插件进程 + 真 IO）下事件循环抖动
+  /// 可以超过整个判活窗口，健康但慢的插件因此被误收尸（假红，known-issues #42
+  /// 同类）。等不到证据说明用例前提「链路在、只是慢」本身不成立，直接明说。
+  Future<void> waitBeatEvidence(PluginBus bus, String id) async {
+    final DateTime deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (DateTime.now().isBefore(deadline)) {
+      final Iterable<Map<String, dynamic>> rows = bus.reapingReadings().where(
+        (Map<String, dynamic> row) => row['plugin_id'] == id,
+      );
+      if (rows.isNotEmpty && rows.single['missed_heartbeats'] == 0) return;
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    fail('$id 在 5s 内没有新的入站心跳证据：前提「链路在、只是慢」已不成立');
+  }
+
   List<String> idsOf(List<PluginReconcileAction> actions) => <String>[
     for (final PluginReconcileAction action in actions) action.pluginId,
   ];
@@ -137,9 +156,9 @@ void main() {
   test('A 心跳在、只是慢 ⇒ 跑很多拍看门狗也绝不收尸（D8 的正命题）', () async {
     // 心跳间隔比“看门狗拍的节奏”密得多：这才是“链路在、只是慢”的真实形状。
     // 反过来（拍比心跳密）本来就该被判失活，那不是本条要钉的东西。
-    // 取 120ms / 3 拍 = 360ms 窗口（而不是贴着 40ms 轮询的 120ms 窗口）：
-    // 全量套件并行跑真插件进程时事件循环偶发抖动，贴着窗口会把“链路仍在”
-    // 误判成连续丢拍；本条要钉的是“心跳在就不杀”，不是测调度器的抖动幅度。
+    // 每轮看门狗之前先等到新的入站证据（见 [waitBeatEvidence]）：判据挂在证据上，
+    // 窗口宽多少就不再取决于调度器抖多少。早先只把 120ms 撑到 360ms 去压抖动，
+    // 满负载跑全量时仍会被跨过（known-issues #42 同类），现在从根上钉死。
     writeEntries(entry('alpha', beatMs: 5));
     final PluginBus bus = newBus(const Duration(milliseconds: 120));
     await bus.start();
@@ -155,11 +174,12 @@ void main() {
       reason: '退出还没确认 ⇒ 挂在收尸台账上',
     );
 
-    // 15 轮看门狗（每轮之间留 40ms，总共≈600ms，远超"3 拍"）：
-    // 插件每 5ms 发一条通知 ⇒ 每一轮都必然有新的心跳证据把丢拍清零
+    // 15 轮看门狗：每轮先确认「自上一拍以来又收到过入站证据」，再让看门狗记一次
+    // miss。丢拍因此永远只到 1、绝到不了 3 ⇒ 收尸路径根本不会被触发。
+    // 这钉的是 D8 的正命题（心跳在就不是杀人的理由），不再顺带测调度器的抖动幅度。
     for (int round = 0; round < 15; round++) {
+      await waitBeatEvidence(bus, 'alpha');
       await bus.watchdog();
-      await settle(40);
     }
 
     expect(bus.straysKilled, 0, reason: '心跳在就不是杀人的理由（D8）');
