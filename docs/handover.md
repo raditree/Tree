@@ -99,7 +99,7 @@ UI 插件（WebSocket 客户端）
 
 | 套件 | 结果 |
 | --- | --- |
-| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped** |
+| `packages/tree_core` | analyze 干净；`dart test` **618 passed / 2 skipped**（#42 修复后连续多轮全量稳定复现） |
 | `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁） |
 | 根仓 | `flutter analyze` 仅既有 10 issues（`tree_tunnel_protocol` + `thinking_window_test`，与插件化无关）；`flutter test` **886 passed** |
 | `plugins/tree.agent` | **363 passed** |
@@ -113,24 +113,26 @@ UI 插件（WebSocket 客户端）
 
 ### 5.1 工具链
 
-- 维护版本：**Flutter 3.47.5 / Dart 3.13.4**。
-- ⚠️ PATH 里的 `dart`/`flutter` 可能是 2.19 老 SDK，会给出莫名其妙的语法/依赖错误。
-  一律用维护 SDK 全路径：`<flutter-sdk>/bin/dart.bat`、`<flutter-sdk>/bin/flutter.bat`。
+- 维护版本：**Flutter 3.47.5 / Dart 3.13.4**，本机实测在
+  `D:\app\flutter-sdk-3.47.5\flutter\bin\`（`dart.bat` / `flutter.bat`）。
+- ⚠️ PATH 里的 `dart`/`flutter` 指向 `D:\app\flutter\flutter`，是 **2.19.6** 老 SDK，
+  会给出莫名其妙的语法/依赖错误。一律用上面维护 SDK 的全路径。
 - 两套 SDK 并存时，收尾前关掉另一套 SDK 的 IDE，避免旧缓冲区覆盖已提交代码。
 
 ### 5.2 门禁（每个改动片按此顺序）
 
 ```powershell
-# 1) 静态检查（改动的包，无新增 error / warning）
+# 1) 静态检查（改动的包，无新增 error / warning）—— 从根目录跑路径形式即可
 <flutter-sdk>/bin/dart.bat analyze packages/tree_core
-# 2) 包内全量测试
-<flutter-sdk>/bin/dart.bat test packages/tree_core
+# 2) 包内全量测试 —— 必须先进包目录（根包是 Flutter app，没有 package:test，
+#    从根目录跑 `dart test packages/xxx` 会报 "Could not find package `test`"）
+cd packages/tree_core; <flutter-sdk>/bin/dart.bat test
 # 3) 契约 / 文档门禁（路由或帧有变动时必跑）
-<flutter-sdk>/bin/dart.bat test packages/tree_protocol
-# 4) 插件仓零核心依赖检查
+cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
+# 4) 插件仓零核心依赖检查（从根目录跑）
 <flutter-sdk>/bin/dart.bat run tool/check_plugin_repo_contract.dart
 #    （插件仓内用 --plugin-root . 跑同一份脚本）
-# 5) 只有动了 UI 才跑
+# 5) 只有动了 UI 才跑（根目录）
 <flutter-sdk>/bin/flutter.bat analyze lib test
 <flutter-sdk>/bin/flutter.bat test
 ```
@@ -144,24 +146,34 @@ UI 插件（WebSocket 客户端）
 3. 执行器 `file.*` 的条目必须是**工作空间根相对**，本机与 SSH 同形（否则 spec reset 路径会多一层）。
 4. 核心 `stdout` 只允许握手行，日志走 `stderr`；核心 stderr 若无人读且是管道，会在 shutdown 时卡住。
 5. 网络/LLM/时钟不进单测：用假传输、假时钟、可注入节拍器。
+6. 站点用例**等确认，不要等挂钟**（known-issues #42）：`publish` / 插件下线 / 站点注销
+   都只作用于「通道已建好」的订阅，用固定 sleep 等同一条连接的订阅帧处理完，
+   满负载跑全量时会假红。订阅成功的同步回证是点名本站的 `reset` 帧；
+   注册 / 注销没有确认帧，轮询核心状态或 `/api/meta` 的 `ui[].connections`。
+   同一连接内的帧按序处理（`_handleHello`/`_handleSubscribe`/`_handleRegister` 都是同步
+   `void`），所以 hello 之后紧跟的同连接帧不需要等。
 
 ---
 
 ## 6. 仓库与发版状态
 
-| 项 | 状态 |
+| 项 | 状态（2026-10-31 实测） |
 | --- | --- |
 | 桌面仓分支 | `desktop`（`main` 是旧的服务端 Python 形态，不合并） |
 | 插件仓分支 | `master`（`plugins/` 内） |
-| 工作区 | 两仓均干净（2026-10-26） |
-| 推送 | **未 push** |
-| 版本号 | `pubspec.yaml` → `1.0.4+3` |
-| Tag | **未打** |
+| 工作区 | 两仓均干净 |
+| 推送 | 桌面仓 **GitHub 已同步**到 `4b75dac`；**Gitee 落后 85 个提交**（`gitee/desktop` 停在 `477dbfc`）；插件仓 GitHub 已同步到 `85fa4f6` |
+| 版本号 | `pubspec.yaml` → `1.0.4+3`，**与已发布 tag 同号** |
+| Tag | 最新 annotated tag = `v1.0.4+3`（→ `41ccddf`，2026-10-19，已在 origin）；**插件化的 88 个提交未被任何 tag 覆盖** |
 | 发布资产 | **未挂**（setup / 插件 zip） |
+
+> 原先本节写「未 push / 未打 tag」，与仓库实况不符，已按实测更正。
+> 由此 **D-4「沿用 `1.0.4+3`」不可行**：该版本已有 annotated tag 且已推到 origin，
+> 沿用等于给两个不同提交挂同一个版本号，必须 bump。
 
 发版流程（细节见 [development.md](development.md) 发布检查单）：
 
-1. 两仓分别 push；
+1. 两仓分别 push；桌面仓**两个远端都要推**（GitHub 已同步、Gitee 落后 85 个提交）；
 2. `dart run tool/build_core.dart`、`dart run tool/build_plugins.dart`（逐个 `--selftest` + 写发布索引）；
 3. `dart run tool/package_windows.dart --flutter <flutter.bat>` → `dist/tree-desktop-<版本>-windows-x64.zip`；
 4. `dart run tool/package_ui_plugin.dart --build` → `tree-ui-default-<版本>.zip`；
@@ -275,7 +287,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 [ui-pluginization_acceptance.md](pluginization/ui-pluginization_acceptance.md)（验收台账）、
 [agent_pluginization.md](pluginization/agent_pluginization.md)（agent 承接范围）、
 [agent_api_contract.md](pluginization/agent_api_contract.md)（逐条契约与样例）、
-[known-issues.md](known-issues.md)（台账，当前最大编号 #41）。
+[known-issues.md](known-issues.md)（台账，当前最大编号 #42）。
 
 ---
 
@@ -299,5 +311,5 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 | D-1 | 本地 zip 安装（L-10） | 本期补端点 / 明确不做并改文案 |
 | D-2 | `scope` 去领域化（L-23） | 单独立项做协议破坏性变更 / 维持现状 |
 | D-3 | 功能裁剪（L-27） | 按 36 条功能面裁到更小集合 / 维持 39 条 |
-| D-4 | 发版版本号 | 沿用 `1.0.4+3` / bump 后重打 |
+| D-4 | 发版版本号 | ~~沿用 `1.0.4+3`~~（**已排除**：该号已有 annotated tag 且在 origin，沿用会撞 tag）/ bump 后重打 |
 | D-5 | 数据接管范围（L-05） | 仅 agents + 会话历史 / 含工作空间 |
