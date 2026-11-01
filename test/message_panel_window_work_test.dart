@@ -29,6 +29,7 @@ import 'package:tree/io/api_service.dart';
 import 'package:tree/io/websocket_service.dart';
 import 'package:tree/ui/models/agent.dart';
 import 'package:tree/ui/models/message.dart';
+import 'package:tree/ui/services/message_window.dart' show kDisplayCacheLimit;
 import 'package:tree/ui/widgets/message_list.dart';
 import 'package:tree/ui/widgets/message_panel.dart';
 
@@ -212,37 +213,54 @@ void main() {
         .position;
   }
 
-  Future<void> pumpPanel(WidgetTester tester) async {
+  Future<void> pumpPanel(WidgetTester tester, {int rounds = 10}) async {
     await tester.pumpWidget(
       MaterialApp(home: Scaffold(body: MessagePanel(selectedAgent: agent()))),
     );
-    // 会话列表 + 末尾一页历史 = 两趟真 I/O，多飞几轮再断言
-    await flyIO(tester, rounds: 10);
+    // 会话列表 + 首屏显示行 = 两趟真 I/O，多飞几轮再断言
+    // （超限会话的首屏一发就是 9999 行，响应体大，轮次给足）
+    await flyIO(tester, rounds: rounds);
   }
 
-  testWidgets('前置事实：首屏只加载末尾一页（窗口化懒加载）',
+  testWidgets('前置事实：首屏整段拉显示行（≤9999 条全量缓存，不再逐页懒加载）',
       (WidgetTester tester) async {
+    // 规格 §3.1.4（F3）：会话不超过显示缓存上限时，首屏一次把**整段轻量显示行**
+    // 装进槽位表（limit=9999）——"末尾一页 51 条"的窗口化懒加载退役，
+    // 滑到哪都不该再问历史，也不该有淘汰挖回的 88px 空洞。
     await pumpPanel(tester);
     final Set<int> loaded = loadedOf(tester);
-    expect(loaded.length, greaterThanOrEqualTo(core.pageSize),
-        reason: '首屏至少要把末尾一页拉回来，实际 ${loaded.length} 条');
+    expect(loaded.length, core.total,
+        reason: '首屏要把整段显示行装进来（3000 ≤ 9999），实际 ${loaded.length} 条');
     expect(loaded.contains(core.total - 1), isTrue, reason: '末尾那一条在窗口里');
-    expect(core.queries.first, contains('limit=51'),
-        reason: '首屏请求形状：只带 limit（一次只拉一页 = 窗口半径 51 条）');
+    expect(core.queries.first, contains('limit=9999'),
+        reason: '首屏请求形状：一次拉满显示缓存上限');
     expect(core.queries.first, isNot(contains('from=')),
-        reason: '首屏问的是"末尾一页"（不带 from）');
+        reason: '首屏问的是"整段显示行"（不带 from）');
+    final int queriesAfterLoad = core.queries.length;
+    // 滑到中段：整段缓存 ⇒ 既没有缺口可补，也不允许淘汰
+    final ScrollPosition pos = positionOf(tester);
+    pos.jumpTo(pos.maxScrollExtent * 0.5);
+    await tester.pump();
+    await flyIO(tester, rounds: 4);
+    expect(core.queries.length, queriesAfterLoad,
+        reason: '整段缓存下不该再发历史请求');
+    expect(loadedOf(tester).length, core.total,
+        reason: '≤ 上限的会话不淘汰（_evictFarSlots 直接返回）');
     core.closeGate();
     await closePanel(tester);
   });
 
   testWidgets('A3：补页落在视口里/视口下方时，面板要发补偿信号',
       (WidgetTester tester) async {
-    await pumpPanel(tester);
+    // 窗口化只接管**超过显示缓存上限**的会话的"更早段"（规格 §3.1.4）：造一条超限会话
+    core.total = 12000;
+    await pumpPanel(tester, rounds: 24);
     core.closeGate();
     final ScrollPosition pos = positionOf(tester);
 
-    // 视口搬到中段：缺口横跨视口顶 ⇒ 面板会补 `[first, gap.to)`（**落在视口里**）。
-    pos.jumpTo(pos.maxScrollExtent * 0.7);
+    // 视口搬到缓存段之前的**更早段**（首屏只装了最近 9999 条，更早的是占位槽）：
+    // 缺口从视口顶开始 ⇒ 补页**落在视口里**。
+    pos.jumpTo(0);
     await tester.pump();
     await flyIO(tester, rounds: 2);
     core.openGate();
@@ -281,17 +299,22 @@ void main() {
   //   · 服务端说这一段没有（空页）⇒ 记一笔别再空转（防死循环），这条老口径不能被削掉。
   testWidgets('下标漂移：页内 id 都已在窗口里时，要搬到权威下标且**不**拉黑（缺口真被填上）',
       (WidgetTester tester) async {
-    await pumpPanel(tester);
-    final int tailStart = core.total - core.pageSize;
+    // 超限会话才有"更早段"可问（规格 §3.1.4）
+    core.total = 12000;
+    await pumpPanel(tester, rounds: 24);
+    // 首屏缓存段 = 最近 9999 条显示行（起点 tailStart），更早段全是占位
+    final int tailStart = core.total - kDisplayCacheLimit;
     final List<String> tailIds = <String>[
-      for (int i = 0; i < core.pageSize; i++) 'm${tailStart + i}',
+      for (int i = tailStart; i < core.total; i++) 'm$i',
     ];
-    // 所有"缺口页"都回**已经在窗口里**的那批 id（末尾一页）—— 这就是漂移：
-    // 页内 id 与"缺口那一段"对不上，老实现会一条都不放（`place` 返回 0 ⇒ 拉黑 ⇒ 永远留空）。
-    core.idsFor = (int start, int count) => start < tailStart ? tailIds : null;
+    // 所有"更早段缺口页"都回**已经在窗口里**的那批 id（缓存段的头部几条）——
+    // 这就是漂移：页内 id 与"缺口那一段"对不上，老实现会一条都不放（`place`
+    // 返回 0 ⇒ 拉黑 ⇒ 永远留空）。
+    core.idsFor = (int start, int count) =>
+        start < tailStart ? tailIds.take(count).toList() : null;
     core.closeGate();
     final ScrollPosition pos = positionOf(tester);
-    pos.jumpTo(pos.maxScrollExtent * 0.6); // 视口搬到中段 ⇒ 缺口出现
+    pos.jumpTo(0); // 视口搬进未缓存的更早段 ⇒ 缺口出现
     await tester.pump();
     await flyIO(tester, rounds: 2);
     core.openGate();
@@ -337,11 +360,13 @@ void main() {
 
   testWidgets('空页（服务端说这里没有）⇒ 记一笔不再空转（防死循环这条不许被削掉）',
       (WidgetTester tester) async {
-    await pumpPanel(tester);
+    // 超限会话才有"更早段"可问（规格 §3.1.4）
+    core.total = 12000;
+    await pumpPanel(tester, rounds: 24);
     core.idsFor = (int start, int count) => <String>[]; // 所有补页都回"这一段没有"
     core.closeGate();
     final ScrollPosition pos = positionOf(tester);
-    pos.jumpTo(pos.maxScrollExtent * 0.6);
+    pos.jumpTo(0); // 视口搬进未缓存的更早段 ⇒ 会问 from=
     await tester.pump();
     await flyIO(tester, rounds: 2);
     core.openGate();

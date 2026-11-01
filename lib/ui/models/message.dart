@@ -63,6 +63,20 @@ class ChatMessage {
   /// 工具执行结果文本（kind == "tool" 时有效）
   String toolResult;
 
+  /// 工具行的**一行关键值**（显示行预生成，规格 §3.1.2：toolLineValue 前移）。
+  ///
+  /// 列表端点的显示行不带 `tool_arguments`，工具行的一行正文由写入侧算好回在这
+  /// 个键上；实时帧构造的消息没有它（参数本来就在内存里），渲染时退回现算。
+  final String preview;
+
+  /// 消息归属的 agent id（显示行/详情端点都带；实时帧由面板补上）。
+  ///
+  /// 点开即查详情端点要按 `(agent, 会话, 消息 id)` 寻址，快照里必须带着这两个坐标。
+  final String agentId;
+
+  /// 消息归属的会话 id（同上）。
+  final String sessionId;
+
   /// 工具是否仍在执行中（kind == "tool" 时有效）
   bool toolRunning;
 
@@ -107,6 +121,9 @@ class ChatMessage {
     this.toolName,
     this.toolArguments,
     this.toolResult = '',
+    this.preview = '',
+    this.agentId = '',
+    this.sessionId = '',
     this.toolRunning = false,
     this.subagentId = '',
     this.subagentName = '',
@@ -162,6 +179,9 @@ class ChatMessage {
       toolName: json['tool_name'] as String?,
       toolArguments: toolArgs,
       toolResult: json['tool_result'] as String? ?? '',
+      preview: json['preview'] as String? ?? '',
+      agentId: json['agent_id'] as String? ?? '',
+      sessionId: json['session_id'] as String? ?? '',
       subagentId: json['subagent_id'] as String? ?? '',
       subagentName: json['subagent_name'] as String? ?? '',
       subagentParentId: json['subagent_parent_id'] as String? ?? '',

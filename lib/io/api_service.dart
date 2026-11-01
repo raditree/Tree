@@ -14,6 +14,7 @@ import '../ui/models/file_listing.dart';
 import '../ui/models/file_node.dart';
 import '../ui/models/git_status.dart';
 import '../ui/models/session.dart';
+import '../ui/services/message_window.dart' show kDisplayCacheLimit;
 import 'service_availability.dart';
 
 /// 流式下载被调用方取消（M8d 下载列表的「取消」按钮）。
@@ -638,6 +639,69 @@ class ApiService {
       hasMore: data['has_more'] == true,
       total: (data['total'] as num?)?.toInt() ?? messages.length,
       offset: (data['offset'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  /// 拉一份会话的**显示行**整段（首屏全量缓存，规格 §3.1.4，上限 [kDisplayCacheLimit]）。
+  ///
+  /// 列表端点现在回的就是轻量显示行（preview + 小字段，无 tool_arguments /
+  /// tool_result / usage / attachments 重负载），所以首屏一次拉满、槽位表不再
+  /// 留 88px 占位空洞。核心**单页有上限**（`kHistoryPageMax`），更早的段用
+  /// `before=<最旧 id>` 逐页补拉，直到 `offset=0` 或攒够上限；超上限只保留
+  /// **最近** [kDisplayCacheLimit] 条，更早的行留给窗口机制（gapsFor 补拉）。
+  static Future<HistoryPage> getConversationDisplayRows(
+    String agentId, {
+    String sessionId = 'session_default',
+  }) async {
+    final HistoryPage tail = await getConversationHistoryPage(
+      agentId,
+      sessionId: sessionId,
+      limit: kDisplayCacheLimit,
+    );
+    List<Map<String, dynamic>> rows =
+        List<Map<String, dynamic>>.of(tail.messages);
+    int start = tail.offset;
+    while (start > 0 && rows.length < kDisplayCacheLimit) {
+      final String oldestId = '${rows.isEmpty ? '' : (rows.first['id'] ?? '')}';
+      if (oldestId.isEmpty) break;
+      final HistoryPage older = await getConversationHistoryPage(
+        agentId,
+        sessionId: sessionId,
+        beforeId: oldestId,
+        limit: kDisplayCacheLimit,
+      );
+      // 空页 / 起点不前进 = 服务端没有更早的内容，停（防死循环）
+      if (older.messages.isEmpty || older.offset >= start) break;
+      rows = <Map<String, dynamic>>[...older.messages, ...rows];
+      start = older.offset;
+    }
+    if (rows.length > kDisplayCacheLimit) {
+      final int drop = rows.length - kDisplayCacheLimit;
+      rows = rows.sublist(drop);
+      start += drop;
+    }
+    return HistoryPage(
+      messages: rows,
+      hasMore: start > 0,
+      total: tail.total,
+      offset: start,
+    );
+  }
+
+  /// 按 id **即查**一条消息的详细数据（规格 §3.1.3：显示/详细两分）。
+  ///
+  /// 调用 `GET /api/conversations/{agentId}/messages/{messageId}?session_id=…`，
+  /// 回扁平单条 JSON（全字段：tool_arguments / tool_result / thinking 正文 /
+  /// attachments / questions / usage…）。服务端先查在途缓存（流式中的消息回
+  /// 最新态）、未命中再查库；查不到抛 404 中文异常。
+  static Future<Map<String, dynamic>> getMessageDetail(
+    String agentId,
+    String messageId, {
+    String sessionId = 'session_default',
+  }) async {
+    return _getJson(
+      '/api/conversations/$agentId/messages/$messageId',
+      query: <String, String>{'session_id': sessionId},
     );
   }
 

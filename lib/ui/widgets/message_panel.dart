@@ -849,14 +849,13 @@ class _MessagePanelState extends State<MessagePanel> {
     return last.isEmpty ? 'session_default' : last;
   }
 
-  /// 从后端拉取当前 agent/会话的**末尾一段**历史，作为窗口的起点。
+  /// 从后端拉取当前 agent/会话的**显示行整段**，作为窗口的起点。
   ///
-  /// 只取末尾 N 条（[MessageWindow.pageSize]）：长会话（几 MB 的 jsonl / 几千条消息）
-  /// 导入不再是"全量读盘 + 全量建 widget + 再想办法滚到底"；用户滑到哪，再由
-  /// [_onWindowChanged] 按**全局下标**补哪一段（滑到哪加载哪）。
-  ///
-  /// [sessionId] 不传 = 当前会话；切 agent 时会**并发预取**，那时传的是
-  /// [_predictedSessionId]（会话列表还没回来）。
+  /// 显示/详细两分（规格 §3.1.4）：列表端点回的是轻量显示行（preview + 小字段），
+  /// 首屏一次拉满 [kDisplayCacheLimit] 条（更早段由 api 层逐页补拉），槽位表
+  /// 整段缓存、不再有 88px 占位空洞；详细数据**不随列表回**，点卡片时按 id
+  /// 即查详情端点（见 [DetailSelection.toggle]）。超过上限的超长会话才退回
+  /// 窗口机制：滑到哪由 [_onWindowChanged] 按**全局下标**补哪一段。
   Future<void> _loadHistory({String? sessionId}) async {
     final Agent? agent = widget.selectedAgent;
     if (agent == null) return;
@@ -873,10 +872,9 @@ class _MessagePanelState extends State<MessagePanel> {
     if (_tailApplied == key && _window.isNotEmpty) return;
     _tailInFlight = (key: key, epoch: epoch);
     try {
-      final HistoryPage page = await ApiService.getConversationHistoryPage(
+      final HistoryPage page = await ApiService.getConversationDisplayRows(
         agent.id,
         sessionId: sid,
-        limit: _historyPageSize,
       );
       if (!mounted) return;
       // 窗口可能在等待期间被整表作废（切 agent / 切会话）：只认同一代 + 同一个 agent
@@ -997,10 +995,9 @@ class _MessagePanelState extends State<MessagePanel> {
     final String sessionId = _currentSessionId;
     final int epoch = _windowEpoch;
     try {
-      final HistoryPage page = await ApiService.getConversationHistoryPage(
+      final HistoryPage page = await ApiService.getConversationDisplayRows(
         agent.id,
         sessionId: sessionId,
-        limit: _historyPageSize,
       );
       if (!mounted || epoch != _windowEpoch) return;
       if (sessionId != _currentSessionId) return;
@@ -1173,17 +1170,25 @@ class _MessagePanelState extends State<MessagePanel> {
   ///
   /// 末尾一段与"正在流式 / 正在跑工具"的消息由 [MessageWindow.evict] 自己保；
   /// [_locateKeep]（刚定位过的那一页）也留着——它可能离视口很远，但用户正看着它。
+  ///
+  /// **显示行整段缓存时不淘汰**（规格 §3.1.4）：会话不超过
+  /// [kDisplayCacheLimit] 条时槽位表本来就整段装着轻量显示行，淘汰只会
+  /// 重新挖出 88px 占位空洞；窗口淘汰只在超限的超长会话里生效。
   void _evictFarSlots() {
     if (_visibleFrom < 0) return;
+    if (_window.total <= kDisplayCacheLimit) return;
     final MessageRange? locate = _locateKeep;
+    // 首屏装进来的**最近 [kDisplayCacheLimit] 条显示行**是缓存本体（规格 §3.1.4
+    // 的衔接规则："超限直接截断只留最近 9999 + 更早段窗口补拉"）：淘汰只清
+    // **更早段**里离视口远的补拉页，不许把这份缓存自己挖回 88px 空洞。
+    final MessageRange cachedTail =
+        MessageRange(_window.total - kDisplayCacheLimit, _window.total);
     final int removed = _window.evict(
       keep: MessageRange(
         _visibleFrom - _cacheMargin,
         _visibleTo + 1 + _cacheMargin,
       ),
-      keepAlso: locate == null
-          ? const <MessageRange>[]
-          : <MessageRange>[locate],
+      keepAlso: <MessageRange>[?locate, cachedTail],
     );
     if (removed == 0) return;
     setState(() {
@@ -1328,6 +1333,9 @@ class _MessagePanelState extends State<MessagePanel> {
         timestamp: DateTime.now(),
         isStreaming: true,
         kind: data['kind'] as String? ?? 'text',
+        // 寻址坐标：点开即查详情端点要按 (agent, 会话, id) 定位（F3 显示/详细两分）
+        agentId: (data['agent_id'] as String?) ?? widget.selectedAgent?.id ?? '',
+        sessionId: (data['session_id'] as String?) ?? _currentSessionId,
         // 临时员工的话：打标显示在它名下（agent_id 仍是会话主人，过滤口径不变）
         subagentId: data['subagent_id'] as String? ?? '',
         subagentName: data['subagent_name'] as String? ?? '',
@@ -1474,6 +1482,9 @@ class _MessagePanelState extends State<MessagePanel> {
         toolName: (data['name'] as String?) ?? '',
         toolArguments: args,
         toolRunning: true,
+        // 寻址坐标：点开即查详情端点要按 (agent, 会话, id) 定位（F3 显示/详细两分）
+        agentId: (data['agent_id'] as String?) ?? widget.selectedAgent?.id ?? '',
+        sessionId: (data['session_id'] as String?) ?? _currentSessionId,
         // 临时员工调的工具也打标：一行式消息流里能看出这一步是谁干的
         subagentId: data['subagent_id'] as String? ?? '',
         subagentName: data['subagent_name'] as String? ?? '',

@@ -229,6 +229,14 @@ List<MessageRange> splitGapAtViewportTop(MessageRange gap, int first) {
 /// 像素↔下标换算的误差来源越多），代价是往回滑更早触发补页。
 const int kMessageWindowRadius = 51;
 
+/// **显示行缓存上限**（规格 §3.1.4：「显示数据缓存（仍设上限<一万条）」）。
+///
+/// 列表端点已是轻量显示行（preview + 小字段，无 tool_arguments / tool_result /
+/// usage / attachments 重负载），≤9999 行整段缓存代价很小：首屏一次拉满，
+/// 槽位表不再有 88px 占位空洞，窗口机制（gapsFor/evict）只在**超过上限**时
+/// 才接管更早段的补拉与淘汰。
+const int kDisplayCacheLimit = 9999;
+
 /// 见文件头：按全局下标寻址的消息窗口。
 class MessageWindow {
   MessageWindow({

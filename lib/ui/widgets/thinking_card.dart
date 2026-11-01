@@ -28,7 +28,11 @@ class _ThinkingCardState extends State<ThinkingCard> {
     final ColorScheme cs = Theme.of(context).colorScheme;
     final bool running = m.isStreaming;
     final String text = m.content.trim();
-    final String summary = text.isEmpty ? '正在分析问题…' : thinkingSummary(text);
+    // 显示行（历史列表）不带思考正文（规格 §1.4：正文属详细数据，点开即查）：
+    // 已封口的空正文行不能当成"还在写"，给一句中性提示。
+    final String summary = text.isEmpty
+        ? (running ? '正在分析问题…' : '点击查看详情')
+        : thinkingSummary(text);
 
     return ListenableBuilder(
       listenable: DetailSelection.instance,

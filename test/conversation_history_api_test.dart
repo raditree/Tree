@@ -21,6 +21,9 @@ class _FakeCore {
   /// 会话一共有多少条。
   int total = 1000;
 
+  /// 单页上限（对齐核心侧 `kHistoryPageMax` 的行为；0 = 不设上限）。
+  int pageCap = 0;
+
   static Future<_FakeCore> start() async {
     final HttpServer http = await HttpServer.bind(
       InternetAddress.loopbackIPv4,
@@ -36,23 +39,52 @@ class _FakeCore {
   Future<void> close() => _http.close(force: true);
 
   Future<void> _handle(HttpRequest request) async {
+    final String path = Uri.decodeComponent(request.uri.path);
     queries.add(request.uri.query);
     final Map<String, String> q = request.uri.queryParameters;
+    // 详情端点：GET /api/conversations/{agentId}/messages/{messageId}
+    // —— 回扁平单条**全字段** JSON（显示/详细两分的"详细"侧）。
+    final Match? detail =
+        RegExp(r'^/api/conversations/[^/]+/messages/(.+)$').firstMatch(path);
+    if (detail != null) {
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode(<String, dynamic>{
+        'id': detail.group(1),
+        'role': 'agent',
+        'kind': 'tool',
+        'content': '',
+        'timestamp': DateTime(2026, 1, 1).millisecondsSinceEpoch,
+        'tool_name': 'read',
+        'tool_arguments': <String, dynamic>{'file_path': 'lib/main.dart'},
+        'tool_result': '完整结果正文\n第二行',
+        'usage': <String, dynamic>{'input_tokens': 1234},
+      }));
+      await request.response.close();
+      return;
+    }
     final int limit = int.tryParse(q['limit'] ?? '') ?? 0;
     final int? from = int.tryParse(q['from'] ?? '');
     final String at = (q['at'] ?? '').trim();
     final String before = (q['before'] ?? '').trim();
+    final int cap = pageCap > 0 && limit > pageCap ? pageCap : limit;
     int start;
     if (at.isNotEmpty) {
       start = 500;
     } else if (from != null) {
       start = from;
     } else if (before.isNotEmpty) {
-      start = 200;
+      // 游标分页：回 before 那条之前的**至多一页**（与核心同口径）
+      final int idx = int.tryParse(before.replaceFirst('m', '')) ?? 0;
+      start = (idx - cap).clamp(0, total);
     } else {
-      start = limit > 0 ? total - limit : 0;
+      start = limit > 0 ? (total - cap).clamp(0, total) : 0;
     }
-    final int count = limit > 0 ? limit : 10;
+    final int upper = before.isNotEmpty
+        ? (int.tryParse(before.replaceFirst('m', '')) ?? 0)
+        : total;
+    final int count =
+        ((limit > 0 ? cap : 10).clamp(0, (upper - start).clamp(0, upper)));
     request.response.statusCode = 200;
     request.response.headers.contentType = ContentType.json;
     request.response.write(jsonEncode(<String, dynamic>{
@@ -148,5 +180,53 @@ void main() {
     expect(core.queries.single, isNot(contains('limit=')));
     expect(page.offset, 0);
     expect(page.total, 1000);
+  });
+
+  // ---- F3 显示/详细两分（规格 §3.1.3 / §3.1.4）----
+
+  test('首屏显示行整段：total ≤ 上限时一发 limit=9999 拉满，不翻页', () async {
+    final HistoryPage page = await ApiService.getConversationDisplayRows('a1');
+    expect(core.queries.single, contains('limit=9999'));
+    expect(core.queries.single, isNot(contains('from=')));
+    expect(page.offset, 0);
+    expect(page.hasMore, isFalse, reason: '1000 条装得进缓存上限 ⇒ 没有更早段');
+    expect(page.messages, hasLength(1000));
+    expect(page.total, 1000);
+  });
+
+  test('首屏显示行整段：核心有单页上限时用 before=<最旧 id> 逐页补拉到 offset=0', () async {
+    core.total = 500;
+    core.pageCap = 200; // 模拟核心 kHistoryPageMax：单页封顶，UI 侧逐页往前补
+    final HistoryPage page = await ApiService.getConversationDisplayRows('a1');
+    expect(core.queries, hasLength(3), reason: '末尾 200 + 200 + 100');
+    expect(core.queries.first, contains('limit=9999'));
+    expect(core.queries[1], contains('before=m300'));
+    expect(core.queries[2], contains('before=m100'));
+    expect(page.offset, 0);
+    expect(page.hasMore, isFalse);
+    expect(page.messages, hasLength(500));
+    expect(page.messages.first['id'], 'm0');
+    expect(page.messages.last['id'], 'm499');
+  });
+
+  test('首屏显示行整段：超过上限只留最近 9999，更早段留给窗口机制（hasMore）', () async {
+    core.total = 12000;
+    final HistoryPage page = await ApiService.getConversationDisplayRows('a1');
+    expect(core.queries.single, contains('limit=9999'),
+        reason: '一发就攒满 9999 ⇒ 补拉循环不触发');
+    expect(page.messages, hasLength(9999));
+    expect(page.offset, 2001);
+    expect(page.hasMore, isTrue, reason: '更早段存在：由 gapsFor 窗口补拉');
+  });
+
+  test('详情端点：getMessageDetail 按 id 取单条全字段 JSON', () async {
+    final Map<String, dynamic> detail =
+        await ApiService.getMessageDetail('a1', 'm42');
+    expect(core.queries.single, contains('session_id=session_default'));
+    expect(detail['id'], 'm42');
+    expect(detail['tool_arguments'], isA<Map<String, dynamic>>(),
+        reason: '显示行不带参数表，详情必须带');
+    expect(detail['tool_result'], contains('完整结果正文'));
+    expect(detail['usage'], isNotNull);
   });
 }

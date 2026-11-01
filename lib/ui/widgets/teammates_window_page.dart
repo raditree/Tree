@@ -610,17 +610,20 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   }
 
   /// 加载该成员当前会话的历史进度（对话历史 + 实时 WS 增量合并）
+  ///
+  /// 显示/详细两分（规格 §3.1.4，队友窗口同规则）：拉的是轻量**显示行**整段
+  /// （上限 [kDisplayCacheLimit] 条），工具参数 / 结果 / 思考正文不随列表回，
+  /// 点卡片时按 id 即查详情端点（见 [DetailSelection.toggle]）。
   Future<void> _loadHistory() async {
     try {
-      final List<Map<String, dynamic>> history =
-          await ApiService.getConversationHistory(
+      final HistoryPage page = await ApiService.getConversationDisplayRows(
         widget.memberId,
         sessionId: widget.sessionId,
       );
       if (!mounted) return;
       setState(() {
         _liveMessages.clear();
-        for (final Map<String, dynamic> item in history) {
+        for (final Map<String, dynamic> item in page.messages) {
           _liveMessages.add(ChatMessage.fromJson(item));
         }
         // 定位导航：历史加载后直接触发 MessageList 定位滚动（而非滚底，
@@ -665,6 +668,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
         content: '',
         timestamp: DateTime.now(),
         isStreaming: true,
+        // 寻址坐标：点开即查详情端点用（F3 显示/详细两分）
+        agentId: widget.memberId,
+        sessionId: widget.sessionId,
       );
       if (message.id.isEmpty) return;
       setState(() {
@@ -703,6 +709,9 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
           toolName: (data['name'] as String?) ?? '',
           toolArguments: args,
           toolRunning: true,
+          // 寻址坐标：点开即查详情端点用（F3 显示/详细两分）
+          agentId: widget.memberId,
+          sessionId: widget.sessionId,
         ));
         _scrollRevision++;
       });

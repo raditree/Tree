@@ -175,7 +175,14 @@ String toolLabel(String name) {
 /// 一行的正文：这条工具调用最关键的那个参数（路径 / 命令 / 查询词…）。
 ///
 /// 取不到关键参数时退回结果的一句话——宁可显示"改了什么"，也别留一行空白。
+///
+/// **显示行**（列表端点，规格 §3.1.2）不带 `tool_arguments`：这一行直接用
+/// 写入侧预生成的 `preview`（与这里同口径前移），不再现场取参数。
 String toolLineValue(ChatMessage m) {
+  final Map<String, dynamic>? rawArgs = m.toolArguments;
+  if ((rawArgs == null || rawArgs.isEmpty) && m.preview.isNotEmpty) {
+    return m.preview;
+  }
   final String name = m.toolName ?? '';
   final Map<String, dynamic> args = m.toolArguments ?? <String, dynamic>{};
   String arg(String key) => (args[key] ?? '').toString();
