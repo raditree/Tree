@@ -170,14 +170,19 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 
 ## 6. 仓库与发版状态
 
-| 项 | 状态（2026-11-01 实测） |
+| 项 | 状态（2026-11-01 发版完成后实测） |
 | --- | --- |
 | 桌面仓分支 | `desktop`（`main` 是旧的服务端 Python 形态，不合并） |
 | 插件仓分支 | `master`（`plugins/` 内） |
-| 推送 | 桌面仓 HEAD `4fcedef`：`origin/desktop` 落后 **3** 个提交（`ae3c101`）、`gitee/desktop` 落后 **106** 个提交（`477dbfc`）；插件仓 HEAD `f4ca29c`：`origin/master` 落后 **2** 个提交（`4d5f788`） |
-| 版本号 | `pubspec.yaml` → **`1.0.5+1`**（2026-11-01 已 bump；`lib/app_version.dart` 同步，`test/version_info_test.dart` 18 条绿） |
-| Tag | 最新 annotated tag = `v1.0.4+3`（→ `41ccddf`，2026-10-19，已在 origin）；**插件化的提交仍未被任何 tag 覆盖**（新 tag 待 push 后打） |
-| 发布资产 | **未挂**（setup / 插件 zip）；Inno Setup 本机未安装（`iscc` 不在 PATH，`C:\Program Files*\Inno Setup*` 也没有） |
+| 推送 | **已同步**：桌面仓 `origin/desktop` = `gitee/desktop` = `cab3582`；插件仓 `origin/master` = `gitee/master` = `f4ca29c` |
+| 版本号 | `pubspec.yaml` → **`1.0.5+1`**（`lib/app_version.dart` 同步，`test/version_info_test.dart` 18 条绿） |
+| Tag | 桌面仓 **`v1.0.5+1`**（→ `cab3582`）、插件仓 **`v1.0.5`**（→ `f4ca29c`），两仓两个远端都已推 |
+| 发布资产 | **GitHub 已挂**：`Tree` release 2 个（`tree-desktop-1.0.5-windows-x64.zip` 30.7 MB / `...-setup.exe` 24.0 MB）；`tree-plugins` release **13 个**（`plugin-index.json` + 12 个 `tree_*.exe`）。**Gitee release 已建但资产未传**（`v1.0.5+1` id 1261447、`v1.0.5` id 1261449）——gitee CLI 的 token 是回退兜底，没有可用的 access token；插件端会因 Gitee 索引缺失自动回退 GitHub |
+| 构建环境 | Inno Setup **装在 `D:\app\Inno Setup 6`**（6.7.3，`package_windows.dart` 会自动探测到）；`iscc` 不在 PATH 属正常 |
+
+> **发版踩到的坑（已修）**：`packages/tree_core_cli/pubspec.lock` 未跟进 `archive` 传递依赖，`tool/build_core.dart` 会报
+> `Not found: 'package:archive/archive.dart'`；另 `package_windows.dart` 会校验 `build/agents/` 里的版本串，
+> 因此 bump 版本后**必须先跑 `dart run tool/build_agent.dart`** 再打包。
 
 > 原先本节写「未 push / 未打 tag」，与仓库实况不符，已按实测更正。
 > **D-4 已决**：插件化这一版用 **`1.0.5+1`**（`1.0.4+3` 已有 annotated tag 且已推到 origin，
@@ -207,7 +212,7 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 | **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面。**已收口（2026-10-31，片 1 / 片 3（桌面）+ 片 2 / 片 4 / Q-7 (a)（插件））**：点位表领域族清零（36 → 28 点位、29 → 9 命令）、撤 `tool.` / `agent.` 前缀禁令、落盘空壳读侧对账、两处门禁；两执行器改名成对称的 `local.*` / `ssh.*` 各 10 条 + 租约统一到插件侧 + tree.agent 换口 + 核心撤 `workspace/register` 与租约簿记 ⇒ **文件与终端两族真机已能打通**；让名的另一半由 tree.agent 在 `agent_tools` 站认领 `llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename`（插件仓 `b21e946`），compact / sample **命令名零改动**即恢复 | 真机复核 compact 的三条功能（总结调用 / 必读文件 / todo 快照） | **L-25 Q-5 / Q-7**；known-issues **#43**；契约 §8.4 落地状态 |
 | **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径 + §8 已拍板统一口径）；**片 1 / 2 / 3 / 4 / 5 均已合**（2026-10-31，片 5 = 桌面仓 `8876254` + 插件仓 `f578894`）；`code` 八环链路、`tree_protocol` 码表、§5 门禁五条断言全部落地，门禁六条用例与 tree_core 全量 627 条跑绿（`ssh_lease_unknown` / `local_lease_unknown` 已归并为 `lease_unknown`） | 文档 §8.4 全部落地，门禁跑绿 | L-25 |
 | **插件仓 CI** | **已完成（2026-11-01）**：插件仓 `.github/workflows/ci.yml`（`f4ca29c`：检出桌面仓拿同一份门禁脚本，跑 `--selftest` + 全仓扫描，再按矩阵对 7 个 Dart 插件跑 `dart pub get / analyze / test`；`local_executor` 无 test 目录只守 analyze）；桌面仓 `.github/workflows/ci.yml`（`4fcedef`：协议 / 核心 / 插件契约 / UI 四段）。两仓均为公开仓，跨仓检出无需 PAT；runner 与 SDK 都钉在维护版本 | 插件仓流水线跑同一脚本 | L-21 |
-| **发版工程** | **版本号已备（2026-11-01）**：`pubspec.yaml` / `lib/app_version.dart` → `1.0.5+1`（`test/version_info_test.dart` 18 条绿）；**构建产物 / push / tag / 挂资产未执行**（需人工确认）；Inno Setup 本机未安装，setup 一步待补 | push（两远端）+ tag + setup/zip 资产 | — |
+| **发版工程** | **已完成（2026-11-01）**：构建链全绿（core → agents → plugins → windows 包 → UI 插件包 → Inno setup），两仓 push + tag（桌面 `v1.0.5+1` / 插件 `v1.0.5`），GitHub 资产已挂（桌面 2 个、插件 13 个）；**Gitee 资产待传**（缺可用 access token，插件端会自动回退 GitHub） | Gitee 资产镜像（需 token）；compact 真机复核 | §6 |
 
 ### P1 · 真机验收（必须在有环境的机器上做）
 
@@ -245,7 +250,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 | 性能基线 | **已建基线（2026-11-01）**：新增 `plugins/tree.agent/tool/bench_stream_pipeline.dart`（脚本引擎 → `TokenPacer` → `_ChunkPump` → 记录 hub，零外部依赖）与 `tool/bench_baseline.json`；实测 6 组（40/200/1000 token/s × 25/20fps）帧率贴配置值、首帧延迟 = 窗口 + 7~13ms；结论与边界写进 known-issues #40 | 迁移前实测不可得（A5 撤实现时未留档），基线以本次数字为准、同参数重跑对比 | 脚本 `--runs/--tokens/--history/--rates/--fps` 可调；见 known-issues #40 |
 | 本地 zip 安装 | **已完成（2026-11-01，桌面仓 `145f565`）**：`ApiPaths.pluginInstallLocal` + `core_server._installPluginLocal` + `PluginDownloader.installFromZip`（`_readLocalEntry` / `_normalizeZipEntry`，卸载支持 `plugins/<id>/`）+ 前端 `ApiService.installPluginLocal` 与面板「本地安装」按钮；`test/plugin_install_local_test.dart` 13 条 | 无（真机点一下按钮即可复验） | `core_server.dart`、`plugin_downloader.dart`、known-issues #38 |
 | 插件仓 CI | **已完成（2026-11-01）**：插件仓 `f4ca29c`、桌面仓 `4fcedef`；插件仓 workflow 跨仓检出桌面仓拿同一份门禁脚本（两仓公开，无需 PAT），矩阵覆盖 7 个 Dart 插件；本地已逐个验证 6 个包的 analyze/test 全绿（`local_executor` 无 test 目录只守 analyze） | 首次 CI 跑在 GitHub 侧的真实结果（本地无法代跑） | `.github/workflows/ci.yml`（两仓）、§5.2 第 4 步 |
-| 发版工程 | **版本号已备（2026-11-01）**：`pubspec.yaml` / `lib/app_version.dart` → `1.0.5+1`；最新 annotated tag 仍 `v1.0.4+3`（插件化提交未被任何 tag 覆盖）；桌面仓 `origin` 落后 3 / `gitee` 落后 106、插件仓 `origin/master` 落后 2；`dist/` 存在；Inno Setup 本机未安装 | 按 §6 七步执行；**构建 / push / tag / 挂资产需人工确认**（Inno Setup 需先装） | §6 发布检查单 |
+| 发版工程 | **已完成（2026-11-01）**：版本 `1.0.5+1`、两仓 tag `v1.0.5+1` / `v1.0.5` 已推、GitHub 资产已挂（桌面 zip+setup、插件 index+12 exe）；Gitee release 已建但资产待传（缺 token，插件端自动回退 GitHub） | Gitee 资产镜像 | §6 |
 
 **P1（真机验收）**
 
