@@ -36,6 +36,12 @@ jobs:
         working-directory: packages/tree_protocol
     steps:
       - uses: actions/checkout@v4
+      - name: 检出插件仓（门禁会扫描 plugins/，缺目录必须显式失败）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLUGIN_REPO }}
+          ref: ${{ env.PLUGIN_REF }}
+          path: plugins
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: ${{ env.DART_SDK }}
@@ -52,6 +58,12 @@ jobs:
         working-directory: packages/tree_core
     steps:
       - uses: actions/checkout@v4
+      - name: 检出插件仓（门禁会扫描 plugins/，缺目录必须显式失败）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLUGIN_REPO }}
+          ref: ${{ env.PLUGIN_REF }}
+          path: plugins
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: ${{ env.DART_SDK }}
