@@ -9,6 +9,7 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 
 import '../models/message.dart';
 import '../services/message_window.dart';
+import 'collapsed_run_row.dart';
 import 'hook_notice_card.dart';
 import 'message_scrollbar.dart';
 import 'thinking_card.dart';
@@ -183,6 +184,35 @@ class _BuiltTopsSnapshot {
 
   /// 布局前：这一趟真被布局过的子项 → 顶边
   final Map<int, double> tops;
+}
+
+/// 一个折叠组（run）的渲染期信息（规格 §3.2.1/§3.2.2，纯渲染层现算）。
+class _RunInfo {
+  const _RunInfo({
+    required this.head,
+    required this.tail,
+    required this.runId,
+    required this.collapsed,
+    required this.toolCount,
+    required this.thinkingCount,
+    required this.toolCountsByLabel,
+  });
+
+  /// 组首/组尾下标（含）
+  final int head;
+  final int tail;
+
+  /// 组标识 = 组首条消息 id（展开态记它；全局同时只展开一个）
+  final String runId;
+
+  /// 是否处于折叠态（「有就折叠」：默认折叠，只有 [_MessageListViewState._expandedRunId]
+  /// 命中的那一组展开）
+  final bool collapsed;
+
+  /// 组内已完成工具条数 / 思考段条数 / 按 `toolLabel` 分类的工具计数
+  final int toolCount;
+  final int thinkingCount;
+  final Map<String, int> toolCountsByLabel;
 }
 
 /// 底部锚定滚动控制器：把「钉在底部」做成**布局同帧**的同步操作。
@@ -420,6 +450,12 @@ class _MessageListViewState extends State<_MessageListView> {
 
   /// 程序化的"直达底部"进行中：期间不把滚动通知当成用户上滚。
   bool _jumpingToBottom = false;
+
+  /// 当前展开的折叠组（runId = 组首条消息 id）。
+  ///
+  /// 全局同时只允许一个展开组（规格 Q5）：点开新组时旧组自动收起。展开态是
+  /// O(1) 的单个 id，渲染负担上限 = 一个 run + 视口。
+  String? _expandedRunId;
 
   @override
   void initState() {
@@ -771,6 +807,17 @@ class _MessageListViewState extends State<_MessageListView> {
       (ChatMessage? m) => m?.id == id,
     );
     if (idx < 0) return;
+    // 目标在折叠组里：先就地展开（定位要看见那一行），下一帧再滚
+    final _RunInfo? run = _runAt(idx);
+    if (run != null && run.collapsed) {
+      setState(() {
+        _expandedRunId = run.runId;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToMessage(id);
+      });
+      return;
+    }
     final GlobalKey? key = _itemKeys[id];
     final BuildContext? ctx = key?.currentContext;
     if (ctx != null) {
@@ -965,6 +1012,73 @@ class _MessageListViewState extends State<_MessageListView> {
     );
   }
 
+  /// 这条槽位能不能进折叠组（规格 §3.2.1）。
+  ///
+  /// 已完成工具（`kind=='tool'` 且不在跑）与思考段（`kind=='thinking'`）可入组；
+  /// **跑着的/流式的永不参与折叠**（用户要看得见进行中状态），null 槽（还没加载）
+  /// 与不进主消息流的槽位（临时员工）都是组边界（组在其处闭合）。
+  bool _groupableAt(int index) {
+    if (index < 0 || index >= widget.slots.length) return false;
+    final ChatMessage? m = widget.slots[index];
+    if (m == null) return false;
+    final bool Function(ChatMessage message)? visible = widget.visible;
+    if (visible != null && !visible(m)) return false;
+    if (m.isStreaming) return false;
+    if (m.kind == 'thinking') return true;
+    if (m.kind == 'tool') return !m.toolRunning;
+    return false;
+  }
+
+  /// 下标所在折叠组（run）的信息；不在组里返回 null。
+  ///
+  /// 纯渲染层现算：只向两侧走**组本身的长度**（O(run)），不做全表扫描
+  /// （规格 §5.5「折叠不得反噬渲染」）；简述计数只读显示行里本来就有的字段。
+  _RunInfo? _runAt(int index) {
+    if (!_groupableAt(index)) return null;
+    int head = index;
+    while (_groupableAt(head - 1)) {
+      head--;
+    }
+    int tail = index;
+    while (_groupableAt(tail + 1)) {
+      tail++;
+    }
+    int toolCount = 0;
+    int thinkingCount = 0;
+    final Map<String, int> toolCountsByLabel = <String, int>{};
+    for (int i = head; i <= tail; i++) {
+      final ChatMessage m = widget.slots[i]!;
+      if (m.kind == 'thinking') {
+        thinkingCount++;
+        continue;
+      }
+      toolCount++;
+      final String label = toolLabel(m.toolName ?? '');
+      toolCountsByLabel[label] =
+          (toolCountsByLabel[label] ?? 0) + 1;
+    }
+    final String runId = widget.slots[head]!.id;
+    return _RunInfo(
+      head: head,
+      tail: tail,
+      runId: runId,
+      collapsed: _expandedRunId != runId,
+      toolCount: toolCount,
+      thinkingCount: thinkingCount,
+      toolCountsByLabel: toolCountsByLabel,
+    );
+  }
+
+  /// 点开/收起折叠组：走既有「上方补页补偿」通路（[_beginShiftCompensation]），
+  /// 保证上方内容零位移（TC-COLLAPSE-01）。控制条两态同高 ⇒ 增量只发生在它下方；
+  /// 组横跨视口顶时由实测锚点精确补偿，净位移仍为 0。
+  void _toggleRun(String runId) {
+    _beginShiftCompensation();
+    setState(() {
+      _expandedRunId = _expandedRunId == runId ? null : runId;
+    });
+  }
+
   /// 一个槽位（或末尾的插件内联卡片）。
   Widget _buildItem(BuildContext context, int index) {
     final int slotCount = widget.slots.length;
@@ -986,8 +1100,47 @@ class _MessageListViewState extends State<_MessageListView> {
     if (visible != null && !visible(message)) {
       return const SizedBox.shrink();
     }
-    // 临时员工的消息：在他的那一段**开头**标一次（同一个人的连续消息/工具
-    // 只在第一行顶标签，避免每条都占一行）。
+    // 折叠组（规格 §3.2.1「有就折叠」）：组内非首格收起时零高度（不占版面），
+    // 组首格画控制条；展开态组员各画各的行。
+    final _RunInfo? run =
+        (message.kind == 'tool' || message.kind == 'thinking')
+        ? _runAt(index)
+        : null;
+    if (run != null && run.collapsed && index != run.head) {
+      return const SizedBox.shrink();
+    }
+    final Widget card = _buildMessageCard(context, index, message);
+    if (run == null || (!run.collapsed && index != run.head)) return card;
+    // 控制条两态同高 ⇒ 展开/收起的高度增量只发生在它下方（TC-COLLAPSE-01 的
+    // 结构性保证）；折叠态的组首格只画控制条（组内消息行隐藏）。
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: CollapsedRunRow(
+            key: ValueKey<String>('collapsed-run-${run.runId}'),
+            toolCount: run.toolCount,
+            thinkingCount: run.thinkingCount,
+            toolCountsByLabel: run.toolCountsByLabel,
+            expanded: !run.collapsed,
+            onTap: () => _toggleRun(run.runId),
+          ),
+        ),
+        if (!run.collapsed) card,
+      ],
+    );
+  }
+
+  /// 一条消息的正常行（折叠组展开时组员的行也走这里）。
+  ///
+  /// 临时员工的消息：在他的那一段**开头**标一次（同一个人的连续消息/工具
+  /// 只在第一行顶标签，避免每条都占一行）。
+  Widget _buildMessageCard(
+    BuildContext context,
+    int index,
+    ChatMessage message,
+  ) {
     final ChatMessage? previous = index > 0 ? widget.slots[index - 1] : null;
     final bool showSubagentTag =
         message.isSubagentMessage &&
