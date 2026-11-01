@@ -40,6 +40,10 @@ abstract final class ApiPaths {
 
   // ── 会话 / 历史 / spec ────────────────────────────────────────────────
   static const String conversations = '/api/conversations/{agentId}';
+
+  /// 单条消息详情（GET）：会话历史列表页只回显示行，重负载点开按 id 即查。
+  static const String agentMessageDetail =
+      '/api/conversations/{agentId}/messages/{messageId}';
   static const String agentSessions = '/api/agents/{agentId}/sessions';
   static const String agentSession =
       '/api/agents/{agentId}/sessions/{sessionId}';
@@ -72,7 +76,7 @@ abstract final class ApiPaths {
   /// 终端会话（`local_executor` / `ssh_executor` 插件申报）。
   ///
   /// UI 只用这一族 REST 管会话（建 / 输入 / 取消 / 改尺寸 / 关），输出走执行器的
-  /// 广播站。它们不属于 [delegated] 的 54 条契约，登记在这里只是为了满足
+  /// 广播站。它们不属于 [delegated] 的 55 条契约，登记在这里只是为了满足
   /// 「前端用到的 /api 路径必须已声明」这条门禁。
   static const String terminalLocalSessions = '/api/terminal/local/sessions';
   static const String terminalSshSessions = '/api/terminal/ssh/sessions';
@@ -419,9 +423,9 @@ abstract final class ApiPaths {
   /// 若将来需要登记「无承接方的插件面」，另建语义明确的集合，不要复用本名。
   static const Set<String> pendingHandoffRoutes = <String>{};
 
-  /// **契约中归插件的全部方法路由：54 条。**
+  /// **契约中归插件的全部方法路由：55 条。**
   ///
-  /// agent 36（34 存量 + 2 新增上行改委派）+ spec 2 + mcp 3 + files 13。
+  /// agent 37（34 存量 + 2 新增上行改委派 + 1 消息详情）+ spec 2 + mcp 3 + files 13。
   /// **git 3 已按用户决定删除**（2026-10-25）。L-28 起它不是运行期白名单：
   /// 放行由 [delegationPatternError] 的命名空间规则 + 归属表冲突检测决定；
   /// 本集合只用于契约自检与 G-1 对照。
@@ -447,8 +451,9 @@ abstract final class ApiPaths {
     'POST $models',
     'PATCH $model',
     'DELETE $model',
-    // 会话 / 历史（8）
+    // 会话 / 历史（9）
     'GET $conversations',
+    'GET $agentMessageDetail',
     'DELETE $conversations',
     'GET $agentSessions',
     'POST $agentSessions',
@@ -495,7 +500,7 @@ abstract final class ApiPaths {
     'POST $fileRename',
   };
 
-  /// 契约全集（94 = [coreOwned] 40 + [delegated] 54）。
+  /// 契约全集（95 = [coreOwned] 40 + [delegated] 55）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -571,6 +576,7 @@ abstract final class ApiPaths {
     models,
     model,
     conversations,
+    agentMessageDetail,
     agentSessions,
     agentSession,
     agentSessionSpecs,

@@ -16,9 +16,9 @@ Flutter 前端已是一份可装卸的 `kind: ui` 插件（支持同插件多窗
 | 基线 | 值 | 出处 |
 | --- | --- | --- |
 | 核心永久路由 | **40**（控制面 20 含本地安装 + 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3 + 存储 4） | `ApiPaths.coreOwned` |
-| 插件委派路由 | **54** | `ApiPaths.delegated` |
-| 契约全集 | **94**（40 + 54） | `contractRoutes` |
-| 可达路径白名单 | **72** | `ApiPaths.kept` |
+| 插件委派路由 | **55** | `ApiPaths.delegated` |
+| 契约全集 | **95**（40 + 55） | `contractRoutes` |
+| 可达路径白名单 | **73** | `ApiPaths.kept` |
 | 待交接路由 | **0** | `pendingHandoffRoutes` |
 | 内置 Spec | 4（general-task / hard-task / team-meeting / plugin-creator） | `plugins/tree.agent/lib/src/spec/builtin_specs.dart` |
 | 核心内置插件条目 | 4（sample / compact / ssh_executor / self_updater） | `packages/tree_core/lib/src/plugin/builtin_plugins.dart` |
@@ -100,7 +100,7 @@ UI 插件（WebSocket 客户端）
 | 套件 | 结果 |
 | --- | --- |
 | `packages/tree_core` | analyze 干净；`dart test` **644 passed / 2 skipped**（2026-11-01 实测，含本地安装 13 条；#42 两轮修复的 30 轮连绿记录仍有效） |
-| `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁；`coreOwned 40 / contract 94 / kept 72`） |
+| `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁；`coreOwned 40 / contract 95 / kept 73`） |
 | 根仓 | `flutter analyze lib` 干净；`flutter analyze lib test` 仅既有 7 issues（`thinking_window_test`，与插件化无关）；`flutter test` **886 passed**（2026-10-31 实测，此后未动 UI） |
 | `plugins/tree.agent` | **373 passed**（2026-11-01 实测，含接管/回滚 7 条） |
 | `plugins/ssh_executor` | **188 passed**（2026-11-01 实测） |
@@ -272,7 +272,7 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 | L-18 UI 视图文档对齐 | `docs/ssh-tunnel-protocol.md:363-369` 描述的 `ui/manifest` 只发一次 + 之后 `ui/update`、动作判据在 `params['event']` —— **已经是当前协议**，不是旧协议；`plugin_ui_action` 仍在使用（`plugins/sample` / `terminal_probe` 按 `event` 通知处理，裸 `method` 仅作老核心兼容）；`plugin-development.md:922` 的退役声明不冲突 | 要做的是**补一句口径**（"这是当前协议"）并全仓复核，**不是删段**；顺带可修 §7 P3 的「35 个点位」旧数字 |
 | L-20 stdio 多实例 | `plugin_bus.dart:290` `Map<String, PluginHost> _hosts`，键＝`config.id`（**一插件一宿主**）；无任何 `(plugin_id, agent_id)` 键痕迹；站点 id 也按插件 id | 改动面＝宿主表键 + 站点命名空间 + 委派按信封 `agent_id` 路由 + 每实例看门狗/并发上限；属平台立项 |
 | L-23 scope 去领域化 | `packages/tree_core/lib/src/plugin/station_scope.dart:5`（四字段 `team_id/agent_id/session_id/mode_key`）、`:117-129`（序列化进 wire 的 `scope` map）；mode_key 已明确不兜底成 `local`（`:103-106`） | **侦查已完成（D-2，本期不实现）**：见 [pluginization/scope-de-domainization-recon.md](pluginization/scope-de-domainization-recon.md)；下期按 S0~S4 执行（mode_key → team_id 两步下沉，agent/session 保留） |
-| L-27 功能裁剪 | 路由口径 40/54/94/72 出自 `ApiPaths`（§1 基线表）；候选裁剪项**都还有实现与调用方**——`token-rate` 在 `plugins/tree.agent/lib/src/delegate.dart:59,531-544` 与 `tree.agent_plugin.dart:1730` 自检、前端设置页仍在用 | 缺的是**真实使用数据**与产品决策，不是代码清理；不要与迁移混做 |
+| L-27 功能裁剪 | 路由口径 40/55/95/73 出自 `ApiPaths`（§1 基线表）；候选裁剪项**都还有实现与调用方**——`token-rate` 在 `plugins/tree.agent/lib/src/delegate.dart:59,531-544` 与 `tree.agent_plugin.dart:1730` 自检、前端设置页仍在用 | 缺的是**真实使用数据**与产品决策，不是代码清理；不要与迁移混做 |
 | L-30~L-34 契约复测 | L-30：`plugins/tree.agent/lib/src/delegate.dart:81-105` `_bodyOf` 抛 `FormatException`（未统一成 400，顶层兜底待复核）；L-31：`packages/tree_protocol/lib/src/api_paths.dart:33-35` 仍是双 `{memberId}`，tree.agent 申报用 `{leaderId}`；L-32 `createAgent` 仍缺建成员参数；L-33 三处（未知 session 200 / DELETE 200 / 空 body token-rate）未复测；L-34 `sub_` id 语义未定 | 全部等 G-1 行为基线冻结后单独评审；L-31 必须核心 + 前端 + 插件 + 契约常量同批改 |
 
 ---
