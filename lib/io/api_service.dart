@@ -1228,15 +1228,73 @@ class ApiService {
     return _postJson(ApiPaths.pluginReleaseRefresh);
   }
 
+  /// 插件发布源设置（源顺序 + 两个令牌是否已配）：GET
+  /// [ApiPaths.settingsPluginReleaseSources]
+  ///
+  /// 返回 `{order, default_order, sources:[{key, name, repo, api_base, token_set}],
+  /// download_ready}`。**令牌永不回显**：只有 `token_set` 布尔，前端只能显示
+  /// 「已保存 / 未保存」，拿不到明文。
+  static Future<Map<String, dynamic>> getPluginReleaseSources() async {
+    return _getJson(ApiPaths.settingsPluginReleaseSources);
+  }
+
+  /// 保存插件发布源设置：POST [ApiPaths.settingsPluginReleaseSources]
+  ///
+  /// [order] 是源 key 顺序（`gitee` / `github`）；令牌只在本轮真的改过时才传：
+  /// 不传 = 保持原值，传空串 = 清除。保存后核心**立即**热应用，不必重启。
+  static Future<Map<String, dynamic>> savePluginReleaseSources({
+    required List<String> order,
+    String? giteeToken,
+    String? githubToken,
+  }) async {
+    return _postJson(
+      ApiPaths.settingsPluginReleaseSources,
+      body: <String, dynamic>{
+        'order': order,
+        'gitee_token': ?giteeToken,
+        'github_token': ?githubToken,
+      },
+    );
+  }
+
+  /// 发布源**连通性探测**：POST [ApiPaths.settingsPluginReleaseSourcesTest]
+  ///
+  /// 不写缓存、不安装，只回答"哪个源通、通到哪一版、有没有 `plugin-index.json`"。
+  /// 可带**还没保存的草稿值**（先填 token 试通，再点保存）。
+  /// 返回 `{ok, order, sources:[{key, name, ok, usable, tag, asset_count,
+  /// has_index, error}]}`。
+  static Future<Map<String, dynamic>> testPluginReleaseSources({
+    List<String>? order,
+    String? giteeToken,
+    String? githubToken,
+  }) async {
+    return _postJson(
+      ApiPaths.settingsPluginReleaseSourcesTest,
+      body: <String, dynamic>{
+        'order': ?order,
+        'gitee_token': ?giteeToken,
+        'github_token': ?githubToken,
+      },
+    );
+  }
+
   /// 从发布仓库装一条插件：POST [ApiPaths.pluginReleaseInstall]
   ///
   /// 一次动作 = 资产进缓存 → 换文件闸门（旧进程没确认退出就**不换**）→ 原子改名 →
   /// 写 plugins.yaml 并热应用。失败（闸门拦住 / 字节数不符 / 想盖内置项）核心回
   /// 400 + 中文原因，这里抛成异常给面板直接显示；**旧文件一个都没动**。
-  static Future<Map<String, dynamic>> installPluginRelease(String pluginId) async {
+  /// [withDependencies] = true 时核心按索引里的 `requires.plugins` **先补齐缺失依赖**
+  /// （只补缺失、不升级既有插件），再装目标本身。
+  static Future<Map<String, dynamic>> installPluginRelease(
+    String pluginId, {
+    bool withDependencies = false,
+  }) async {
     final String encoded = Uri.encodeComponent(pluginId.trim());
     return _postJson(
       ApiPaths.pluginReleaseInstall.replaceFirst('{pluginId}', encoded),
+      body: withDependencies
+          ? <String, dynamic>{'with_dependencies': true}
+          : null,
     );
   }
 
@@ -1798,6 +1856,43 @@ class ApiService {
   /// 单问就是长度 1 的表。
   static Future<void> answerQuestion(String qid, List<String> answers) async {
     await _postJson('/api/questions/$qid/answer', body: {'answers': answers});
+  }
+
+  /// 发送一条用户消息：`POST /api/agents/{agentId}/messages`（tree.agent 承接）。
+  ///
+  /// A5 起核心**不再处理** WS 上行 `user_message`（会回 `error` 帧：
+  /// 「该上行帧已随核心领域面移除」），发消息只有这一条通路。
+  /// 回包：`{success, agent_id, session_id, session_created}`——新建会话时
+  /// 调用方要跟着切到 [session_id]，否则后续历史仍按旧会话拉。
+  ///
+  /// [attachments] 是附件上传服务给的工作空间相对路径元数据（`{name, path,
+  /// size, type}`），随消息交给模型。
+  static Future<Map<String, dynamic>> sendAgentMessage(
+    String agentId,
+    String content, {
+    String? sessionId,
+    List<Map<String, dynamic>> attachments =
+        const <Map<String, dynamic>>[],
+  }) async {
+    return _postJson(
+      ApiPaths.agentMessages.replaceFirst('{agentId}', agentId),
+      body: <String, dynamic>{
+        'content': content,
+        if (sessionId != null && sessionId.isNotEmpty) 'session_id': sessionId,
+        if (attachments.isNotEmpty) 'attachments': attachments,
+      },
+    );
+  }
+
+  /// 取消某个 agent（或临时员工 `sub_…`）进行中的生成：
+  /// `POST /api/agents/{agentId}/cancel`（tree.agent 承接）。
+  ///
+  /// A5 起 WS 上行 `stop` 同样已被核心移除，停止只有这一条通路。
+  /// 旧借口的 `session_id` 在 agent 级取消里被忽略，因此不再传。
+  static Future<Map<String, dynamic>> cancelAgent(String agentId) async {
+    return _postJson(
+      ApiPaths.agentCancel.replaceFirst('{agentId}', agentId),
+    );
   }
 
   /// 一键重置 agent 工作空间里的系统提示词 / Spec。

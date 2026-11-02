@@ -1,4 +1,5 @@
-/// REST 路径（前端 `lib/io/api_service.dart` 实际使用的 40 条）。
+/// REST 路径（前端 `lib/io/api_service.dart` 实际使用的 40 条）。发布源设置 2 条
+/// （其中探测端点由 UI 直接以常量引用）见 [ApiPaths.settingsPluginReleaseSources]。
 ///
 /// 桌面分支中这些路径先由核心进程在 **127.0.0.1 回环**上原样提供（M1），
 /// 后续里程碑再逐模块把前端 HTTP 调用换成直接调用；路径常量是过渡期的
@@ -126,6 +127,18 @@ abstract final class ApiPaths {
       '/api/settings/missed-heartbeat-limit';
 
   static const String settingsDataCollection = '/api/settings/data-collection';
+
+  /// 插件**发布源**设置（GET 读 / POST 写）：源顺序（Gitee / GitHub）与两个令牌。
+  ///
+  /// 令牌**永不回显**（响应只给 `token_set` 布尔），保存后立即热应用到运行中的
+  /// 下载器上，无需重启核心。
+  static const String settingsPluginReleaseSources =
+      '/api/settings/plugin-release-sources';
+
+  /// 发布源连通性探测（POST）：不写缓存、不安装，只回答"哪个源通、通到哪一版、
+  /// 有没有索引"。请求体可带**未保存的草稿值**（先试通再保存）。
+  static const String settingsPluginReleaseSourcesTest =
+      '/api/settings/plugin-release-sources/test';
 
   // ── 发现面 / 引导壳（插件化新增，核心永久面）──────────────────────────
 
@@ -361,10 +374,10 @@ abstract final class ApiPaths {
   static String routeKey(String method, String pattern) =>
       '${method.toUpperCase()} $pattern';
 
-  /// **核心永久面：40 条方法路由。**
+  /// **核心永久面：43 条方法路由。**
   ///
-  /// 平台控制面 20（含 UI 多窗口 3）+ 传输设置 9 + 引导壳 3 + 发现面 1 + 日志 3
-  /// + 存储 4。只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
+  /// 平台控制面 20（含 UI 多窗口 3）+ 传输设置 12（含发布源 3）+ 引导壳 3
+  /// + 发现面 1 + 日志 3 + 存储 4。只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
   /// （见 `docs/pluginization/ui-pluginization.md` §4.1 / §4.5）。
   static const Set<String> coreOwned = <String>{
     // 平台控制面（20）：装插件的前提，也是引导页唯一依赖。
@@ -399,6 +412,9 @@ abstract final class ApiPaths {
     'PATCH $settingsMissedHeartbeatLimit',
     'POST $settingsMissedHeartbeatLimit',
     'POST $settingsDataCollection',
+    'GET $settingsPluginReleaseSources',
+    'POST $settingsPluginReleaseSources',
+    'POST $settingsPluginReleaseSourcesTest',
     // 引导壳（3）。
     'GET $bootstrap',
     'POST $bootstrapSession',
@@ -416,7 +432,7 @@ abstract final class ApiPaths {
     'DELETE $storeEntry',
   };
 
-  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 40 条（36 + UI 多窗口 3 + 本地安装 1）。
+  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 43 条（36 + UI 多窗口 3 + 本地安装 1 + 发布源设置 3）。
   ///
   /// 历史：这里曾登记 52 条「核心仍实现、待交接」的域路由；A5 已删除核心实现，
   /// git 3 条也按用户决定从契约中删除。保留空集合只为兼容旧门禁形状；
@@ -500,7 +516,7 @@ abstract final class ApiPaths {
     'POST $fileRename',
   };
 
-  /// 契约全集（95 = [coreOwned] 40 + [delegated] 55）。
+  /// 契约全集（98 = [coreOwned] 43 + [delegated] 55）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -605,6 +621,8 @@ abstract final class ApiPaths {
     settingsHeartbeatInterval,
     settingsMissedHeartbeatLimit,
     settingsDataCollection,
+    settingsPluginReleaseSources,
+    settingsPluginReleaseSourcesTest,
     meta,
     bootstrap,
     bootstrapSession,

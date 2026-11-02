@@ -89,6 +89,15 @@ abstract final class WsOutboundType {
   /// 插件实例生命周期状态。
   static const String pluginStatus = 'plugin_status';
 
+  /// 插件清单（plugins.yaml）发生变更（核心 → 所有 WS 连接，前端面板据此重拉清单）。
+  ///
+  /// 帧形状：`{type, data: {plugin_id, enabled?, removed?, source}}`。
+  /// 为什么需要这条帧：配置写入过去只落盘、不通知——面板的开关绑在打开那一刻
+  /// 拉到的清单快照上，别的窗口 / 别的写入路径（卸载连带停用、重启回滚）改了
+  /// `enabled`，界面照样显示启用（2026-11-01「盘上停用、界面启用」不对齐事故）。
+  /// `source` 是触发写入的路由名，UI 原样展示即可，不在前端再猜一遍。
+  static const String pluginConfigChanged = 'plugin_config_changed';
+
   /// 站点投递（核心 → WS 订阅者，插件化新增）。
   ///
   /// 帧形状：`{type, station_id, point, topic?, payload, scope, origin_plugin_id,
@@ -136,6 +145,7 @@ abstract final class WsOutboundType {
     frameEnd,
     pluginEvent,
     pluginStatus,
+    pluginConfigChanged,
     stationDelivery,
     terminalReady,
     terminalOutput,

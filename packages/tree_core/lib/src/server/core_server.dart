@@ -330,6 +330,7 @@ class CoreServer {
           cacheDir: pluginReleaseCacheDir,
           bus: pluginBus,
           catalog: resolvedBuiltinPlugins,
+          settings: resolvedSettings,
         );
     // 片 E：品牌申报的路径闸门只认这几处插件目录（相对路径也按它们解析）。
     pluginBus?.configureBrandingDirs(<String>{
@@ -1107,6 +1108,22 @@ class CoreServer {
       _setMissedHeartbeatLimit,
     );
     router.add('POST', ApiPaths.settingsDataCollection, _setDataCollection);
+    // 插件发布源（3）：顺序 + 令牌（令牌永不回显）+ 连通性探测。
+    router.add(
+      'GET',
+      ApiPaths.settingsPluginReleaseSources,
+      _getPluginReleaseSources,
+    );
+    router.add(
+      'POST',
+      ApiPaths.settingsPluginReleaseSources,
+      _setPluginReleaseSources,
+    );
+    router.add(
+      'POST',
+      ApiPaths.settingsPluginReleaseSourcesTest,
+      _testPluginReleaseSources,
+    );
     // 引导壳（3）。
     router.add('GET', ApiPaths.bootstrap, _handleBootstrapPage);
     router.add('POST', ApiPaths.bootstrapSession, _handleBootstrapSession);
@@ -1154,6 +1171,170 @@ class CoreServer {
     // 桌面单用户形态没有收集方：仅保留开关以兼容既有设置页（M7 移除）
     await writeJson(request, 200, <String, dynamic>{'success': true});
   }
+
+  // ── 插件发布源（设置页「插件发布源」区）────────────────────────────────
+  //
+  // 令牌只进不出：响应永远只回答 `token_set`，不把明文回显给前端 / 日志（与模型
+  // api_key 同一条纪律）。POST 保存后**立即**套到运行中的下载器上（`configureSources`），
+  // 因此"填完保存 → 去插件面板点刷新"就用新源，不必重启核心。
+
+  Future<void> _getPluginReleaseSources(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    await writeJson(request, 200, _pluginReleaseSourcesBody());
+  }
+
+  Future<void> _setPluginReleaseSources(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final List<String>? order = _releaseOrderFromBody(body);
+    if (order != null && order.isEmpty) {
+      await writeJson(
+        request,
+        400,
+        errorBody('源顺序里没有可识别的源（可用 gitee / github）'),
+      );
+      return;
+    }
+    final bool touchedGitee = body.containsKey('gitee_token');
+    final bool touchedGithub = body.containsKey('github_token');
+    settings.setPluginReleaseSettings(
+      order: order,
+      giteeToken: touchedGitee ? (body['gitee_token'] ?? '').toString() : null,
+      githubToken: touchedGithub
+          ? (body['github_token'] ?? '').toString()
+          : null,
+    );
+    _applyPluginReleaseSources();
+    errorLog?.call(
+      '插件发布源设置已保存：顺序 ${_effectiveReleaseOrder(settings).join(' → ')}'
+      '${touchedGitee ? '，Gitee 令牌已更新' : ''}'
+      '${touchedGithub ? '，GitHub 令牌已更新' : ''}',
+    );
+    await writeJson(request, 200, <String, dynamic>{
+      ..._pluginReleaseSourcesBody(),
+      'applied': true,
+    });
+  }
+
+  Future<void> _testPluginReleaseSources(
+    HttpRequest request,
+    Map<String, String> _,
+  ) async {
+    final Map<String, dynamic> body = await readJsonBody(request);
+    final PluginDownloader? downloader = pluginDownloader;
+    if (downloader == null) {
+      await writeJson(
+        request,
+        503,
+        errorBody('核心未接入插件发布仓库（缺少下载缓存目录或插件总线未启用）'),
+      );
+      return;
+    }
+    final List<String>? draftOrder = _releaseOrderFromBody(body);
+    final List<String> order = (draftOrder == null || draftOrder.isEmpty)
+        ? _effectiveReleaseOrder(settings)
+        : draftOrder;
+    // 草稿值（还没保存）优先：用户可以先填 token 试通，再点保存。
+    final List<PluginReleaseSource> draft = defaultPluginReleaseSources(
+      giteeToken: body.containsKey('gitee_token')
+          ? (body['gitee_token'] ?? '').toString()
+          : _effectiveToken(settings, 'gitee'),
+      githubToken: body.containsKey('github_token')
+          ? (body['github_token'] ?? '').toString()
+          : _effectiveToken(settings, 'github'),
+      order: order,
+    );
+    final List<PluginReleaseProbe> probes = await downloader.probeSources(
+      sources: draft,
+    );
+    final bool anyUsable = probes.any((PluginReleaseProbe p) => p.usable);
+    await writeJson(request, 200, <String, dynamic>{
+      'ok': anyUsable,
+      'order': order,
+      'sources': probes
+          .map((PluginReleaseProbe p) => p.toJson())
+          .toList(growable: false),
+    });
+  }
+
+  /// 把设置里的发布源（顺序 + 令牌）套到**运行中**的下载器上。
+  void _applyPluginReleaseSources() {
+    pluginDownloader?.configureSources(pluginReleaseSourcesFor(settings));
+  }
+
+  /// 发布源端点的响应体（GET 与 POST 同形状；令牌只以 `token_set` 出现）。
+  Map<String, dynamic> _pluginReleaseSourcesBody() {
+    final List<PluginReleaseSource> all = defaultPluginReleaseSources();
+    return <String, dynamic>{
+      'order': _effectiveReleaseOrder(settings),
+      'default_order': kPluginReleaseSourceKeys,
+      'sources': <Map<String, dynamic>>[
+        for (final PluginReleaseSource source in all)
+          <String, dynamic>{
+            'key': source.key,
+            'name': source.name,
+            'repo': source.repo,
+            'api_base': source.apiBase,
+            'token_set': _effectiveToken(settings, source.key).isNotEmpty,
+          },
+      ],
+      'download_ready': pluginDownloader != null,
+    };
+  }
+
+  /// 从请求体读源顺序（键缺席 = null「不改」；认不出的过滤后可能为空）。
+  static List<String>? _releaseOrderFromBody(Map<String, dynamic> body) {
+    if (!body.containsKey('order')) return null;
+    final Object? raw = body['order'];
+    if (raw is List) {
+      return parsePluginReleaseSourceOrder(
+        raw.map((Object? item) => item?.toString() ?? '').join(' '),
+      );
+    }
+    return parsePluginReleaseSourceOrder((raw ?? '').toString());
+  }
+
+  /// 生效顺序：设置 > 环境变量 `TREE_PLUGIN_RELEASE_ORDER` > 默认（Gitee → GitHub）。
+  static List<String> _effectiveReleaseOrder(CoreSettings settings) {
+    final List<String> fromSettings = parsePluginReleaseSourceOrder(
+      settings.pluginReleaseOrder.join(' '),
+    );
+    if (fromSettings.isNotEmpty) return fromSettings;
+    final List<String> fromEnv = parsePluginReleaseSourceOrder(
+      Platform.environment['TREE_PLUGIN_RELEASE_ORDER'] ?? '',
+    );
+    return fromEnv.isEmpty ? kPluginReleaseSourceKeys : fromEnv;
+  }
+
+  /// 生效令牌：设置 > 环境变量（`GITEE_TOKEN` / `GITHUB_TOKEN`）。
+  ///
+  /// 环境变量作为兜底是为了兼容"运维在启动脚本里注入 token"的既有部署；
+  /// 在设置页里填过之后就以设置为准（清空令牌是会回落到环境变量的，这条要能解释
+  /// 得清——"我清空了为什么还在用"的答案就在这里）。
+  static String _effectiveToken(CoreSettings settings, String key) {
+    final String fromSettings = key == 'gitee'
+        ? settings.giteeToken
+        : settings.githubToken;
+    if (fromSettings.isNotEmpty) return fromSettings;
+    return (Platform.environment[key == 'gitee'
+                ? 'GITEE_TOKEN'
+                : 'GITHUB_TOKEN'] ??
+            '')
+        .trim();
+  }
+
+  /// 由设置解析出一组可用的发布源（启动时与保存后共用同一段）。
+  static List<PluginReleaseSource> pluginReleaseSourcesFor(
+    CoreSettings settings,
+  ) => defaultPluginReleaseSources(
+    giteeToken: _effectiveToken(settings, 'gitee'),
+    githubToken: _effectiveToken(settings, 'github'),
+    order: _effectiveReleaseOrder(settings),
+  );
 
   // ── 心跳判活参数（M9 规约 1.1；用户已确认默认 I=10s / N=3） ─────────────
   //
@@ -1967,14 +2148,17 @@ class CoreServer {
     return report.ok ? null : report.toJson();
   }
 
-  /// `with_dependencies` 的自动补齐：**只装缺失项，不升级既有插件**。
+  /// `with_dependencies` 的自动补齐：补齐**缺失项**，并把**版本不满足**的那条顶上去。
   ///
   /// 返回 null = 依赖已齐（目标插件可以继续安装）；否则返回依赖闸门形状的 409 回包。
   /// 规则：
   /// - 已安装且版本满足 ⇒ 跳过（绝不因为索引里有新版就顺手升级）；
-  /// - 已安装但版本不满足 ⇒ 直接拒绝（升级是用户动作，不是安装副作用）；
+  /// - 已安装但版本不满足 ⇒ 从索引装**能满足要求**的那一版（只动这一条依赖，
+  ///   保留旧条目的 `enabled` / `builtin`）；索引那一版也满足不了 ⇒ 可读失败；
   /// - 同一 id 被多方要求 ⇒ 取区间交集，无交集 / 成环 ⇒ 可读失败、逐条列出；
-  /// - 只补齐依赖自身，不碰目标插件（调用方随后走正常 install）。
+  /// - 只补齐依赖自身，不碰目标插件（调用方随后走正常 install）；
+  /// - 可选依赖（`optional: true`）不补齐；**已停用**的依赖不主动启用
+  ///   （闸门会如实回 409，让用户自己决定开不开）。
   Future<Map<String, dynamic>?> _installMissingDependencies(
     PluginBus bus,
     PluginDownloader downloader,
@@ -2078,8 +2262,6 @@ class CoreServer {
         if (dependency.optional) continue;
         final List<({String by, PluginDependency dependency})> requirements =
             requirementsFor(dependency.id, entry.id, dependency);
-        final PluginVersionConstraint? parsed =
-            PluginVersionConstraint.tryParse(dependency.version);
         final ({String text, PluginVersionConstraint? intersection, String? error})
         merged = intersectRequirements(dependency.id, requirements);
         final String requiredText = merged.text;
@@ -2103,41 +2285,54 @@ class CoreServer {
           return false;
         }
         final Map<String, dynamic>? live = installed[dependency.id];
-        if (live != null) {
-          final String actual = versionOf(live);
-          if (merged.intersection != null &&
-              !merged.intersection!.isAny &&
-              (actual.isEmpty ||
-                  !merged.intersection!.satisfies(actual))) {
-            final String reason =
-                '依赖 ${dependency.id} 已安装版本「${actual.isEmpty ? '未知' : actual}」'
-                '不满足 $requiredText；自动安装只补齐缺失项，**不升级**既有插件';
-            reasons.add(reason);
-            issues.add(
-              PluginDependencyIssue(
-                id: dependency.id,
-                required: requiredText,
-                installed: true,
-                actual: actual,
-                by: by,
-                reason: reason,
-              ),
-            );
-            return false;
-          }
-          continue;
-        }
+        final String liveVersion = versionOf(live);
+        final bool versionOk =
+            merged.intersection == null ||
+            merged.intersection!.isAny ||
+            (live != null &&
+                liveVersion.isNotEmpty &&
+                merged.intersection!.satisfies(liveVersion));
+        if (live != null && versionOk) continue;
         final PluginRepoEntry? candidate = repo[dependency.id];
         if (candidate == null) {
-          final String reason =
-              '缺少依赖 ${dependency.id}（发布索引里也没有这条）';
+          final String reason = live == null
+              ? '缺少依赖 ${dependency.id}（发布索引里也没有这条）'
+              : '依赖 ${dependency.id} 已安装版本「$liveVersion」不满足 $requiredText，'
+                    '发布索引里也没有这条 ⇒ 自动安装没法把它顶上去';
           reasons.add(reason);
           issues.add(
             PluginDependencyIssue(
               id: dependency.id,
               required: requiredText,
-              installed: false,
-              actual: '',
+              installed: live != null,
+              actual: liveVersion,
+              by: by,
+              reason: reason,
+            ),
+          );
+          return false;
+        }
+        // 候选版本必须**真能满足**要求（缺失安装与升级同理）：索引里那一版也满足
+        // 不了时如实拒绝——把一条不满足的换成另一条不满足的，只是把错误藏起来。
+        final String candidateVersion = candidate.version.trim();
+        final bool candidateOk =
+            merged.intersection == null ||
+            merged.intersection!.isAny ||
+            (candidateVersion.isNotEmpty &&
+                merged.intersection!.satisfies(candidateVersion));
+        if (!candidateOk) {
+          final String shown = candidateVersion.isEmpty ? '未知' : candidateVersion;
+          final String reason = live == null
+              ? '发布索引里的 ${dependency.id} 版本「$shown」不满足 $requiredText'
+              : '依赖 ${dependency.id} 已安装版本「$liveVersion」不满足 $requiredText，'
+                    '发布索引里的版本「$shown」也不满足 ⇒ 自动升级解决不了';
+          reasons.add(reason);
+          issues.add(
+            PluginDependencyIssue(
+              id: dependency.id,
+              required: requiredText,
+              installed: live != null,
+              actual: live == null ? candidateVersion : liveVersion,
               by: by,
               reason: reason,
             ),
@@ -2158,31 +2353,6 @@ class CoreServer {
               required: requiredText,
               installed: false,
               actual: '',
-              by: by,
-              reason: reason,
-            ),
-          );
-          return false;
-        }
-        final String candidateVersion = candidate.version.trim();
-        if (parsed != null &&
-            !parsed.isAny &&
-            (candidateVersion.isEmpty || !parsed.satisfies(candidateVersion)) ||
-            (merged.intersection != null &&
-                !merged.intersection!.isAny &&
-                (candidateVersion.isEmpty ||
-                    !merged.intersection!.satisfies(candidateVersion)))) {
-          final String reason =
-              '发布索引里的 ${dependency.id} 版本'
-              '「${candidateVersion.isEmpty ? '未知' : candidateVersion}」'
-              '不满足 $requiredText';
-          reasons.add(reason);
-          issues.add(
-            PluginDependencyIssue(
-              id: dependency.id,
-              required: requiredText,
-              installed: false,
-              actual: candidateVersion,
               by: by,
               reason: reason,
             ),
@@ -2214,7 +2384,23 @@ class CoreServer {
           );
           return false;
         }
-        final PluginStoreResult stored = store.upsert(installedEntry);
+        // 依赖已装（走到这里只可能是版本不满足）⇒ 这次是**升级**：只把这一条顶到
+        // 索引里能满足要求的那一版。旧条目的启用状态与内置标记原样保留——自动补齐
+        // 依赖不是"顺手把用户停用的插件打开"，也不该把内置项变成自定义项。
+        final Map<String, dynamic> toStore = live == null
+            ? installedEntry
+            : <String, dynamic>{
+                ...installedEntry,
+                // 旧条目自带 `version` 时它是依赖闸门**优先取**的那个值：不覆盖的话，
+                // 磁盘上 `version` 还是旧的、只有 `repo_version` 变新，闸门仍判"不满足"
+                //（看上去升了、实际没升）。
+                if (live['version'] is String &&
+                    (live['version'] as String).trim().isNotEmpty)
+                  'version': install.version,
+                if (live['enabled'] is bool) 'enabled': live['enabled'],
+                if (live['builtin'] == true) 'builtin': true,
+              };
+        final PluginStoreResult stored = store.upsert(toStore);
         final Map<String, dynamic>? row = stored.entry;
         if (!stored.ok || row == null) {
           final String reason =
@@ -2234,7 +2420,14 @@ class CoreServer {
           return false;
         }
         installed[dependency.id] = row;
-        await _applyPluginChange(bus, row, enable: true);
+        await _applyPluginChange(bus, row, enable: row['enabled'] != false);
+        _noteConfigWrite(
+          bus,
+          id: dependency.id,
+          beforeEnabled: live?['enabled'],
+          afterEnabled: row['enabled'],
+          source: '依赖自动补齐（装 $targetId 连带）',
+        );
       }
       return true;
     }
@@ -2352,6 +2545,13 @@ class CoreServer {
       final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, entry);
       if (blocked != null) {
         store.remove(newId);
+        _noteConfigWrite(
+          bus,
+          id: newId,
+          beforeEnabled: entry['enabled'],
+          afterEnabled: null,
+          source: 'POST /api/plugin/configs（依赖闸门回滚）',
+        );
         await _writeDependencyConflict(request, blocked, pluginId: newId);
         return;
       }
@@ -2361,7 +2561,51 @@ class CoreServer {
       entry,
       enable: true,
     );
+    _noteConfigWrite(
+      bus,
+      id: newId,
+      beforeEnabled: null,
+      afterEnabled: entry['enabled'],
+      source: 'POST /api/plugin/configs',
+    );
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
+  }
+
+  /// 配置写入的统一处置：enabled 跃迁记审计日志 + 向所有 WS 连接广播清单变更。
+  ///
+  /// 事故复盘（2026-11-01）：tree.agent 被写成 `enabled: false`，而日志里**没有
+  /// 任何一行**说明"谁改的"——只能靠文件字节数与 mtime 反推时间线；UI 面板也无从
+  /// 得知，开关显示与磁盘状态严重不对齐。从现在起，凡可能改动清单的写点都必须调
+  /// 这一条：
+  /// - [beforeEnabled] / [afterEnabled] 不同（null = 条目不存在 / 已删除）⇒
+  ///   往 core.log 记一行「旧值 → 新值（来源路由）」；
+  /// - 无论开关是否跃迁，都广播 `plugin_config_changed`：面板收到就重拉清单。
+  ///   两条 REST 读很便宜，"界面说谎"很贵。
+  void _noteConfigWrite(
+    PluginBus bus, {
+    required String id,
+    Object? beforeEnabled,
+    Object? afterEnabled,
+    required String source,
+  }) {
+    final String from = beforeEnabled is bool
+        ? (beforeEnabled ? 'true' : 'false')
+        : '(无条目)';
+    final String to = afterEnabled is bool
+        ? (afterEnabled ? 'true' : 'false')
+        : '(条目删除)';
+    if (from != to) {
+      bus.log?.call('[enabled-audit] $id: $from → $to（来源：$source）');
+    }
+    bus.outbound?.call(<String, dynamic>{
+      'type': WsOutboundType.pluginConfigChanged,
+      'data': <String, dynamic>{
+        'plugin_id': id,
+        if (afterEnabled is bool) 'enabled': afterEnabled,
+        if (afterEnabled is! bool) 'removed': true,
+        'source': source,
+      },
+    });
   }
 
   /// PATCH /api/plugin/configs/{pluginId}：局部更新（每项的开关也走这里）。
@@ -2398,6 +2642,13 @@ class CoreServer {
       final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, entry);
       if (blocked != null) {
         store.update(id, <String, dynamic>{'enabled': before['enabled'] ?? false});
+        _noteConfigWrite(
+          bus,
+          id: id,
+          beforeEnabled: before['enabled'],
+          afterEnabled: before['enabled'],
+          source: 'PATCH /api/plugin/configs（依赖闸门拦下，开关回滚）',
+        );
         await _writeDependencyConflict(request, blocked, pluginId: id);
         return;
       }
@@ -2406,6 +2657,13 @@ class CoreServer {
       bus,
       entry,
       enable: entry['enabled'] != false,
+    );
+    _noteConfigWrite(
+      bus,
+      id: id,
+      beforeEnabled: before['enabled'],
+      afterEnabled: entry['enabled'],
+      source: 'PATCH /api/plugin/configs',
     );
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
@@ -2443,6 +2701,13 @@ class CoreServer {
       bus,
       before,
       enable: false,
+    );
+    _noteConfigWrite(
+      bus,
+      id: id,
+      beforeEnabled: before['enabled'],
+      afterEnabled: null,
+      source: 'DELETE /api/plugin/configs',
     );
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
@@ -2498,15 +2763,128 @@ class CoreServer {
       await writeJson(request, 200, await bus.forceStop(id));
       return;
     }
-    // 片 D：重启前复核依赖（含热重启）。依赖缺失时重拉只会得到同样失败，
-    // 这里直接 409 并给可读清单，避免“看起来重启了，实际没起来”。
+    // 未知 mode 先拒（放在启用之前）：把拼错的 `mode: 'hotr'` 静默当成冷重启、
+    // 甚至顺手把停用项启用，用户看到的会是“我点了个错的按钮，插件却自己开了”。
+    if (mode.isNotEmpty && mode != 'cold' && mode != 'hot') {
+      await writeJson(
+        request,
+        400,
+        errorBody(
+          '未知的 mode「$mode」：这一条只有 cold（冷重启，缺省）/ hot（热重启续跑）/ '
+          'force_stop（用户显式强制停止）三种做法；不把拼错的值静默当成缺省，'
+          '因为你看到的就是“点了热重启但状态没续上”',
+        ),
+      );
+      return;
+    }
     final PluginConfig restartConfig = bus.config(id)!;
-    if (restartConfig.enabled) {
-      final Map<String, dynamic>? blocked = bus.dependencyBlock(id);
+    // **停用态点「重启」= 用户要它跑起来**：先把条目开关打开（过依赖闸门，拦下
+    // 就把开关放回去），再热应用拉起。不打开开关就直接 restart 的话，实例状态
+    // 由 `cfg.enabled` 决定（PluginBus 的 `_pluginState`），结果就是用户报过的
+    // 「进程拉起来了，但状态仍写着已停用」——界面与事实互相打脸。
+    if (!restartConfig.enabled) {
+      final Map<String, dynamic>? before = store.readEntry(id);
+      final PluginStoreResult enableResult = store.update(
+        id,
+        <String, dynamic>{'enabled': true},
+      );
+      final Map<String, dynamic>? entry = enableResult.entry;
+      if (!enableResult.ok || entry == null) {
+        await writeJson(request, 400, errorBody(enableResult.error));
+        return;
+      }
+      final Map<String, dynamic>? blocked = _dependencyBlockForEntry(bus, entry);
       if (blocked != null) {
+        // 闸门拦下：开关回滚，磁盘上不留一条“开着却永远起不来”的条目。
+        // 回滚值只认**读到的旧值**：读不到就跳过回写并记日志——猜一个 false
+        // 正是"盘上状态与界面显示分叉"的写法（2026-11-01 复盘）。
+        final Object? prev = before?['enabled'];
+        if (prev is bool) {
+          store.update(id, <String, dynamic>{'enabled': prev});
+        } else {
+          bus.log?.call(
+            '[enabled-audit] $id: 重启闸门回滚时读不到改动前的 enabled'
+            '（条目可能已被并发删除），跳过回写，请人工核对 ${store.path}',
+          );
+        }
+        _noteConfigWrite(
+          bus,
+          id: id,
+          beforeEnabled: true,
+          afterEnabled: before?['enabled'],
+          source: 'POST …/restart（依赖闸门拦下，开关回滚）',
+        );
         await _writeDependencyConflict(request, blocked, pluginId: id);
         return;
       }
+      final PluginHotApplyOutcome outcome = await _applyPluginChange(
+        bus,
+        entry,
+        enable: true,
+      );
+      if (!outcome.applied) {
+        // 起不来就把开关放回去：一次失败的重启不该悄悄把条目改成“已启用”，
+        // 否则下次核心启动会再试一次、日志里再多一条同样的失败。
+        // 同上：只回写读到的旧值，不猜 false。
+        final Object? prev = before?['enabled'];
+        if (prev is bool) {
+          store.update(id, <String, dynamic>{'enabled': prev});
+        } else {
+          bus.log?.call(
+            '[enabled-audit] $id: 重启失败回滚时读不到改动前的 enabled'
+            '（条目可能已被并发删除），跳过回写，请人工核对 ${store.path}',
+          );
+        }
+        _noteConfigWrite(
+          bus,
+          id: id,
+          beforeEnabled: true,
+          afterEnabled: before?['enabled'],
+          source: 'POST …/restart（热应用失败，开关回滚）',
+        );
+        await writeJson(
+          request,
+          400,
+          errorBody(
+            '插件 $id 没能起来：${outcome.detail}（开关已回滚到停用）',
+          ),
+        );
+        return;
+      }
+      _noteConfigWrite(
+        bus,
+        id: id,
+        beforeEnabled: before?['enabled'],
+        afterEnabled: true,
+        source: 'POST …/restart（停用态点重启=启用）',
+      );
+      if (!bus.isRunning(id)) {
+        await writeJson(
+          request,
+          400,
+          errorBody('插件 $id 已启用，但运行态里没有它的实例（检查命令与参数是否可执行）'),
+        );
+        return;
+      }
+      // 没在跑的插件没有“上一世状态”可续，所以 hot 与 cold 在这里是同一件事：
+      // 如实回 `resumed: false`，不假装续上了。
+      await writeJson(request, 200, <String, dynamic>{
+        'ok': true,
+        'plugin_id': id,
+        'enabled': true,
+        'running': true,
+        if (mode == 'hot') 'resumed': false,
+        'path': store.path,
+        'detail': outcome.detail,
+      });
+      return;
+    }
+    // 片 D：重启前复核依赖（含热重启）。依赖缺失时重拉只会得到同样失败，
+    // 这里直接 409 并给可读清单，避免“看起来重启了，实际没起来”。
+    final Map<String, dynamic>? blocked = bus.dependencyBlock(id);
+    if (blocked != null) {
+      await _writeDependencyConflict(request, blocked, pluginId: id);
+      return;
     }
     if (mode == 'hot') {
       final PluginHotRestartResult hot = await bus.hotRestart(
@@ -2525,19 +2903,10 @@ class CoreServer {
         );
         return;
       }
-      await writeJson(request, 200, hot.toJson());
-      return;
-    }
-    if (mode.isNotEmpty && mode != 'cold') {
-      await writeJson(
-        request,
-        400,
-        errorBody(
-          '未知的 mode「$mode」：这一条只有 cold（冷重启，缺省）/ hot（热重启续跑）/ '
-          'force_stop（用户显式强制停止）三种做法；不把拼错的值静默当成缺省，'
-          '因为你看到的就是“点了热重启但状态没续上”',
-        ),
-      );
+      await writeJson(request, 200, <String, dynamic>{
+        ...hot.toJson(),
+        'enabled': true,
+      });
       return;
     }
     final bool ok = await bus.restart(id);
@@ -2553,6 +2922,7 @@ class CoreServer {
     await writeJson(request, 200, <String, dynamic>{
       'ok': true,
       'plugin_id': id,
+      'enabled': true,
       'running': true,
       'path': store.path,
     });
@@ -2650,6 +3020,8 @@ class CoreServer {
       await _writeDependencyConflict(request, blocked, pluginId: id);
       return;
     }
+    // 审计要的旧值必须在写盘**之前**读（写完之后读到的就是新值了）。
+    final Object? prevEnabled = store.readEntry(id)?['enabled'];
     final PluginStoreResult result = store.upsert(candidateEntry);
     final Map<String, dynamic>? entry = result.entry;
     if (!result.ok || entry == null) {
@@ -2660,6 +3032,13 @@ class CoreServer {
       bus,
       entry,
       enable: true,
+    );
+    _noteConfigWrite(
+      bus,
+      id: id,
+      beforeEnabled: prevEnabled,
+      afterEnabled: true,
+      source: 'POST /api/plugin/builtins（打开内置开关）',
     );
     await writeJson(request, 200, <String, dynamic>{
       ..._pluginWriteBody(store, result, outcome),
@@ -2715,6 +3094,13 @@ class CoreServer {
       bus,
       updated,
       enable: false,
+    );
+    _noteConfigWrite(
+      bus,
+      id: id,
+      beforeEnabled: entry['enabled'],
+      afterEnabled: false,
+      source: 'POST /api/plugin/builtins/{id}/disable',
     );
     await writeJson(request, 200, _pluginWriteBody(store, result, outcome));
   }
@@ -2819,7 +3205,8 @@ class CoreServer {
     if (body == null) return;
     final bool withDependencies =
         body['with_dependencies'] == true || body['withDependencies'] == true;
-    // 片 D：`with_dependencies` 只**补齐缺失**的依赖（不升级已装版本）。
+    // 片 D：`with_dependencies` 补齐**缺失**的依赖，并把**版本不满足**的那条顶到索引里
+    // 能满足要求的一版（已满足的绝不顺手升级）。
     // 冲突 / 成环 / 缺索引条目都在这一步回可读 409，且不会继续装目标插件。
     if (withDependencies) {
       final Map<String, dynamic>? dependencyBlock =
@@ -2875,6 +3262,13 @@ class CoreServer {
       bus,
       stored,
       enable: true,
+    );
+    _noteConfigWrite(
+      bus,
+      id: id,
+      beforeEnabled: existing?['enabled'],
+      afterEnabled: true,
+      source: 'POST /api/plugin/release/{id}/install',
     );
     errorLog?.call(
       '[core:plugin-release] 已安装 $id（${install.version}，'
@@ -2977,6 +3371,13 @@ class CoreServer {
       bus,
       stored,
       enable: true,
+    );
+    _noteConfigWrite(
+      bus,
+      id: id,
+      beforeEnabled: existing?['enabled'],
+      afterEnabled: true,
+      source: 'POST /api/plugin/install/local',
     );
     errorLog?.call(
       '[core:plugin-local] 已安装 $id（${install.version}，'
@@ -3118,6 +3519,15 @@ class CoreServer {
         stored ?? before, // 整条删掉时用被删的那条去断开（与 _deletePluginConfig 同）
         enable: false,
       );
+      _noteConfigWrite(
+        bus,
+        id: id,
+        beforeEnabled: before['enabled'],
+        afterEnabled: builtin ? false : null,
+        source: builtin
+            ? 'POST …/uninstall（内置项：条目保留并停用）'
+            : 'POST …/uninstall（条目删除）',
+      );
     }
 
     // 片 D：已确认的依赖方**停用**（条目保留，不删文件）；停用失败如实列出。
@@ -3132,6 +3542,13 @@ class CoreServer {
       }
       dependentsDisabled.add(config.id);
       await _applyPluginChange(bus, row, enable: false);
+      _noteConfigWrite(
+        bus,
+        id: config.id,
+        beforeEnabled: true,
+        afterEnabled: false,
+        source: '卸载连带停用（依赖 $id）',
+      );
     }
 
     final String fileNotice = removed.failed.isEmpty
@@ -3167,12 +3584,14 @@ class CoreServer {
   ///   “装了没”的结论互相矛盾）；
   /// - 换文件闸门由路由层现给（[PluginBus.quiesceForSwap]）：只有总线知道进程在不在；
   /// - `sources`：**有序多源**（默认 Gitee → GitHub，见 [defaultPluginReleaseSources]）；
-  ///   token 从 `GITEE_TOKEN` / `GITHUB_TOKEN` 读，源顺序可用 `TREE_PLUGIN_RELEASE_ORDER`
-  ///   覆盖（公开仓库不登录也能读，token 只在被限流/401 时才用得上）。
+  ///   来源优先级：设置页（`settings.yaml`）> 环境变量（`GITEE_TOKEN` / `GITHUB_TOKEN`，
+  ///   顺序用 `TREE_PLUGIN_RELEASE_ORDER`）> 默认。公开仓库不登录也能读，token 只在
+  ///   被限流/401 时才用得上。
   static PluginDownloader? _releaseDownloaderFor({
     required String? cacheDir,
     required PluginBus? bus,
     required BuiltinPluginCatalog catalog,
+    required CoreSettings settings,
   }) {
     final String dir = (cacheDir ?? '').trim();
     if (dir.isEmpty || bus == null) return null;
@@ -3180,13 +3599,7 @@ class CoreServer {
     return PluginDownloader(
       cacheDir: dir,
       installDir: defaultPluginInstallDir(),
-      sources: defaultPluginReleaseSources(
-        giteeToken: (Platform.environment['GITEE_TOKEN'] ?? '').trim(),
-        githubToken: (Platform.environment['GITHUB_TOKEN'] ?? '').trim(),
-        order: parsePluginReleaseSourceOrder(
-          Platform.environment['TREE_PLUGIN_RELEASE_ORDER'] ?? '',
-        ),
-      ),
+      sources: pluginReleaseSourcesFor(settings),
       runtimeResolver: catalog.detectRuntime,
       installedEntryOf: store.readEntry,
     );

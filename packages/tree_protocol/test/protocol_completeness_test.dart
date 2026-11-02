@@ -197,12 +197,12 @@ void main() {
     );
   });
 
-  test('委派契约：coreOwned 40 / delegated 55 / pendingHandoffRoutes 0', () {
-    expect(ApiPaths.coreOwned.length, 40, reason: '核心永久面 40 条（36 + UI 多窗口 3 + 本地安装 1）');
+  test('委派契约：coreOwned 43 / delegated 55 / pendingHandoffRoutes 0', () {
+    expect(ApiPaths.coreOwned.length, 43, reason: '核心永久面 43 条（36 + UI 多窗口 3 + 本地安装 1 + 发布源设置 3）');
     expect(ApiPaths.delegated.length, 55, reason: '插件面 55 条（git 3 已删除；消息详情端点 +1）');
     expect(ApiPaths.pendingHandoffRoutes, isEmpty, reason: 'A5 已清空迁移债台账');
-    expect(ApiPaths.contractRoutes.length, 95);
-    expect(ApiPaths.kept.length, 73, reason: 'git 3 已删；UI 多窗口 +2；终端 REST +2；本地安装 +1；消息详情 +1');
+    expect(ApiPaths.contractRoutes.length, 98);
+    expect(ApiPaths.kept.length, 75, reason: 'git 3 已删；UI 多窗口 +2；终端 REST +2；本地安装 +1；消息详情 +1；发布源设置 +2');
     expect(ApiPaths.contractRoutes.length, ApiPaths.coreOwned.length + ApiPaths.delegated.length);
     expect(ApiPaths.coreOwned.intersection(ApiPaths.delegated), isEmpty);
     expect(ApiPaths.pendingHandoffRoutes.difference(ApiPaths.delegated), isEmpty);

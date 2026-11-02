@@ -107,6 +107,25 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _missedHeartbeatLimitController =
       TextEditingController();
 
+  // --- 插件发布源（安装/更新插件时按顺序逐个试源） ---
+  /// 生效的源顺序（key）：只支持 gitee / github 两种排列。
+  List<String> _releaseOrder = const <String>['gitee', 'github'];
+
+  /// 令牌是否**已保存**（明文永远拿不到，核心只回 `token_set`）。
+  bool _giteeTokenSet = false;
+  bool _githubTokenSet = false;
+
+  bool _releaseSourcesLoaded = false;
+  bool _releaseSaving = false;
+  bool _releaseTesting = false;
+
+  /// 最近一次「测试连接」的逐源结果（null = 还没测过）。
+  List<Map<String, dynamic>>? _releaseProbes;
+  String? _releaseProbeError;
+
+  final TextEditingController _giteeTokenController = TextEditingController();
+  final TextEditingController _githubTokenController = TextEditingController();
+
   // --- 自定义模型（设置页 CRUD） ---
   List<Map<String, dynamic>> _models = <Map<String, dynamic>>[];
   bool _modelsLoading = false;
@@ -131,6 +150,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _loadTokenRateSetting();
     _loadFrameRateSetting();
     _loadHeartbeatSetting();
+    _loadPluginReleaseSources();
     _loadModelList();
     _loadPluginConfigPath();
     // 引导带过来的（focusModels）：首帧之后滚到「自定义模型」——此时 ListView
@@ -185,6 +205,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _frameRateController.dispose();
     _heartbeatIntervalController.dispose();
     _missedHeartbeatLimitController.dispose();
+    _giteeTokenController.dispose();
+    _githubTokenController.dispose();
     super.dispose();
   }
 
@@ -412,6 +434,125 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  // ── 插件发布源 ────────────────────────────────────────────────────────
+
+  /// 当前选择的排列（两个源只有两种顺序，看第一个是谁即可）。
+  List<String> get _selectedReleaseOrder => _releaseOrder.first == 'github'
+      ? const <String>['github', 'gitee']
+      : const <String>['gitee', 'github'];
+
+  /// 读发布源设置（顺序 + 令牌是否已配；**明文令牌拿不到**）。
+  Future<void> _loadPluginReleaseSources() async {
+    try {
+      final Map<String, dynamic> data =
+          await ApiService.getPluginReleaseSources();
+      if (!mounted) return;
+      _applyReleaseSourcesResponse(data);
+    } catch (_) {
+      // 核心不可达：保留默认（Gitee → GitHub），控件仍可编辑
+      if (mounted) setState(() => _releaseSourcesLoaded = true);
+    }
+  }
+
+  /// 把核心返回的发布源设置写进界面（GET / POST 响应同形状）。
+  void _applyReleaseSourcesResponse(Map<String, dynamic> data) {
+    final Object? rawOrder = data['order'];
+    final List<String> order = rawOrder is List
+        ? rawOrder
+              .map((Object? item) => item?.toString() ?? '')
+              .where((String key) => key.isNotEmpty)
+              .toList()
+        : <String>[];
+    bool giteeSet = false;
+    bool githubSet = false;
+    final Object? rawSources = data['sources'];
+    if (rawSources is List) {
+      for (final Object? item in rawSources) {
+        if (item is! Map) continue;
+        final String key = (item['key'] ?? '').toString();
+        final bool set = item['token_set'] == true;
+        if (key == 'gitee') giteeSet = set;
+        if (key == 'github') githubSet = set;
+      }
+    }
+    setState(() {
+      _releaseOrder = order.isEmpty
+          ? const <String>['gitee', 'github']
+          : order;
+      _giteeTokenSet = giteeSet;
+      _githubTokenSet = githubSet;
+      _releaseSourcesLoaded = true;
+    });
+  }
+
+  /// 保存顺序与（本轮填过的）令牌：留空的令牌输入框**不改原值**。
+  Future<void> _savePluginReleaseSources() async {
+    if (_releaseSaving) return;
+    setState(() => _releaseSaving = true);
+    final String gitee = _giteeTokenController.text.trim();
+    final String github = _githubTokenController.text.trim();
+    try {
+      final Map<String, dynamic> data =
+          await ApiService.savePluginReleaseSources(
+            order: _selectedReleaseOrder,
+            giteeToken: gitee.isEmpty ? null : gitee,
+            githubToken: github.isEmpty ? null : github,
+          );
+      if (!mounted) return;
+      _applyReleaseSourcesResponse(data);
+      _giteeTokenController.clear();
+      _githubTokenController.clear();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('插件发布源已保存并生效'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('保存失败：$e'), duration: const Duration(seconds: 3)),
+      );
+    } finally {
+      if (mounted) setState(() => _releaseSaving = false);
+    }
+  }
+
+  /// 探测各源是否连通（带**未保存的草稿值**：先试通再保存）。
+  Future<void> _testPluginReleaseSources() async {
+    if (_releaseTesting) return;
+    final String gitee = _giteeTokenController.text.trim();
+    final String github = _githubTokenController.text.trim();
+    setState(() {
+      _releaseTesting = true;
+      _releaseProbes = null;
+      _releaseProbeError = null;
+    });
+    try {
+      final Map<String, dynamic> data =
+          await ApiService.testPluginReleaseSources(
+            order: _selectedReleaseOrder,
+            giteeToken: gitee.isEmpty ? null : gitee,
+            githubToken: github.isEmpty ? null : github,
+          );
+      if (!mounted) return;
+      final Object? rawSources = data['sources'];
+      setState(() {
+        _releaseProbes = rawSources is List
+            ? <Map<String, dynamic>>[
+                for (final Object? item in rawSources)
+                  if (item is Map) Map<String, dynamic>.from(item),
+              ]
+            : <Map<String, dynamic>>[];
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _releaseProbeError = '$e');
+    } finally {
+      if (mounted) setState(() => _releaseTesting = false);
+    }
+  }
+
   /// 加载自定义模型列表
   Future<void> _loadModelList() async {
     if (mounted) {
@@ -485,6 +626,10 @@ class _SettingsPageState extends State<SettingsPage> {
         _buildSectionTitle('插件开发'),
         const SizedBox(height: 8),
         _buildPluginDevCard(),
+        const SizedBox(height: 24),
+        _buildSectionTitle('插件发布源'),
+        const SizedBox(height: 8),
+        _buildPluginReleaseCard(),
         const SizedBox(height: 24),
         _buildSectionTitle('核心日志'),
         const SizedBox(height: 8),
@@ -611,6 +756,194 @@ class _SettingsPageState extends State<SettingsPage> {
         );
       },
     );
+  }
+
+  /// 插件发布源卡片：面板的「安装 / 更新」按这里的顺序逐个试源。
+  ///
+  /// 令牌输入框只负责**写入**：已保存的明文永远拿不到（核心只回 `token_set`），
+  /// 所以留空 = 保持原值；想验证填的值对不对，先点「测试连接」（带草稿值、不落盘）。
+  Widget _buildPluginReleaseCard() {
+    final ColorScheme cs = Theme.of(context).colorScheme;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              '插件面板的「安装 / 更新」会按下面的顺序逐个尝试发布源，第一个通的生效。'
+              '公开仓库不登录也能读；令牌只在被限流或需要私有访问时才用得上。',
+              style: TextStyle(
+                fontSize: 12,
+                color: cs.onSurfaceVariant,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 8),
+            RadioGroup<String>(
+              groupValue: _releaseOrder.first,
+              onChanged: (String? value) {
+                if (value == null) return;
+                setState(() {
+                  _releaseOrder = value == 'github'
+                      ? const <String>['github', 'gitee']
+                      : const <String>['gitee', 'github'];
+                });
+              },
+              child: Column(
+                children: <Widget>[
+                  RadioListTile<String>(
+                    key: const Key('plugin-release-order-gitee-first'),
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    value: 'gitee',
+                    activeColor: cs.primary,
+                    title: const Text(
+                      'Gitee → GitHub（推荐）',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                    subtitle: const Text(
+                      '国内访问更稳；Gitee 不通时自动换 GitHub。',
+                      style: TextStyle(fontSize: 11),
+                    ),
+                  ),
+                  RadioListTile<String>(
+                    key: const Key('plugin-release-order-github-first'),
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    value: 'github',
+                    activeColor: cs.primary,
+                    title: const Text(
+                      'GitHub → Gitee',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                    subtitle: const Text(
+                      'GitHub 优先；不通时自动换 Gitee。',
+                      style: TextStyle(fontSize: 11),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              key: const Key('plugin-release-gitee-token'),
+              controller: _giteeTokenController,
+              obscureText: true,
+              decoration: InputDecoration(
+                labelText: 'Gitee token（可选）',
+                hintText: _giteeTokenSet
+                    ? '已保存（留空保持不变）'
+                    : '未设置（公开仓库可留空）',
+                isDense: true,
+                border: const OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              key: const Key('plugin-release-github-token'),
+              controller: _githubTokenController,
+              obscureText: true,
+              decoration: InputDecoration(
+                labelText: 'GitHub token（可选）',
+                hintText: _githubTokenSet
+                    ? '已保存（留空保持不变）'
+                    : '未设置（公开仓库可留空）',
+                isDense: true,
+                border: const OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: <Widget>[
+                FilledButton.icon(
+                  key: const Key('plugin-release-save'),
+                  onPressed:
+                      (_releaseSaving || !_releaseSourcesLoaded)
+                      ? null
+                      : _savePluginReleaseSources,
+                  icon: _releaseSaving
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.save_outlined, size: 16),
+                  label: const Text('保存'),
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                  ),
+                ),
+                OutlinedButton.icon(
+                  key: const Key('plugin-release-test'),
+                  onPressed: _releaseTesting ? null : _testPluginReleaseSources,
+                  icon: _releaseTesting
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.wifi_tethering_outlined, size: 16),
+                  label: const Text('测试连接'),
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                  ),
+                ),
+              ],
+            ),
+            if (_releaseProbeError != null) ...<Widget>[
+              const SizedBox(height: 8),
+              Text(
+                '探测失败：$_releaseProbeError',
+                style: TextStyle(fontSize: 11, color: cs.error),
+              ),
+            ],
+            if (_releaseProbes != null) ...<Widget>[
+              const SizedBox(height: 8),
+              for (final Map<String, dynamic> probe in _releaseProbes!)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Text(
+                    _releaseProbeLine(probe),
+                    key: Key(
+                      'plugin-release-probe-${(probe['key'] ?? '').toString()}',
+                    ),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: probe['usable'] == true
+                          ? cs.onSurfaceVariant
+                          : cs.error,
+                      height: 1.3,
+                    ),
+                  ),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 一条探测结果的展示文案（通了要给出"通到哪一版"，没通要给出原因）。
+  String _releaseProbeLine(Map<String, dynamic> probe) {
+    final String name = (probe['name'] ?? probe['key'] ?? '').toString();
+    if (probe['ok'] != true) {
+      return '$name：不通 —— ${probe['error'] ?? '未知原因'}';
+    }
+    final String tag = (probe['tag'] ?? '').toString();
+    final bool hasIndex = probe['has_index'] == true;
+    if (!hasIndex) {
+      return '$name：可连通（release ${tag.isEmpty ? '未知' : tag}），'
+          '但这一版没有 plugin-index.json ⇒ 还不能安装';
+    }
+    return '$name：可连通（release ${tag.isEmpty ? '未知' : tag}，'
+        '${(probe['asset_count'] as num?)?.toInt() ?? 0} 个资产，含索引）';
   }
 
   /// 插件开发卡片（M9 §4.2 的开发面）。

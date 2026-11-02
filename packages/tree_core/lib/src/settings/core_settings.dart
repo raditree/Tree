@@ -342,6 +342,21 @@ class CoreSettings {
   /// 连续丢失阈值 N（次）：落 settings.yaml 的 `missed_heartbeat_limit`。
   int _missedHeartbeatLimit = defaultMissedHeartbeatLimit;
 
+  /// 插件**发布源**的优先顺序（key 序，如 `gitee` / `github`）：落 `plugin_release_order`。
+  ///
+  /// 这里只保存原值，**不做合法性校验**（认不出的 key 由核心在用的时候过滤，
+  /// 见 `parsePluginReleaseSourceOrder`）——设置层不引入插件模块的常量，
+  /// 免得两处各有一份"已知源"清单漂移。
+  /// 空 = 用户没配过（生效顺序由核心按环境变量 → 默认 Gitee → GitHub 解析）。
+  List<String> _pluginReleaseOrder = const <String>[];
+
+  /// Gitee / GitHub 的发布源令牌：落 settings.yaml，**永不回显**给前端/日志。
+  ///
+  /// 公开仓库不登录也能读，令牌只在被限流或需要私有访问时才用得上；保存后立即
+  /// 热应用到运行中的下载器上（见 CoreServer 的 `_applyPluginReleaseSources`）。
+  String _giteeToken = '';
+  String _githubToken = '';
+
   /// 最近一次心跳判活参数写入的**可读说明**（只有真被夹取时才有值）。
   String? _livenessNotice;
 
@@ -372,6 +387,34 @@ class CoreSettings {
   int get livenessWindowSeconds =>
       _heartbeatIntervalSeconds * _missedHeartbeatLimit;
 
+  /// 插件发布源的优先顺序（用户可配；空/全认不出时由核心回落默认）。
+  List<String> get pluginReleaseOrder =>
+      List<String>.unmodifiable(_pluginReleaseOrder);
+
+  /// Gitee 发布源令牌（空 = 不带鉴权；**不回显**）。
+  String get giteeToken => _giteeToken;
+
+  /// GitHub 发布源令牌（空 = 不带鉴权；**不回显**）。
+  String get githubToken => _githubToken;
+
+  /// 写入插件发布源设置（`null` = 该项保持原值），并落盘。
+  ///
+  /// 空白令牌按"清除"处理：用户在设置页清空输入框就是想撤掉它，不能变成
+  /// "保留上次那个看不见的值"。因此核心侧只在**请求体里出现该字段**时调用
+  /// 这里，不出现的字段就传 null。
+  void setPluginReleaseSettings({
+    List<String>? order,
+    String? giteeToken,
+    String? githubToken,
+  }) {
+    if (order != null) {
+      _pluginReleaseOrder = _readReleaseOrder(order.join(' '));
+    }
+    if (giteeToken != null) _giteeToken = giteeToken.trim();
+    if (githubToken != null) _githubToken = githubToken.trim();
+    sink?.saveSettings(this);
+  }
+
   /// 最近一次写入被夹取时的**可读原因**；没有夹取则为 null。
   ///
   /// 存在的理由：夹取必须说得清"为什么"（用户填 1s 却生效成 4s 时要能看到原因）。
@@ -400,8 +443,14 @@ class CoreSettings {
         defaultMissedHeartbeatLimit,
       ),
     );
+    _pluginReleaseOrder = _readReleaseOrder(map['plugin_release_order']);
+    _giteeToken = _str(map, 'gitee_token');
+    _githubToken = _str(map, 'github_token');
     extra = Map<String, dynamic>.from(map)
       ..remove('frame_rate')
+      ..remove('plugin_release_order')
+      ..remove('gitee_token')
+      ..remove('github_token')
       // 领域键（归 tree.agent）：消耗而不是当未知键透传，否则保存时又会被写回去。
       ..remove('token_acquisition_rate')
       ..remove('models')
@@ -418,6 +467,9 @@ class CoreSettings {
     'heartbeat_interval': _heartbeatIntervalSeconds,
     'missed_heartbeat_limit': _missedHeartbeatLimit,
     'data_collection_enabled': _dataCollectionEnabled,
+    'plugin_release_order': List<String>.of(_pluginReleaseOrder),
+    'gitee_token': _giteeToken,
+    'github_token': _githubToken,
   };
 
   /// 模型列表（按 model_id 排序，稳定可预测）。
@@ -591,6 +643,34 @@ class CoreSettings {
   static int _clampMissedLimit(int value) => value < missedHeartbeatLimitMin
       ? missedHeartbeatLimitMin
       : (value > missedHeartbeatLimitMax ? missedHeartbeatLimitMax : value);
+
+  /// 读发布源顺序：兼容 yaml 的列表写法与手写的逗号/空格分隔串；空 ⇒ 返回空表。
+  ///
+  /// 只做"去空、转小写、去重"，**不筛未知 key**：合法性由用它的那一层判定
+  /// （[CoreSettings] 不认识插件模块的源清单）。空表表示"没配过"，由核心回落
+  /// 环境变量 / 默认顺序（见 CoreServer 的 `_effectiveReleaseOrder`）。
+  static List<String> _readReleaseOrder(Object? raw) {
+    final List<String> keys = <String>[];
+    void add(String token) {
+      final String key = token.trim().toLowerCase();
+      if (key.isEmpty || keys.contains(key)) return;
+      keys.add(key);
+    }
+
+    if (raw is List) {
+      for (final Object? item in raw) {
+        if (item != null) add(item.toString());
+      }
+    } else if (raw is String) {
+      for (final String token in raw.split(RegExp(r'[,\s]+'))) {
+        add(token);
+      }
+    }
+    return keys;
+  }
+
+  static String _str(Map<String, dynamic> map, String key) =>
+      (map[key] as Object?)?.toString().trim() ?? '';
 
   static bool _bool(Map<String, dynamic> map, String key, bool fallback) {
     final Object? value = map[key];

@@ -13,6 +13,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
@@ -231,6 +232,30 @@ void main() {
       expect(listing.ok, isFalse);
       expect(listing.error, contains(kPluginIndexAsset));
       expect(listing.error, contains('没得上'));
+    });
+
+    test('release 只带自动源码包（没上传附件）⇒ 说清"源码包不能直接装"', () async {
+      // 现场（2026-11-01）：Gitee 上 v1.0.5 这个 release 一个附件都没传，
+      // `assets` 里只有平台自动生成的两条源码包。不能把它读成"索引名写错了"。
+      repo.release = <String, dynamic>{
+        'tag_name': 'v1.0.5',
+        'assets': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'name': 'v1.0.5.zip',
+            'browser_download_url':
+                'https://gitee.example/raditree/tree-plugins/archive/refs/tags/v1.0.5.zip',
+          },
+          <String, dynamic>{
+            'name': 'v1.0.5.tar.gz',
+            'browser_download_url':
+                'https://gitee.example/raditree/tree-plugins/archive/refs/tags/v1.0.5.tar.gz',
+          },
+        ],
+      };
+      final PluginReleaseListing listing = await downloader().refresh();
+      expect(listing.ok, isFalse);
+      expect(listing.error, contains('源码包'));
+      expect(listing.error, contains('上传资产'));
     });
 
     test('索引字节数不符 ⇒ 失败且**不缓存半截索引**', () async {
@@ -985,6 +1010,162 @@ void main() {
       expect(result.deleted, <String>['gone.dart']);
       expect(File(gone).existsSync(), isFalse, reason: '真的删了');
       expect(result.failed, <String, String>{}, reason: '不存在不是失败');
+    });
+  });
+
+  // ── 整包（archive）形态：UI 插件（2026-11-01） ─────────────────────────
+  //
+  // 为什么单开一组：UI 带 `data/` 与几十个 dll，扁平 `files[]` 的 target 必须是纯文件名，
+  // **装不下**目录。索引里因此多了一个 `archive` 字段（整包 zip），装机端下载后交给
+  // `installFromZip` 的目录形态 —— 与本地 zip 安装共用同一段校验与原子换目录。
+  group('整包（archive）形态（UI 插件）', () {
+    Map<String, dynamic> uiEntry({String id = 'tree.ui.default'}) =>
+        <String, dynamic>{
+          'id': id,
+          'name': 'Tree 默认界面',
+          'version': '1.0.0',
+          'runtime': 'ui',
+          'command': 'tree_ui.exe',
+          'args': <String>[],
+          'granularity': 'team',
+          'scope': <String, dynamic>{},
+          'requires': <String, dynamic>{'api': '>=1.0 <2.0'},
+          'archive': 'tree-ui-default-1.0.0.zip',
+          'archive_bytes': 0,
+        };
+
+    List<int> uiZip({
+      String id = 'tree.ui.default',
+      String command = 'tree_ui.exe',
+    }) {
+      final Archive archive = Archive()
+        ..add(
+          ArchiveFile(
+            'plugin.json',
+            0,
+            utf8.encode(
+              jsonEncode(<String, dynamic>{
+                'id': id,
+                'name': 'Tree 默认界面',
+                'version': '1.0.0',
+                'runtime': 'ui',
+                'command': command,
+                'args': <String>[],
+                'granularity': 'team',
+                'scope': <String, dynamic>{},
+              }),
+            ),
+          ),
+        )
+        ..add(ArchiveFile(command, 4, <int>[0x4D, 0x5A, 0x90, 0x00]))
+        ..add(ArchiveFile('data/app.so', 4, <int>[1, 2, 3, 4]));
+      return ZipEncoder().encode(archive);
+    }
+
+    test('索引解析：有 archive 时 files 可以缺席，command 是包内相对路径', () async {
+      repo.assets['tree-ui-default-1.0.0.zip'] = uiZip();
+      repo.publish(plugins: <Map<String, dynamic>>[uiEntry()]);
+      final PluginReleaseListing listing = await downloader().refresh();
+      expect(listing.ok, isTrue, reason: listing.error);
+      final PluginRepoEntry entry = listing.entries.single;
+      expect(entry.isArchive, isTrue);
+      expect(entry.files, isEmpty);
+      expect(entry.command, 'tree_ui.exe');
+      expect(entry.runtime, 'ui');
+    });
+
+    test('同时声明 files 与 archive ⇒ 该条被跳过并给出原因（不带走整份清单）', () async {
+      repo.publish(
+        plugins: <Map<String, dynamic>>[
+          <String, dynamic>{
+            ...uiEntry(),
+            'files': <Map<String, dynamic>>[
+              <String, dynamic>{
+                'asset': 'tree_ui.exe',
+                'target': 'tree_ui.exe',
+              },
+            ],
+          },
+          _entry(),
+        ],
+      );
+      final PluginReleaseListing listing = await downloader().refresh();
+      expect(listing.entries.map((PluginRepoEntry e) => e.id), <String>['released']);
+      expect(listing.skipped.join('\n'), contains('一种发布形态'));
+    });
+
+    test('安装：整包下到缓存 → 解成 plugins/<id>/ → 条目 command 是绝对路径', () async {
+      repo.assets['tree-ui-default-1.0.0.zip'] = uiZip();
+      repo.publish(plugins: <Map<String, dynamic>>[uiEntry()]);
+      final PluginInstallResult result = await downloader().install(
+        'tree.ui.default',
+        swapGate: allowSwap,
+      );
+      expect(result.ok, isTrue, reason: result.error);
+      final String dir = p.join(installDir, 'tree.ui.default');
+      expect(File(p.join(dir, 'tree_ui.exe')).existsSync(), isTrue);
+      expect(File(p.join(dir, 'plugin.json')).existsSync(), isTrue);
+      expect(
+        File(p.join(dir, 'data', 'app.so')).existsSync(),
+        isTrue,
+        reason: '目录形态的关键收益：data/ 这类子目录装得下',
+      );
+      final Map<String, dynamic> entry = result.entry!;
+      expect(entry['command'], p.join(dir, 'tree_ui.exe'));
+      expect(entry['runtime'], 'ui');
+      expect(
+        entry[kRepoSourceKey],
+        kRepoSourceValue,
+        reason: '来源要如实写“发布仓库”，否则面板会把从仓库装的显示成本地包',
+      );
+      expect(entry[kRepoVersionKey], '1.0.0');
+      expect(result.source, isNotEmpty);
+    });
+
+    test('字节数不符 ⇒ 不落任何文件，旧目录也不动', () async {
+      repo.assets['tree-ui-default-1.0.0.zip'] = uiZip();
+      repo.publish(
+        plugins: <Map<String, dynamic>>[
+          <String, dynamic>{...uiEntry(), 'archive_bytes': 999},
+        ],
+      );
+      // 不截断：让“声明 999 / 实际 N”这条校验单独生效。
+      final PluginInstallResult result = await downloader().install(
+        'tree.ui.default',
+        swapGate: allowSwap,
+      );
+      expect(result.ok, isFalse);
+      expect(result.error, contains('字节数不符'));
+      expect(
+        Directory(p.join(installDir, 'tree.ui.default')).existsSync(),
+        isFalse,
+      );
+    });
+
+    test('包内清单 id 与索引不一致 ⇒ 不写条目（并如实报出来）', () async {
+      repo.assets['tree-ui-default-1.0.0.zip'] = uiZip(id: 'someone.else');
+      repo.publish(plugins: <Map<String, dynamic>>[uiEntry()]);
+      final PluginInstallResult result = await downloader().install(
+        'tree.ui.default',
+        swapGate: allowSwap,
+      );
+      expect(result.ok, isFalse);
+      expect(result.error, contains('someone.else'));
+    });
+
+    test('闸门拒绝 ⇒ 一个文件都不解（缓存可以留着，plugins/ 不动）', () async {
+      repo.assets['tree-ui-default-1.0.0.zip'] = uiZip();
+      repo.publish(plugins: <Map<String, dynamic>>[uiEntry()]);
+      final PluginInstallResult result = await downloader().install(
+        'tree.ui.default',
+        swapGate: (String id) async => '界面还在跑，先退出',
+      );
+      expect(result.ok, isFalse);
+      expect(result.error, contains('界面还在跑'));
+      expect(
+        Directory(p.join(installDir, 'tree.ui.default')).existsSync(),
+        isFalse,
+      );
     });
   });
 }

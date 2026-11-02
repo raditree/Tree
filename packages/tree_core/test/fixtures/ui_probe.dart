@@ -18,6 +18,9 @@ void main(List<String> args) {
   stdout.writeln(
     'TREE_UI_WINDOW_ID=${Platform.environment['TREE_UI_WINDOW_ID'] ?? ''}',
   );
+  stdout.writeln(
+    'TREE_DATA_ROOT=${Platform.environment['TREE_DATA_ROOT'] ?? ''}',
+  );
   stdout.writeln('PROBE_ENV=${Platform.environment['PROBE_ENV'] ?? ''}');
   stderr.writeln('PROBE_STDERR_MARKER');
 

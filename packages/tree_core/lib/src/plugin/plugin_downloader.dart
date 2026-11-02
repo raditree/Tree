@@ -63,6 +63,9 @@ class PluginReleaseSource {
   /// `Accept` 头（GitHub 要求 `application/vnd.github+json`；Gitee 不挑 ⇒ 留空）。
   final String accept;
 
+  /// 源的稳定 key（`gitee` / `github`）：设置项与 API 用它，[name] 只作展示。
+  String get key => name.trim().toLowerCase();
+
   Uri get latestRelease => Uri.parse('$apiBase/repos/$repo/releases/latest');
 
   Map<String, String> get headers => <String, String>{
@@ -244,6 +247,8 @@ class PluginRepoEntry {
     this.scope = const <String, dynamic>{},
     this.installedVersion = '',
     this.requires = const <PluginDependency>[],
+    this.archive = '',
+    this.archiveBytes = 0,
   });
 
   final String id;
@@ -251,7 +256,19 @@ class PluginRepoEntry {
   final String version;
   final List<PluginRepoFile> files;
 
-  /// 装完后用来拉起它的那个**目标文件名**（必在 [files] 的 target 里）。
+  /// **目录形态**插件的整包资产名（zip；空 = 走旧的 `files[]` 扁平文件口径）。
+  ///
+  /// 为什么需要它：UI 插件（`tree.ui.default`）带 `data/` 与几十个 dll，扁平
+  /// `files[]` 根本装不下（索引也要求 target 是纯文件名）。发布方把整个插件目录
+  /// 压成一个 zip，装机端下载后交给 [PluginDownloader.installFromZip] 按目录形态
+  /// 落盘 —— 与本地 zip 安装走**同一段**校验与原子换目录，不另开一条路径。
+  final String archive;
+
+  /// 整包资产声明的字节数（0 = 不核对；>0 时下载完必须一致）。
+  final int archiveBytes;
+
+  /// 装完后用来拉起它的那个**目标文件名**（`files[]` 口径；archive 口径下是
+  /// **包内相对路径**，由 `installFromZip` 改写成落盘后的绝对路径）。
   final String command;
 
   /// 清单声明的**原始** runtime（归一化口径见 `PluginRuntime`）。
@@ -279,6 +296,9 @@ class PluginRepoEntry {
   List<String> get targets =>
       files.map((PluginRepoFile file) => file.target).toList(growable: false);
 
+  /// 是不是**目录形态**（整包 zip 安装）。
+  bool get isArchive => archive.isNotEmpty;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'plugin_id': id,
     'name': name,
@@ -287,6 +307,8 @@ class PluginRepoEntry {
     'runtime': runtime,
     'command': command,
     'files': files.map((PluginRepoFile f) => f.toJson()).toList(),
+    if (archive.isNotEmpty) 'archive': archive,
+    if (archiveBytes > 0) 'archive_bytes': archiveBytes,
     'suspension': suspension,
     'granularity': granularity,
     if (requires.isNotEmpty)
@@ -346,6 +368,57 @@ class PluginReleaseListing {
     'count': entries.length,
     'entries': entries.map((PluginRepoEntry e) => e.toJson()).toList(),
     'skipped': skipped,
+  };
+}
+
+/// 一条发布源的**连通性探测**结果（设置页「测试连接」用，不写缓存）。
+///
+/// 为什么不复用一个 bool：用户要能看见"哪个源通了、通到哪一版、缺了什么"——
+/// 一个 `false` 只会把人推去猜是令牌错了还是被墙了。
+class PluginReleaseProbe {
+  const PluginReleaseProbe({
+    required this.key,
+    required this.name,
+    required this.ok,
+    this.tag = '',
+    this.assetCount = 0,
+    this.hasIndex = false,
+    this.error = '',
+  });
+
+  /// 源 key（`gitee` / `github`）。
+  final String key;
+
+  /// 展示名（`Gitee` / `GitHub`）。
+  final String name;
+
+  /// API 可达且回了合法的 release（令牌错 / 被墙 / 限流都是 false）。
+  final bool ok;
+
+  /// 最新 release 的 tag（拿不到时为空）。
+  final String tag;
+
+  /// 该 release 的资产数量。
+  final int assetCount;
+
+  /// release 里有没有 `plugin-index.json`（没有 ⇒ 这个源"通但装不了"）。
+  final bool hasIndex;
+
+  /// 失败时的可读原因（[ok] 为 true 时为空）。
+  final String error;
+
+  /// 这一版能不能拿来装：通了**且**带索引。
+  bool get usable => ok && hasIndex;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'key': key,
+    'name': name,
+    'ok': ok,
+    'usable': usable,
+    'tag': tag,
+    'asset_count': assetCount,
+    'has_index': hasIndex,
+    'error': error,
   };
 }
 
@@ -453,7 +526,10 @@ class PluginDownloader {
   ///
   /// 逐源尝试、失败就换下一个；成功时把"是哪一个"如实写进回包与日志 —— 装机端
   /// 不该猜"这次是从哪儿拿的"，出问题时那个名字就是第一条线索。
-  final List<PluginReleaseSource> sources;
+  ///
+  /// 可变（用户可在设置页改顺序 / 填 token，保存后无需重启核心）：
+  /// 改动只经 [configureSources]，它负责"空清单回落默认"这条兜底。
+  List<PluginReleaseSource> sources;
 
   /// 单次 HTTP 的超时（建连 + 读响应 + 收流）。
   ///
@@ -650,6 +726,82 @@ class PluginDownloader {
   /// 收掉本类自己建的 HTTP 客户端（注入的那一份归注入方所有，不动它）。
   void close() => _ownedClient?.close(force: true);
 
+  /// 换成一组新的发布源（设置页保存后**热应用**，不用重启核心）。
+  ///
+  /// 空清单回落默认（Gitee → GitHub）：一个"源都没配好"的设置不该让装机入口
+  /// 直接失效。这里只换清单、不清缓存 —— 已下载的索引与资产仍然可用。
+  void configureSources(List<PluginReleaseSource> next) {
+    sources = next.isEmpty
+        ? defaultPluginReleaseSources()
+        : List<PluginReleaseSource>.of(next, growable: true);
+  }
+
+  /// 逐源做一次**只读探测**（设置页「测试连接」）：拿最新 release、看有没有索引，
+  /// **不写缓存、不装任何东西**。
+  ///
+  /// [sources] 给"还没保存的草稿值"留了口子：用户可以先把 token 填进去试一次，
+  /// 通了再保存。为 null 时用当前生效的清单。
+  Future<List<PluginReleaseProbe>> probeSources({
+    List<PluginReleaseSource>? sources,
+  }) async {
+    final List<PluginReleaseSource> list = sources ?? this.sources;
+    final List<PluginReleaseProbe> probes = <PluginReleaseProbe>[];
+    for (final PluginReleaseSource source in list) {
+      probes.add(await _probeFrom(source));
+    }
+    return probes;
+  }
+
+  /// 从一个源取最新 release 并检查索引资产（失败只回可读原因，不抛异常）。
+  Future<PluginReleaseProbe> _probeFrom(PluginReleaseSource source) async {
+    final Uri uri = source.latestRelease;
+    final PluginFetchResult meta = await _get(uri, source);
+    if (!meta.ok) {
+      return PluginReleaseProbe(
+        key: source.key,
+        name: source.name,
+        ok: false,
+        error: _httpFailure('取最新 release 失败', meta, uri, source),
+      );
+    }
+    final Map<String, dynamic>? release;
+    try {
+      final Object? decoded = jsonDecode(utf8.decode(meta.bytes));
+      release = decoded is Map
+          ? decoded.map(
+              (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+            )
+          : null;
+    } catch (_) {
+      return PluginReleaseProbe(
+        key: source.key,
+        name: source.name,
+        ok: false,
+        error: 'release 响应不是合法 JSON（形状与发布平台 API 不符）',
+      );
+    }
+    if (release == null) {
+      return PluginReleaseProbe(
+        key: source.key,
+        name: source.name,
+        ok: false,
+        error: 'release 响应不是 JSON 对象（形状与发布平台 API 不符）',
+      );
+    }
+    final String tag = (release['tag_name'] ?? '').toString();
+    final Object? assets = release['assets'];
+    final List<dynamic> assetList = assets is List ? assets : const <dynamic>[];
+    final bool hasIndex = _findIndexAsset(assetList) != null;
+    return PluginReleaseProbe(
+      key: source.key,
+      name: source.name,
+      ok: true,
+      tag: tag,
+      assetCount: assetList.length,
+      hasIndex: hasIndex,
+    );
+  }
+
   // ── ① 取索引（联网那一段）─────────────────────────────────────────────
 
   /// 逐源拉最新 release 的 `plugin-index.json` 并缓存，然后回清单。
@@ -717,9 +869,23 @@ class PluginDownloader {
     }
     final ({String url, int size})? indexAsset = _findIndexAsset(rawAssets);
     if (indexAsset == null) {
+      // Gitee 的 release 即使一个附件都没传，`assets` 里也会自动带两条**源码包**
+      // （`v1.0.5.zip` / `v1.0.5.tar.gz`，`browser_download_url` 指向 `/archive/`）。
+      // 把它们当成"有资产"会让真正的原因（发布时压根没上传成品）被读成"索引名写错了"。
+      final List<String> archiveNames = <String>[
+        for (final Object? item in rawAssets)
+          if (item is Map && _isSourceArchive(item))
+            (item['name'] ?? '').toString(),
+      ];
+      final bool onlyArchives = archiveNames.length == rawAssets.length;
       return PluginReleaseListing.failed(
-        '最新 release（$tag）里没有 $kPluginIndexAsset 资产：'
-        '装机端只认这份索引，缺它就等于"这一版没得上"',
+        onlyArchives
+            ? '最新 release（$tag）只带自动生成的源码包'
+                  '（${archiveNames.join(' / ')}），一个上传的资产都没有：'
+                  '装机端要的是 $kPluginIndexAsset 与各插件成品，源码包不能直接装；'
+                  '请在这个 release 里上传资产（或换一个填好资产的 release）'
+            : '最新 release（$tag）里没有 $kPluginIndexAsset 资产：'
+                  '装机端只认这份索引，缺它就等于"这一版没得上"',
         indexPath: indexPath,
       );
     }
@@ -776,6 +942,13 @@ class PluginDownloader {
       );
     }
     return _readIndex(tag: _cachedTag(), online: false, source: _cachedSource());
+  }
+
+  /// 该资产是不是发布平台**自动生成**的源码包（下载地址在 `/archive/` 下），
+  /// 而不是发布者手工上传的成品 —— 只有后者能装，前者只能读代码。
+  bool _isSourceArchive(Map<dynamic, dynamic> item) {
+    final String url = (item['browser_download_url'] ?? '').toString();
+    return url.contains('/archive/');
   }
 
   ({String url, int size})? _findIndexAsset(List<dynamic> assets) {
@@ -893,9 +1066,24 @@ class PluginDownloader {
     if (!_versionPattern.hasMatch(version)) {
       return (entry: null, error: '$id 的 version 必须是三段数字 x.y.z（当前：$version）');
     }
+    // 两种发布形态（一条插件只能选一种）：
+    // 1) `files[]`：旧的逐资产口径，每个 target 必须是**纯文件名**（扁平落进 plugins/）；
+    // 2) `archive`：目录形态插件的整包 zip（target 是包内相对路径，如 `data/…`、
+    //    `sub/lib.dll`，扁平口径表达不了）。下载后复用 installFromZip 的目录安装。
+    final String archive = (raw['archive'] ?? '').toString().trim();
+    if (archive.isNotEmpty && archive != p.basename(archive)) {
+      return (entry: null, error: '$id 的 archive「$archive」不是纯文件名（不许含路径）');
+    }
     final Object? rawFiles = raw['files'];
-    if (rawFiles is! List || rawFiles.isEmpty) {
+    final bool hasFiles = rawFiles is List && rawFiles.isNotEmpty;
+    if (archive.isEmpty && !hasFiles) {
       return (entry: null, error: '$id 的 files 必须是非空数组（要放进 plugins/ 的文件）');
+    }
+    if (archive.isNotEmpty && hasFiles) {
+      return (
+        entry: null,
+        error: '$id 同时声明了 files 与 archive：一条插件只能用一种发布形态',
+      );
     }
     final List<PluginRepoFile> files = <PluginRepoFile>[];
     final Set<String> reserved = protectedFileNames();
@@ -908,7 +1096,7 @@ class PluginDownloader {
             isWindows: isWindows ?? Platform.isWindows,
           )
         : '';
-    for (final Object? item in rawFiles) {
+    for (final Object? item in rawFiles is List ? rawFiles : const <Object?>[]) {
       if (item is! Map) {
         return (entry: null, error: '$id 的 files 里有一项不是对象（要 {asset, target}）');
       }
@@ -947,7 +1135,8 @@ class PluginDownloader {
     if (command.isEmpty) {
       return (entry: null, error: '$id 缺 command（装完后拿什么拉起它）');
     }
-    if (!files.any((PluginRepoFile f) => f.target == command)) {
+    if (archive.isEmpty &&
+        !files.any((PluginRepoFile f) => f.target == command)) {
       return (entry: null, error: '$id 的 command「$command」不在 files 的目标名里');
     }
     // 片 D：runtime **不再按语言枚举白名单拒收**。任意值都接受，原样保留进
@@ -998,6 +1187,8 @@ class PluginDownloader {
             ? rawScope.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
             : <String, dynamic>{},
         requires: requires.dependencies,
+        archive: archive,
+        archiveBytes: (raw['archive_bytes'] as num?)?.toInt() ?? 0,
         installedVersion: (installed == null
             ? ''
             : (installed[kRepoVersionKey] ?? '').toString()),
@@ -1064,6 +1255,11 @@ class PluginDownloader {
       }
     }
 
+    // 目录形态（整包 zip）：资产只有一个，走 installFromZip 的目录安装。
+    if (entry.isArchive) {
+      return _installArchive(entry, swapGate: swapGate);
+    }
+
     // ① 资产进缓存（缺什么就下什么；字节数不符 = 失败且不落地）
     int downloadedBytes = 0;
     // 这批文件是从哪个源下的（缓存全命中时用索引缓存时记下的那个）——如实带进回包。
@@ -1083,50 +1279,67 @@ class PluginDownloader {
         ready[file.target] = cachedPath;
         continue;
       }
-      final ({String url, int size, PluginReleaseSource source})? asset =
-          await _lookupAsset(file.asset);
-      if (asset == null) {
+      final List<({String url, int size, PluginReleaseSource source})> candidates =
+          await _lookupAssetCandidates(file.asset);
+      if (candidates.isEmpty) {
         return PluginInstallResult.failed(
           '发布源里找不到资产「${file.asset}」（插件 $id 需要它）：'
           '发布与索引不同版 ⇒ 请重新发布，或先刷新索引',
           pluginId: id,
         );
       }
-      usedSource = asset.source.name;
-      final PluginFetchResult data = await _get(
-        Uri.parse(asset.url),
-        asset.source,
-      );
-      if (!data.ok) {
-        return PluginInstallResult.failed(
-          _httpFailure(
+      // 下载**也按源顺序回退**：某个源能给出地址却下不动（被墙 / 超时 / 资产没
+      // 传完整）时换下一个源再试。否则「默认 Gitee」一旦某个源抽风，整单就失败，
+      // 而日志里只剩最后那个源的超时（用户会问“为什么没走 Gitee”）。
+      String lastFailure = '';
+      for (final ({String url, int size, PluginReleaseSource source}) candidate
+          in candidates) {
+        final Uri uri = Uri.parse(candidate.url);
+        final PluginFetchResult data = await _get(uri, candidate.source);
+        if (!data.ok) {
+          lastFailure = _httpFailure(
             '下载资产「${file.asset}」失败',
             data,
-            Uri.parse(asset.url),
-            asset.source,
-          ),
-          pluginId: id,
-        );
+            uri,
+            candidate.source,
+          );
+          log?.call(
+            '发布源 ${candidate.source.name}：$lastFailure ⇒ 换下一个源',
+          );
+          continue;
+        }
+        // 期望字节数：索引显式声明优先，否则取 API 给的 asset.size
+        final int expected = file.bytes > 0 ? file.bytes : candidate.size;
+        if (expected > 0 && data.bytes.length != expected) {
+          lastFailure =
+              '资产「${file.asset}」字节数不符（下载 ${data.bytes.length}，声明 $expected）'
+              '⇒ 不缓存半截文件，旧文件也没动';
+          log?.call(
+            '发布源 ${candidate.source.name}：$lastFailure ⇒ 换下一个源',
+          );
+          continue;
+        }
+        try {
+          await _atomicWriteBytes(cachedPath, data.bytes);
+        } catch (error) {
+          return PluginInstallResult.failed(
+            '资产「${file.asset}」写缓存失败（$cachedPath）：$error',
+            pluginId: id,
+          );
+        }
+        usedSource = candidate.source.name;
+        downloadedBytes += data.bytes.length;
+        ready[file.target] = cachedPath;
+        break;
       }
-      // 期望字节数：索引显式声明优先，否则取 API 给的 asset.size
-      final int expected = file.bytes > 0 ? file.bytes : asset.size;
-      if (expected > 0 && data.bytes.length != expected) {
+      if (ready[file.target] == null) {
         return PluginInstallResult.failed(
-          '资产「${file.asset}」字节数不符（下载 ${data.bytes.length}，声明 $expected）'
-          '⇒ 不缓存半截文件，旧文件也没动',
+          lastFailure.isEmpty
+              ? '资产「${file.asset}」在发布源里下载不到（每个源都没给出一份可用文件）'
+              : lastFailure,
           pluginId: id,
         );
       }
-      try {
-        await _atomicWriteBytes(cachedPath, data.bytes);
-      } catch (error) {
-        return PluginInstallResult.failed(
-          '资产「${file.asset}」写缓存失败（$cachedPath）：$error',
-          pluginId: id,
-        );
-      }
-      downloadedBytes += data.bytes.length;
-      ready[file.target] = cachedPath;
     }
 
     // ② 闸门：旧进程没确认退出就不换（核心不为了换文件而杀进程，也不无限等）
@@ -1231,6 +1444,111 @@ class PluginDownloader {
     );
   }
 
+  /// 目录形态插件的安装：**一个 zip 资产** → 缓存 → [installFromZip] 的目录落盘。
+  ///
+  /// 与扁平通道共用同一段纪律：下载只写缓存、字节数对不上就失败、只碰获得授权的
+  /// 文件、失败一步都不动旧目录。区别只在“字节从哪来”和“落成文件还是落成目录”。
+  Future<PluginInstallResult> _installArchive(
+    PluginRepoEntry entry, {
+    required PluginSwapGate swapGate,
+  }) async {
+    final String id = entry.id;
+    final String cachedPath = p.join(
+      cacheDir,
+      id,
+      entry.version,
+      entry.archive,
+    );
+    final File cached = File(cachedPath);
+    String usedSource = _cachedSource();
+    int downloaded = 0;
+    if (!cached.existsSync() ||
+        (entry.archiveBytes > 0 &&
+            cached.lengthSync() != entry.archiveBytes)) {
+      final ({String url, int size, PluginReleaseSource source})? asset =
+          await _lookupAsset(entry.archive);
+      if (asset == null) {
+        return PluginInstallResult.failed(
+          '发布源里找不到整包资产「${entry.archive}」（插件 $id 需要它）：'
+          '发布与索引不同版 ⇒ 请重新发布，或先刷新索引',
+          pluginId: id,
+        );
+      }
+      usedSource = asset.source.name;
+      final PluginFetchResult data = await _get(
+        Uri.parse(asset.url),
+        asset.source,
+      );
+      if (!data.ok) {
+        return PluginInstallResult.failed(
+          _httpFailure(
+            '下载整包资产「${entry.archive}」失败',
+            data,
+            Uri.parse(asset.url),
+            asset.source,
+          ),
+          pluginId: id,
+        );
+      }
+      final int expected = entry.archiveBytes > 0
+          ? entry.archiveBytes
+          : asset.size;
+      if (expected > 0 && data.bytes.length != expected) {
+        return PluginInstallResult.failed(
+          '整包资产「${entry.archive}」字节数不符（下载 ${data.bytes.length}，声明 $expected）'
+          '⇒ 不缓存半截文件，旧目录也没动',
+          pluginId: id,
+        );
+      }
+      try {
+        await _atomicWriteBytes(cachedPath, data.bytes);
+      } catch (error) {
+        return PluginInstallResult.failed(
+          '整包资产「${entry.archive}」写缓存失败（$cachedPath）：$error',
+          pluginId: id,
+        );
+      }
+      downloaded = data.bytes.length;
+    }
+
+    final PluginInstallResult placed = await installFromZip(
+      cachedPath,
+      swapGate: swapGate,
+    );
+    if (!placed.ok) return placed;
+    // 索引与包内清单必须是**同一个 id**：包里写的是 id 的唯一真源（条目按 id 落盘），
+    // 不一致时不能写条目 —— 否则面板上会出现"装了 A、目录里是 B"。
+    if (placed.pluginId != id) {
+      return PluginInstallResult.failed(
+        '整包资产「${entry.archive}」的清单 id 是「${placed.pluginId}」，'
+        '与索引条目「$id」不一致 ⇒ 未写入插件条目（发布方需重新打同一份包）',
+        pluginId: id,
+      );
+    }
+    // 来源标记要改成「发布仓库」（zip 通道默认写的是本地）：面板据此显示
+    // “从仓库装的”并正常给出更新提示；版本号以**索引**为准（索引是那份合同）。
+    final Map<String, dynamic> entryWritten = <String, dynamic>{
+      ...?placed.entry,
+      kRepoSourceKey: kRepoSourceValue,
+      kRepoVersionKey: entry.version,
+    };
+    log?.call(
+      '插件发布仓库：已放置 $id（${entry.version}，整包 ${entry.archive}，'
+      '本次下载 $downloaded 字节，来自 ${usedSource.isEmpty ? '（未知）' : usedSource}）',
+    );
+    return PluginInstallResult(
+      ok: true,
+      pluginId: id,
+      version: entry.version,
+      files: placed.files,
+      entry: entryWritten,
+      swapped: true,
+      downloaded: downloaded,
+      source: usedSource,
+      note: '整包已解到插件目录；插件条目由调用方写入 plugins.yaml 并热应用',
+    );
+  }
+
   /// 装一个**本地 zip**（`POST /api/plugin/install/local` 的落点）。
   ///
   /// 与发布仓库通道只差"字节从哪来"：zip 里带 `plugin.json`（与
@@ -1330,6 +1648,11 @@ class PluginDownloader {
         out.parent.createSync(recursive: true);
         out.writeAsBytesSync(item.value.content, flush: true);
       }
+      // 清单也落一份：装完之后 `plugins/<id>/` 要能自描述。UI 插件靠
+      // **可执行体同目录的 `plugin.json`** 认身份并决定发不发 `ui.hello`
+      // （见 `lib/io/ui_identity.dart`）—— 丢了它，装回来的界面会被核心降级。
+      File(p.join(staging, kLocalManifestName))
+          .writeAsBytesSync(manifest.content, flush: true);
     } catch (error) {
       _deleteDirQuietly(staging);
       return PluginInstallResult.failed(
@@ -1374,7 +1697,7 @@ class PluginDownloader {
       ok: true,
       pluginId: id,
       version: (entry[kRepoVersionKey] ?? '').toString(),
-      files: payload.keys.toList(growable: false),
+      files: <String>[kLocalManifestName, ...payload.keys],
       entry: {...entry, 'command': p.join(targetDir, entry['command'] as String)},
       swapped: true,
       downloaded: bytes.length,
@@ -1497,6 +1820,18 @@ class PluginDownloader {
   Future<({String url, int size, PluginReleaseSource source})?> _lookupAsset(
     String assetName,
   ) async {
+    final List<({String url, int size, PluginReleaseSource source})> candidates =
+        await _lookupAssetCandidates(assetName);
+    return candidates.isEmpty ? null : candidates.first;
+  }
+
+  /// 收集**所有**能给出这个资产的发布源地址（顺序同上，索引来源优先）。
+  ///
+  /// 为什么发现之后要留一列而不是只留第一个：**下载本身也会失败**（被墙、超时、
+  /// 那个源的资产没传完整）。只回退发现阶段的源救不了这种情况——典型的实机现象
+  /// 就是「默认走 Gitee，日志里却只有 GitHub 的下载超时」，因为没有第二家可试。
+  Future<List<({String url, int size, PluginReleaseSource source})>>
+  _lookupAssetCandidates(String assetName) async {
     final String preferred = _cachedSource();
     final List<PluginReleaseSource> ordered = <PluginReleaseSource>[
       for (final PluginReleaseSource s in sources)
@@ -1504,23 +1839,49 @@ class PluginDownloader {
       for (final PluginReleaseSource s in sources)
         if (s.name != preferred) s,
     ];
+    final List<({String url, int size, PluginReleaseSource source})> found =
+        <({String url, int size, PluginReleaseSource source})>[];
     for (final PluginReleaseSource source in ordered) {
       final PluginFetchResult meta = await _get(source.latestRelease, source);
-      if (!meta.ok) continue;
+      if (!meta.ok) {
+        // 多源回退下「为什么没走 Gitee」必须能被日志回答：每个失败源都留一行，
+        // 否则用户只看到最后那个源（GitHub）的下载超时，会以为核心压根没试 Gitee。
+        log?.call(
+          '发布源 ${source.name}：读不到 release 元信息'
+          '（${_httpFailure('latest release', meta, source.latestRelease, source)}），'
+          '换下一个源找「$assetName」',
+        );
+        continue;
+      }
       final Object? release;
       try {
         release = jsonDecode(utf8.decode(meta.bytes));
-      } catch (_) {
+      } catch (error) {
+        log?.call(
+          '发布源 ${source.name}：release 元信息不是合法 JSON（$error），'
+          '换下一个源找「$assetName」',
+        );
         continue;
       }
       final Object? assets = release is Map ? release['assets'] : null;
-      if (assets is! List) continue;
-      final ({String url, int size})? found = _findAsset(assets, assetName);
-      if (found != null) {
-        return (url: found.url, size: found.size, source: source);
+      if (assets is! List) {
+        log?.call(
+          '发布源 ${source.name}：release 里没有 assets 列表，'
+          '换下一个源找「$assetName」',
+        );
+        continue;
+      }
+      final ({String url, int size})? hit = _findAsset(assets, assetName);
+      if (hit != null) {
+        found.add((url: hit.url, size: hit.size, source: source));
+      } else {
+        log?.call(
+          '发布源 ${source.name}：这个 release 的 ${assets.length} 个资产里没有'
+          '「$assetName」，换下一个源',
+        );
       }
     }
-    return null;
+    return found;
   }
 
   ({String url, int size})? _findAsset(List<dynamic> assets, String name) {
