@@ -2,92 +2,114 @@ import 'package:test/test.dart';
 import 'package:tree_launcher/src/criterion.dart';
 
 void main() {
-  Map<String, dynamic> meta(List<Map<String, dynamic>> ui) => <String, dynamic>{
-    'ui': ui,
+  Map<String, dynamic> snapshot(List<Object?> plugins) => <String, dynamic>{
+    'config': <String, dynamic>{'plugins': plugins},
   };
 
-  Map<String, dynamic> uiEntry({
-    String id = 'editor',
-    int connections = 1,
-    List<String> capabilities = const <String>['plugin.manage'],
+  // 快照里 `config.plugins[]` 的 id 键名是 `plugin_id`（核心 `toApiJson()`），
+  // 夹具按**真实形状**造，避免判据读错键名还能“测绿”。
+  Map<String, dynamic> plugin({
+    String id = 'tree.ui.default',
+    String runtime = 'ui',
+    bool? enabled,
   }) => <String, dynamic>{
     'plugin_id': id,
-    'connections': connections,
-    'capabilities': capabilities,
+    'runtime': runtime,
+    if (enabled != null) 'enabled': enabled,
   };
 
-  group('引导壳判据（纯函数）', () {
-    test('零连接 ⇒ 开引导页', () {
-      expect(needsBootstrap(meta(const <Map<String, dynamic>>[])), isTrue);
-      expect(needsBootstrap(<String, dynamic>{}), isTrue);
-      expect(needsBootstrap(null), isTrue);
+  group('引导壳判据（配置口径）', () {
+    test('有启用的 ui 插件 ⇒ 不开引导页', () {
+      expect(needsBootstrapByConfig(snapshot(<Object?>[plugin()])), isFalse);
     });
 
-    test('只剩不具备 plugin.manage 的 UI ⇒ 开引导页', () {
+    test('老口径的 `id` 键也要认得（兼容手写清单/旧快照）', () {
       expect(
-        needsBootstrap(meta(<Map<String, dynamic>>[
-          uiEntry(capabilities: <String>['viewer']),
-        ])),
-        isTrue,
-      );
-    });
-
-    test('有存活且声明 plugin.manage 的 UI ⇒ 不开', () {
-      expect(needsBootstrap(meta(<Map<String, dynamic>>[uiEntry()])), isFalse);
-    });
-
-    test('连接数为 0 的 plugin.manage 条目不算存活', () {
-      expect(
-        needsBootstrap(meta(<Map<String, dynamic>>[uiEntry(connections: 0)])),
-        isTrue,
-      );
-    });
-
-    test('能力条目被停用 ⇒ 开引导页（即使还挂着连接）', () {
-      expect(
-        needsBootstrap(
-          meta(<Map<String, dynamic>>[uiEntry()]),
-          disabledPluginIds: <String>{'editor'},
-        ),
-        isTrue,
-      );
-      expect(
-        needsBootstrap(
-          meta(<Map<String, dynamic>>[
-            uiEntry(),
-            uiEntry(id: 'second'),
+        needsBootstrapByConfig(
+          snapshot(<Object?>[
+            <String, dynamic>{'id': 'tree.ui.default', 'runtime': 'ui'},
           ]),
-          disabledPluginIds: <String>{'editor'},
         ),
         isFalse,
       );
     });
 
-    test('坏数据按零连接处理（fail-open 到引导页）', () {
+    test('ui 插件被停用 ⇒ 开引导页（已下载但停用也算“不存在”）', () {
       expect(
-        needsBootstrap(<String, dynamic>{
-          'ui': <Object?>[null, 'x', <String, dynamic>{'connections': 'many'}],
-        }),
+        needsBootstrapByConfig(
+          snapshot(<Object?>[plugin(enabled: false)]),
+        ),
         isTrue,
       );
     });
 
-    test('从 snapshot 配置收集被停用插件 id', () {
-      final Set<String> disabled = disabledPluginIdsOf(<String, dynamic>{
-        'config': <String, dynamic>{
-          'plugins': <Object?>[
-            <String, dynamic>{'id': 'a', 'enabled': false},
-            <String, dynamic>{'id': 'b', 'enabled': true},
-            <String, dynamic>{'id': 'c'},
-          ],
-        },
-      });
-      expect(disabled, <String>{'a'});
+    test('只有 headless 插件 ⇒ 开引导页', () {
+      expect(
+        needsBootstrapByConfig(
+          snapshot(<Object?>[plugin(runtime: 'headless', id: 'compact')]),
+        ),
+        isTrue,
+      );
     });
 
-    test('停用信息缺失 ⇒ 空集合', () {
-      expect(disabledPluginIdsOf(null), isEmpty);
-      expect(disabledPluginIdsOf(<String, dynamic>{}), isEmpty);
+    test('多个条目里只要有一条启用的 ui ⇒ 不开', () {
+      expect(
+        needsBootstrapByConfig(
+          snapshot(<Object?>[
+            plugin(runtime: 'headless', id: 'compact'),
+            plugin(id: 'second', enabled: false),
+            plugin(id: 'third'),
+          ]),
+        ),
+        isFalse,
+      );
+    });
+
+    test('runtime 大小写与空白不影响判定', () {
+      expect(
+        needsBootstrapByConfig(snapshot(<Object?>[plugin(runtime: ' UI ')])),
+        isFalse,
+      );
+    });
+
+    test('读不到 config.plugins ⇒ 判据不下结论（返回 false，交给重试）', () {
+      expect(needsBootstrapByConfig(null), isFalse);
+      expect(needsBootstrapByConfig(<String, dynamic>{}), isFalse);
+      expect(
+        needsBootstrapByConfig(<String, dynamic>{
+          'config': <String, dynamic>{},
+        }),
+        isFalse,
+      );
+      expect(snapshotReady(null), isFalse);
+    });
+
+    test('空清单是“读到了” ⇒ 开引导页', () {
+      expect(snapshotReady(snapshot(const <Object?>[])), isTrue);
+      expect(needsBootstrapByConfig(snapshot(const <Object?>[])), isTrue);
+    });
+
+    test('坏条目跳过，不影响好条目', () {
+      expect(
+        needsBootstrapByConfig(
+          snapshot(<Object?>[null, 'x', <String, dynamic>{'runtime': 'ui'} , plugin()]),
+        ),
+        isFalse,
+      );
+    });
+
+    test('收集启用中的 ui 插件 id', () {
+      expect(
+        enabledUiPluginIdsOf(
+          snapshot(<Object?>[
+            plugin(),
+            plugin(id: 'second', enabled: false),
+            plugin(runtime: 'headless', id: 'compact'),
+          ]),
+        ),
+        <String>{'tree.ui.default'},
+      );
+      expect(enabledUiPluginIdsOf(null), isEmpty);
     });
 
     test('快捷方式只接受 role=exe 的 .ico 本地路径', () {

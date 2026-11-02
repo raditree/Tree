@@ -102,6 +102,27 @@ void main() {
     expect(plain.windowId, isEmpty);
   });
 
+  test('数据根：接线了才注入 TREE_DATA_ROOT；未接线时该键为空', () async {
+    final UiHost withRoot = await UiHost.start(
+      configFor(),
+      coreUrl: 'ws://127.0.0.1:12345',
+      coreToken: 'secret-token',
+      dataRoot: r'C:\tree-data',
+    );
+    hosts.add(withRoot);
+    await waitUntil(
+      () => withRoot.stdoutTail.contains(r'TREE_DATA_ROOT=C:\tree-data'),
+      reason: 'UI 的用量账本 / 日志入口依赖这个数据根',
+    );
+
+    final UiHost plain = await startHost();
+    await waitUntil(
+      () => plain.stdoutTail.contains('TREE_DATA_ROOT='),
+      reason: '未接线（老口径）照常启动，键为空',
+    );
+    expect(plain.stdoutTail, isNot(contains(r'TREE_DATA_ROOT=C:\tree-data')));
+  });
+
   test('输出回调逐行触发：stdout / stderr 各走自己的回调（日志落盘接线用）', () async {
     final List<String> stdoutLines = <String>[];
     final List<String> stderrLines = <String>[];

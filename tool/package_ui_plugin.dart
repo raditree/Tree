@@ -6,7 +6,7 @@ import 'dart:io';
 /// UI 已是 `runtime: ui` 插件，发布物不再是"桌面安装包"，而是树里的一份插件产物：
 /// ```
 /// tree-ui-default-{ver}.zip
-///   tree_ui.exe          # 由 Tree.exe 改名，避免与不可卸载的 loader 同名
+///   tree_ui.exe          # 界面可执行体（打包链已把它从 Tree.exe 改名过来）
 ///   flutter_windows.dll
 ///   *.dll
 ///   data/
@@ -21,11 +21,17 @@ import 'dart:io';
 ///   --build               先跑 `flutter build windows --release`（默认用已有产物）
 ///   --release-dir DIR     发行目录（默认 build/windows/x64/runner/Release）
 ///   --out DIR             产物目录（默认 dist）
+///   --index FILE          要合并进索引的文件（默认 build/plugins/plugin-index.json）
+///   --no-index            只打包，不动发布索引
 ///   --version x.y.z       插件版本（默认取 pubspec.yaml 的 `+` 之前部分）
 ///   --no-zip              只准备目录，不压缩
 ///
-/// 排除：`*.pdb`、核心 `tree_core.exe`、目标机 agent（`agents/`）与旧 `Tree.exe`
-/// （改名成 `tree_ui.exe`，不重复带一份）。
+/// 排除：`*.pdb`、核心 `tree_core.exe`、引导壳（`Tree.exe` / `tree_launcher.exe`）
+/// 与目标机 agent（`agents/`）。界面可执行体只收一份，固定叫 `tree_ui.exe`。
+///
+/// **索引条目（2026-11-01）**：UI 带 `data/` 与几十个 dll，扁平 `files[]` 装不下，
+/// 所以这条以 `archive` 形态进索引（整包 zip + 包内 `plugin.json`）。装机端
+/// `PluginDownloader` 认这个字段：下载整包 → `installFromZip` 解成 `plugins/<id>/`。
 Future<void> main(List<String> args) async {
   try {
     await _package(args);
@@ -41,6 +47,15 @@ Future<void> main(List<String> args) async {
 const String kPluginId = 'tree.ui.default';
 const String kPluginName = 'Tree 默认界面';
 const String kTargetExe = 'tree_ui.exe';
+
+/// UI 插件自己登记的领域依赖（**可选**）。
+///
+/// 为什么是 `optional: true`：`requires.plugins` 是启用前的硬闸门——写成必需就
+/// 意味着"agent 没装 ⇒ 界面起不来"，等于把绝大多数人挡在门外。写成可选后：
+/// 核心照常拉起界面，清单 / 详情页会显示这条依赖，安装或更新 UI 时也能一键补全。
+const List<Map<String, dynamic>> kUiPluginDependencies = <Map<String, dynamic>>[
+  <String, dynamic>{'id': 'tree.agent', 'version': '>=0.28.0', 'optional': true},
+];
 
 Future<void> _package(List<String> args) async {
   final _Options options = _Options.parse(args);
@@ -70,9 +85,13 @@ Future<void> _package(List<String> args) async {
   }
 
   final File appExe = File(_join(releaseDir.path, appExeName));
-  if (!appExe.existsSync()) {
+  // 打包链已把界面改名为 tree_ui.exe（见 package_windows.dart ①b）；直接用
+  // `flutter build` 的目录则还是 Tree.exe，两种都收，落到包里统一叫 tree_ui.exe。
+  final File uiSource = File(_join(releaseDir.path, kTargetExe));
+  final File resolvedSource = uiSource.existsSync() ? uiSource : appExe;
+  if (!resolvedSource.existsSync()) {
     throw _UsageError(
-      '找不到应用可执行文件：${appExe.path}\n'
+      '找不到界面可执行文件：$kTargetExe 或 $appExeName\n'
       '先构建或传 --release-dir（默认 build/windows/x64/runner/Release）。',
       3,
     );
@@ -99,16 +118,21 @@ Future<void> _package(List<String> args) async {
     }
     if (entity is! File) continue;
     if (lower.endsWith('.pdb')) continue;
-    if (lower == 'tree_core.exe') continue;
-    if (lower == appExeName.toLowerCase() || lower == 'tree.exe') {
-      entity.copySync(_join(staging.path, kTargetExe));
-      stdout.writeln('   可执行体：$name → $kTargetExe');
-      copied += 1;
+    // 核心与**引导壳**都不是界面的一部分：Tree.exe / tree_launcher.exe 属 loader，
+    // 打进插件包会被装机端装成“和引导壳同名”的东西（这正是要避免的那件事）。
+    if (lower == 'tree_core.exe' ||
+        lower == 'tree.exe' ||
+        lower == 'tree_launcher.exe') {
       continue;
     }
+    if (lower == 'plugin.json') continue; // 下面按本包的版本重写
+    if (lower == kTargetExe) continue; // 界面可执行体在循环外单独收一次
     entity.copySync(_join(staging.path, name));
     copied += 1;
   }
+  resolvedSource.copySync(_join(staging.path, kTargetExe));
+  stdout.writeln('   可执行体：${_basename(resolvedSource.path)} → $kTargetExe');
+  copied += 1;
   if (copied == 0) {
     throw _UsageError('发行目录是空的：${releaseDir.path}', 3);
   }
@@ -142,7 +166,91 @@ Future<void> _package(List<String> args) async {
       '   产物：$zipPath'
       '（${(File(zipPath).lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
     );
+    if (!options.noIndex) {
+      final File indexFile = File(
+        _join(root.path, options.index ?? 'build/plugins/plugin-index.json'),
+      );
+      final int added = _mergeIndex(
+        indexFile,
+        version,
+        _basename(zipPath),
+        File(zipPath).lengthSync(),
+      );
+      stdout.writeln(
+        '   索引：${indexFile.path}（tree.ui.default ${added == 0 ? '已是最新' : '已写入'}）',
+      );
+    }
   }
+}
+
+/// 把 `tree.ui.default` 合并进发布索引（`schema: 1` + `plugins[]`）。
+///
+/// 为什么用 **archive** 而不是 `files[]`：索引对每项 `target` 要求纯文件名，而 UI
+/// 包里有 `data/…` 与几十个 dll；`files[]` 表达不了目录，装上去只会缺文件。
+/// 整包形态在装机端由 `PluginDownloader._installArchive` 落到 `plugins/<id>/`。
+///
+/// 返回本次写入的条数（0 = 已经有一条同版本的，什么都没改）。
+int _mergeIndex(File indexFile, String version, String archive, int bytes) {
+  Map<String, dynamic> document = <String, dynamic>{
+    'schema': 1,
+    'plugins': <dynamic>[],
+  };
+  if (indexFile.existsSync()) {
+    try {
+      final Object? decoded = jsonDecode(indexFile.readAsStringSync());
+      if (decoded is Map) {
+        document = decoded.map(
+          (Object? k, Object? v) => MapEntry(k.toString(), v),
+        );
+      }
+    } catch (error) {
+      // 索引是发布合同：读不动就**直接失败**，绝不覆盖成“只有 UI 一条”的清单。
+      throw _UsageError('现有索引读不动（${indexFile.path}）：$error', 4);
+    }
+  }
+  final Object? rawPlugins = document['plugins'];
+  final List<dynamic> plugins = rawPlugins is List
+      ? List<dynamic>.of(rawPlugins)
+      : <dynamic>[];
+  final Map<String, dynamic> entry = <String, dynamic>{
+    'id': kPluginId,
+    'name': kPluginName,
+    'version': version,
+    'description': 'Tree 的默认图形界面（runtime: ui）。',
+    'runtime': 'ui',
+    'command': kTargetExe,
+    'args': <String>[],
+    'granularity': 'team',
+    'scope': <String, dynamic>{},
+    'requires': <String, dynamic>{
+      'api': '>=1.0 <2.0',
+      'plugins': kUiPluginDependencies,
+    },
+    'archive': archive,
+    'archive_bytes': bytes,
+  };
+  final int index = plugins.indexWhere(
+    (Object? item) => item is Map && '${item['id']}'.trim() == kPluginId,
+  );
+  if (index >= 0) {
+    final Map<String, dynamic> previous = (plugins[index] as Map)
+        .map((Object? k, Object? v) => MapEntry(k.toString(), v));
+    if ('${previous['version']}' == version &&
+        '${previous['archive']}' == archive &&
+        (previous['archive_bytes'] as num?)?.toInt() == bytes) {
+      return 0;
+    }
+    plugins[index] = entry;
+  } else {
+    plugins.add(entry);
+  }
+  document['schema'] = 1;
+  document['plugins'] = plugins;
+  indexFile.parent.createSync(recursive: true);
+  indexFile.writeAsStringSync(
+    '${const JsonEncoder.withIndent('  ').convert(document)}\n',
+  );
+  return 1;
 }
 
 Map<String, dynamic> _manifest(String version) => <String, dynamic>{
@@ -157,7 +265,10 @@ Map<String, dynamic> _manifest(String version) => <String, dynamic>{
   // granularity 只影响 headless 的实例编组，这里沿用契约内的默认值。
   'granularity': 'team',
   'scope': <String, dynamic>{},
-  'requires': <String, dynamic>{'api': '>=1.0 <2.0'},
+  'requires': <String, dynamic>{
+    'api': '>=1.0 <2.0',
+    'plugins': kUiPluginDependencies,
+  },
   'files': <String>['**'],
 };
 
@@ -261,23 +372,29 @@ class _Options {
   const _Options({
     required this.build,
     required this.noZip,
+    required this.noIndex,
     required this.out,
     this.version,
     this.releaseDir,
+    this.index,
   });
 
   final bool build;
   final bool noZip;
+  final bool noIndex;
   final String out;
   final String? version;
   final String? releaseDir;
+  final String? index;
 
   static _Options parse(List<String> args) {
     bool build = false;
     bool noZip = false;
+    bool noIndex = false;
     String out = 'dist';
     String? version;
     String? releaseDir;
+    String? index;
     for (int i = 0; i < args.length; i++) {
       final String arg = args[i];
       String value() {
@@ -292,8 +409,12 @@ class _Options {
           build = true;
         case '--no-zip':
           noZip = true;
+        case '--no-index':
+          noIndex = true;
         case '--out':
           out = value();
+        case '--index':
+          index = value();
         case '--version':
           version = value();
         case '--release-dir':
@@ -308,9 +429,11 @@ class _Options {
     return _Options(
       build: build,
       noZip: noZip,
+      noIndex: noIndex,
       out: out,
       version: version,
       releaseDir: releaseDir,
+      index: index,
     );
   }
 }

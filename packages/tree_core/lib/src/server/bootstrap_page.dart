@@ -26,6 +26,25 @@ class BootstrapPage {
   /// 票据占位符：核心渲染时替换为一次性的"换会话"票据。
   static const String ticketPlaceholder = '__BOOTSTRAP_TICKET__';
 
+  /// 种子页面的构建号（写进种子 HTML 的 `tree-bootstrap-build` meta）。
+  ///
+  /// 为什么需要它：页面是**落盘到数据根**的（用户可以改），但它的表单要跟着
+  /// 核心接口演进——一直留着一份旧页面，升级后用户看到的还是老毛病（例如
+  /// “引导壳只有重启和停用、没有启用”）。磁盘那份比种子旧才覆盖一次；
+  /// 构建号相同就完全不动，用户自己的修改照旧保留。
+  static const int seedBuild = 3;
+
+  static final RegExp _buildPattern = RegExp(
+    r'<meta\s+name="tree-bootstrap-build"\s+content="([0-9]+)"',
+    caseSensitive: false,
+  );
+
+  /// 从页面 HTML 读构建号（没有 = 升级前的老页面）。
+  static int? buildOf(String html) {
+    final Match? match = _buildPattern.firstMatch(html);
+    return match == null ? null : int.tryParse(match.group(1) ?? '');
+  }
+
   /// 页面落盘路径。
   String get targetPath => p.join(dataDir, 'bootstrap', 'index.html');
 
@@ -69,6 +88,9 @@ class BootstrapPage {
           '已释放内置最小引导页到 $targetPath',
         );
       }
+    } else {
+      // 页面已落盘（可能是旧安装留下的，或用户手改过）：只在“比种子旧”时覆盖。
+      await _refreshStalePage(target);
     }
     try {
       return await target.readAsString();
@@ -82,6 +104,28 @@ class BootstrapPage {
         // 写不进去也只影响下次种子化，本次仍可返回内置页面。
       }
       return fallback;
+    }
+  }
+
+  /// 磁盘上的页面比安装包种子旧（或没有构建号）⇒ 用种子覆盖一次。
+  ///
+  /// 构建号相同 / 种子自己没标号 ⇒ 一寸都不动（用户的修改照旧保留）。
+  Future<void> _refreshStalePage(File target) async {
+    try {
+      final File? seed = await _findSeed();
+      if (seed == null) return;
+      final int? seedBuild = buildOf(await seed.readAsString());
+      if (seedBuild == null) return;
+      final int? localBuild = buildOf(await target.readAsString());
+      if (localBuild != null && localBuild >= seedBuild) return;
+      final List<int> bytes = await seed.readAsBytes();
+      await target.writeAsBytes(bytes, flush: true);
+      log?.call(
+        '[core:bootstrap] 引导页已更新到种子版本（build $seedBuild）：$targetPath',
+      );
+    } catch (error) {
+      // 读种子 / 读旧页面失败：保持现状，交给上面的读取分支处理。
+      log?.call('[core:bootstrap] 检查引导页版本失败：$error');
     }
   }
 

@@ -99,6 +99,46 @@ Future<void> _package(List<String> args) async {
     await _fail('找不到应用可执行文件：$appExe（先构建，或检查 --release-dir）', 3);
   }
 
+  // ①b 发行版**布局改名**（2026-11-01，用户拍板的启动链）：
+  //
+  // 发行包里 `Tree.exe` 是**引导壳**（纯 Dart loader，不可卸载），界面本身是
+  // `runtime: ui` 插件，按 `ui-pluginization_detailed.md` §2 必须叫 `tree_ui.exe`
+  // （与 loader 同名的话，双击到底启动谁就成了看运气的事）。
+  //
+  // 因此 flutter build 产出的 `Tree.exe` 在这里改名，并写一份 `plugin.json`
+  // （UI 的身份来自**可执行体同目录**的清单，见 `lib/io/ui_identity.dart`）：
+  // 没有它，界面连上核心也不会发 `ui.hello`，核心就永远认不出这是个 UI 插件。
+  //
+  // 幂等与防误改靠**体积**判：`Tree.exe` ≥ 3 MB ⇒ 它是 Dart **AOT 编译**的产物
+  // （loader / 核心，6~10 MB），而 Flutter runner 只有 ~450 KB。于是三种情形：
+  // ① 只有 Tree.exe（小）⇒ 首次改名；② 两个都在、Tree.exe 小 ⇒ 重跑打包，用新构建
+  // 覆盖旧界面；③ Tree.exe 不小 ⇒ 目录已排好版，绝不把 loader 改名成界面。
+  final String uiExe = _join(releaseDir.path, 'tree_ui.exe');
+  final int appSize = File(appExe).lengthSync();
+  final bool appIsFlutterRunner = appSize < 3 * 1024 * 1024;
+  if (!File(uiExe).existsSync()) {
+    if (!appIsFlutterRunner) {
+      stdout.writeln(
+        '   界面改名：跳过（$appExeName 有 ${(appSize / 1024 / 1024).toStringAsFixed(1)} MB，'
+        '不像 Flutter runner；该目录可能已排好版）',
+      );
+    } else {
+      File(appExe).renameSync(uiExe);
+      stdout.writeln('   界面改名：$appExeName → tree_ui.exe');
+    }
+  } else if (appIsFlutterRunner) {
+    // 同一个 Release 目录**重跑打包**：`Tree.exe` 是本次 flutter build 的新产物，
+    // `tree_ui.exe` 是上一轮留下的旧界面。不刷新的话会"构建了新界面、发出去的却是
+    // 旧的"，而且下面 `_buildLauncher` 会因为 Tree.exe 被占而跳过改名 ⇒ 启动链断掉。
+    File(uiExe).deleteSync();
+    File(appExe).renameSync(uiExe);
+    stdout.writeln('   界面改名：$appExeName → tree_ui.exe（替换上一轮产物）');
+  }
+  if (File(uiExe).existsSync()) {
+    _writeUiManifest(releaseDir, version);
+    stdout.writeln('   界面清单：plugin.json（tree.ui.default $version）');
+  }
+
   // ② 编译核心并放进同一个目录（发行版布局的硬要求）
   final String flutterRoot = _flutterRoot(options.flutter);
   final String dart = _dartOf(flutterRoot);
@@ -251,7 +291,8 @@ Future<void> _package(List<String> args) async {
   stdout.writeln('');
   stdout.writeln('完成。');
   stdout.writeln('  便携目录：${releaseDir.path}');
-  stdout.writeln('  应用：$appExe');
+  stdout.writeln('  引导壳（双击入口）：${_join(releaseDir.path, 'Tree.exe')}');
+  stdout.writeln('  界面插件：$uiExe（+ plugin.json）');
   stdout.writeln('  核心：$coreExe');
   if (zipPath != null) stdout.writeln('  zip：$zipPath');
   stdout.writeln('  数据目录（首次运行自动创建）：%APPDATA%\\Tree');
@@ -263,8 +304,16 @@ Tree 桌面端（Windows 便携版）
 ============================
 
 怎么启动
-  双击 Tree.exe。它会在同目录启动 tree_core.exe（核心进程：随机端口 + 一次性
-  token，只监听 127.0.0.1），界面与数据全部走这个本地核心，不连任何服务器。
+  双击 Tree.exe。它是**引导壳**（不可卸载），只做三件事：
+    1. 在同目录启动 tree_core.exe（核心进程：随机端口 + 一次性 token，只监听
+       127.0.0.1）——界面与数据全部走这个本地核心，不连任何服务器；
+    2. 核心按 config/plugins.yaml 拉起**已启用**的插件，其中 `runtime: ui` 的那条
+       就是界面（安装包自带 tree_ui.exe + plugin.json，首次启动会自动登记）；
+    3. 若启动时**没有启用的界面插件**（被停用 / 被删 / 手工换过），引导壳会打开
+       浏览器里的引导页，在那一页装回界面或别的插件。
+
+  界面起来之后，引导壳本身没有窗口，它随核心一起退出（进程列表里能看到）。
+  想单独看核心日志：在命令行里运行 `Tree.exe`，它会打印核心握手与预热日志。
 
 数据放在哪里
   %APPDATA%\\Tree（C:\\Users\\<你>\\AppData\\Roaming\\Tree）。
@@ -280,16 +329,25 @@ Tree 桌面端（Windows 便携版）
         spec/*.md               内置 + 自定义 Spec（右栏可一键重置，旧文件备份 .bak.N）
     data/<agent>/<session>/     会话数据：session.json + messages.jsonl（一行一条消息）
 
+界面（插件）被停用了怎么办
+  config/plugins.yaml 里把 tree.ui.default 这条的 enabled 改成 true，重新双击
+  Tree.exe 即可。整条被删掉也行——tree_ui.exe 还在包里，下次启动核心会自动重新
+  登记一条（只登记、不会替你改回你手动停用的开关）。
+
 插件
-  plugins/ 目录与 Tree.exe 同级。安装包**不带插件可执行文件**（2026-10-18 起），里面只有
-  一份插件开发指南 plugin-development.md。界面上「插件」页分三栏：**未安装** / **已安装** /
-  站点。没装过的（含四个内置项）都在「未安装」栏，先点刷新（拉 tree-plugins 仓库的 release
-  成品）再装它；装好的条目落在「已安装」栏，与自定义插件**同一种卡片、同一套开关与按钮**。
-  装完核心就在 plugins/ 里按同名可执行文件找它（Windows 补 .exe）。
+  plugins/ 目录与 Tree.exe 同级。安装包**不带**其它插件可执行文件（2026-10-18 起），
+  里面只有一份插件开发指南 plugin-development.md；唯一的例外是上面说的界面
+  （tree_ui.exe 就在主目录，不占 plugins/）。界面上「插件」页分三栏：**未安装** /
+  **已安装** / 站点。没装过的（含四个内置项）都在「未安装」栏，先点刷新——它会依次
+  从 **Gitee** 和 **GitHub**（raditree/tree-plugins 的 release）拉取成品索引，哪个源
+  通就先用哪个，再装它；装好的条目落在「已安装」栏，与自定义插件**同一种卡片、
+  同一套开关与按钮**。装完核心就在 plugins/ 里按同名可执行文件找它（Windows 补 .exe）。
 
 出问题先看这里
   - 提示"未找到核心进程可执行文件 tree_core.exe"：确认 tree_core.exe 与 Tree.exe
     在同一目录（整包解压，不要只复制主程序）。
+  - 双击后只有浏览器引导页、没有桌面窗口：说明没有启用的界面插件。按上面
+    「界面（插件）被停用了怎么办」那一段处理；引导页里也能一键装回界面。
   - 想把核心放别处：设置环境变量 TREE_CORE_EXE 指向它。
   - 想单独调试核心 / 对接已运行的核心：设置 TREE_CORE_URL 与 TREE_CORE_TOKEN
     附着过去（两者都要设）。
@@ -308,10 +366,15 @@ Future<Never> _fail(String message, int code) async {
   exit(code);
 }
 
-/// 编译纯 Dart 引导启动器。
+/// 编译纯 Dart 引导壳，并把它落到 **`Tree.exe`**（发行版里用户双击的那个名字）。
 ///
-/// 失败只打 TODO、不阻断整包：launcher 不是运行桌面的必需品（核心可以单独启动，
-/// 引导页也能由用户手动打开）。但它**不得引入 Flutter**——这是设计约束。
+/// 失败只打 TODO、不阻断整包：核心可以单独启动、引导页也能手动打开。但它
+/// **不得引入 Flutter**——这是设计约束。
+///
+/// 落位口径（2026-11-01）：先编译到 `tree_launcher.exe`，再改名成 `Tree.exe`。
+/// 若 `Tree.exe` 还在（说明 ①b 的界面改名没做，那个名字上仍是 Flutter 界面），
+/// 就**保留 tree_launcher.exe、绝不覆盖**——覆盖等于把界面删掉，这比“布局不完整”
+/// 糟得多，所以这里只留一条显眼的警告。
 Future<String> _buildLauncher(
   Directory root,
   String dart,
@@ -319,7 +382,7 @@ Future<String> _buildLauncher(
 ) async {
   final Directory launcherDir = Directory(_join(root.path, 'tool/tree_launcher'));
   if (!Directory(_join(launcherDir.path, 'bin')).existsSync()) {
-    return '   引导启动器：跳过（没有 tool/tree_launcher）';
+    return '   引导壳：跳过（没有 tool/tree_launcher）';
   }
   final int pubCode = await _runLive(
     dart,
@@ -327,9 +390,9 @@ Future<String> _buildLauncher(
     launcherDir.path,
   );
   if (pubCode != 0) {
-    return '   引导启动器：TODO 跳过编译（dart pub get --offline 失败，exit=$pubCode）';
+    return '   引导壳：TODO 跳过编译（dart pub get --offline 失败，exit=$pubCode）';
   }
-  final String output = _join(releaseDir.path, 'tree_launcher.exe');
+  final String compiled = _join(releaseDir.path, 'tree_launcher.exe');
   final int code = await _runLive(
     dart,
     <String>[
@@ -337,15 +400,59 @@ Future<String> _buildLauncher(
       'exe',
       _join(launcherDir.path, 'bin/tree_launcher.dart'),
       '-o',
-      output,
+      compiled,
     ],
     root.path,
   );
   if (code != 0) {
-    return '   引导启动器：TODO 跳过（dart compile exe 失败，exit=$code）';
+    return '   引导壳：TODO 跳过（dart compile exe 失败，exit=$code）';
   }
-  return '   引导启动器：tree_launcher.exe（'
-      '${(File(output).lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）';
+  final String mb = (File(compiled).lengthSync() / 1024 / 1024).toStringAsFixed(1);
+  final File shellTarget = File(_join(releaseDir.path, 'Tree.exe'));
+  if (shellTarget.existsSync()) {
+    // `tree_ui.exe` 已在 ⇒ ①b 的界面改名做过了，此时那个 `Tree.exe` 只可能是**上一轮
+    // 打包留下的引导壳**（loader 6~7 MB，Flutter runner 只有 ~450 KB）。必须用本次
+    // 编译的替换掉：否则 `--skip-build` 反复重跑时，发出去的永远是第一次那个 loader，
+    // 改了判据/补拉逻辑也验证不到。
+    final File uiExe = File(_join(releaseDir.path, 'tree_ui.exe'));
+    final int shellSize = shellTarget.lengthSync();
+    if (uiExe.existsSync() && shellSize >= 3 * 1024 * 1024) {
+      shellTarget.deleteSync();
+      File(compiled).renameSync(shellTarget.path);
+      return '   引导壳：Tree.exe（$mb MB，已替换上一轮的引导壳）';
+    }
+    return '   引导壳：警告！Tree.exe 已被占用（应为界面改名失败），'
+        '保留 tree_launcher.exe（$mb MB），安装器快捷方式会指向错误的目标';
+  }
+  File(compiled).renameSync(shellTarget.path);
+  return '   引导壳：Tree.exe（$mb MB，双击它就是普通用户的入口）';
+}
+
+/// 写出界面插件清单 `<release>/plugin.json`（与 `tree_ui.exe` **同目录**）。
+///
+/// 三个字段都是**硬需求**，少一个就出问题：
+/// - `id`：必须是 `tree.ui.default`（核心首启按这个 id 播种 `plugins.yaml`，
+///   见 `packages/tree_core/lib/src/plugin/builtin_plugins.dart` 的
+///   `seedDesktopUiPlugin`）；`ui.hello` 也报这个 id。
+/// - `runtime: ui`：核心据此走 UI 宿主（`UiHost`）而不是 stdio 的 headless 分支。
+/// - `command: tree_ui.exe`：只作**展示与可读性**，核心实际拉起用的是
+///   `plugins.yaml` 里的绝对路径（用户机器上的安装目录不固定，清单里不能写绝对路径）。
+void _writeUiManifest(Directory releaseDir, String version) {
+  final File manifest = File(_join(releaseDir.path, 'plugin.json'));
+  manifest.writeAsStringSync(
+    const JsonEncoder.withIndent('  ').convert(<String, dynamic>{
+      'id': 'tree.ui.default',
+      'name': 'Tree 默认界面',
+      'version': version,
+      'description': 'Tree 的默认图形界面（runtime: ui）。',
+      'runtime': 'ui',
+      'command': 'tree_ui.exe',
+      'args': <String>[],
+      'granularity': 'team',
+      'scope': <String, dynamic>{},
+      'requires': <String, dynamic>{'api': '>=1.0 <2.0'},
+    }),
+  );
 }
 
 /// 把引导页种子放到 `<release>/assets/bootstrap/index.html`。

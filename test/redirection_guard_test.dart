@@ -23,14 +23,27 @@ import 'package:flutter_test/flutter_test.dart';
 /// 本机已手工验证过两端：旧 exe 不认这个参数 ⇒ 什么都不打印、会去起界面（先红）；
 /// 新 exe 打印 `tree-rt-selfcheck: flags=0x… would-relaunch=…`（后绿））。
 void main() {
-  const String exeRel = 'build/windows/x64/runner/Release/Tree.exe';
-  final bool canRun = Platform.isWindows && File(exeRel).existsSync();
+  // 发行版布局（2026-11-01 起）：`Tree.exe` 是不可卸载的引导壳，Flutter runner
+  // 本身改名成 `tree_ui.exe`。自检在 runner 里，因此优先找 `tree_ui.exe`；
+  // 只有裸 `flutter build`（还没走打包链改名）时才回落到 `Tree.exe`。
+  const List<String> exeCandidates = <String>[
+    'build/windows/x64/runner/Release/tree_ui.exe',
+    'build/windows/x64/runner/Release/Tree.exe',
+  ];
+  String? exeRel;
+  for (final String candidate in exeCandidates) {
+    if (File(candidate).existsSync()) {
+      exeRel = candidate;
+      break;
+    }
+  }
+  final bool canRun = Platform.isWindows && exeRel != null;
 
   test(
     'runner 自检：报出 RedirectionTrust 与"是否该自愈重启"，且不起 Flutter',
     () async {
       final Process process = await Process.start(
-        exeRel,
+        exeRel!,
         <String>['--tree-rt-selfcheck'],
       );
       final StringBuffer out = StringBuffer();
@@ -68,6 +81,6 @@ void main() {
     },
     skip: canRun
         ? false
-        : '没有构建好的 $exeRel（先跑 flutter build windows --release）',
+        : '没有构建好的 ${exeCandidates.join(' / ')}（先跑 flutter build windows --release）',
   );
 }

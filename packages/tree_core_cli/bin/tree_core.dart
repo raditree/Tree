@@ -51,6 +51,25 @@ Future<void> main(List<String> args) async {
   final bool enableHeartbeat = !args.contains('--no-heartbeat');
   final bool verbose = args.contains('--verbose');
 
+  // 单实例闸门（2026-11-01）：核心只能有**一个**进程。多开的后果是每个核心各自拉起
+  // 一套插件与界面窗口、并发写同一份数据根（实测出现过 3 个核心同时在跑）。
+  //
+  // 判据不是"有没有文件"（硬杀会留下陈旧记录），而是"那把 token 还能不能打通
+  // `/api/meta`"。活着 ⇒ 本次直接退出，交给 loader 附着；打不通 ⇒ 清掉陈旧记录继续。
+  final CoreInstanceFile instance = CoreInstanceFile(paths.coreInstanceFile);
+  final CoreInstanceRecord? existing = instance.read();
+  if (existing != null) {
+    final bool alive = await instance.alive(existing);
+    if (alive) {
+      stderr.writeln(
+        '[tree_core] 已有核心在运行（pid=${existing.pid} '
+        '${existing.httpBaseUrl}），本实例退出（核心是单实例）',
+      );
+      exit(0);
+    }
+    instance.clear();
+  }
+
   // 日志出口（核心唯一的一处）：**同时**写 stderr（保持原样）与
   // `<数据根>/logs/core.log`（8 MiB × 5 份轮转）。放在这里是为了让后面**所有**
   // 日志（含启动计时）都走同一个出口——发布版没有调试器，落盘是唯一的取证手段。
@@ -107,6 +126,18 @@ Future<void> main(List<String> args) async {
 
   bootLog('监听已就绪，即将发出握手');
 
+  // 实例发现文件：**监听成功之后**才写（端口 / token 在此之前不存在）。loader 与
+  // 之后任何一次双击都靠它判断"该附着还是该新起"，写在这里也保证它比握手先就位。
+  await instance.write(
+    CoreInstanceRecord(
+      pid: server.processId,
+      port: server.port,
+      token: server.handshake.token,
+      version: TreeCore.version,
+      dataRoot: paths.root,
+    ),
+  );
+
   // 本进程自己的报告（`[tree_core]` 前缀）：与原先的 stderr 行逐字一致，只是同时落盘
   final void Function(String line) logCore = coreLog.forPrefix('tree_core');
 
@@ -162,6 +193,9 @@ Future<void> main(List<String> args) async {
   await control.cancel();
   logCore('shutting down');
   await server.close();
+  // 实例发现文件跟着这一世一起消失：留着它会让下一次启动的探测去连一个已经关掉的端口
+  //（探测失败虽然也能自愈，但"正常退出不留垃圾"本该由退出路径负责）。
+  instance.clear();
   // 关停是唯一能保证日志尾部完整的时机：WriteQueue 在硬杀时会丢掉在途任务
   // （见 core_log_sink.dart / write_queue.dart 的说明），故必须在 exit 之前 flush。
   await coreLog.flush();
@@ -222,6 +256,23 @@ Future<void> _warmUpPeripheralsAfterHandshake(
             } catch (error) {
               // 播种失败不该拦住插件系统启动（最坏就是中转站没默认开）。
               log('播种默认内置插件失败（已忽略）：$error');
+            }
+            // 3) [seedDesktopUiPlugin]：随安装包发布的默认界面（与核心同目录的
+            //    `tree_ui.exe` + `plugin.json`）首次出现时登记一条 `runtime: ui`。
+            //    少了这一步，新装机的 plugins.yaml 里根本没有界面这一条，核心
+            //    永远不会拉起它 —— 用户双击图标只会看到引导页，或者什么都没有。
+            //    登记进来之后**走的是与其它 UI 插件完全相同的通用启动路径**
+            //    （PluginBus → UiHost），这里不写任何“默认界面”特判。
+            try {
+              final List<String> seededUi = await seedDesktopUiPlugin(
+                store: builtinStore,
+                log: log,
+              );
+              if (seededUi.isNotEmpty) {
+                log('已登记随包默认界面插件：${seededUi.join('、')}');
+              }
+            } catch (error) {
+              log('登记默认界面插件失败（已忽略）：$error');
             }
             await plugins.start();
           },

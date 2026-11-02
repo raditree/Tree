@@ -137,6 +137,18 @@ class TreePaths {
   /// `<id>.1.log`。文件名只取 [safeSegment] 后的插件 id（配置里的 id 天然满足）。
   String get pluginLogsDir => p.join(logsDir, 'plugins');
 
+  /// **运行时发现文件**目录（`<root>/runtime`）。
+  ///
+  /// 这里只放"进程活着时才有效"的小文件（当前核心的端口/token），不是配置也不是
+  /// 数据。核心是单实例，loader 靠 [coreInstanceFile] 判断"要不要附着而不是新起"。
+  String get runtimeDir => p.join(root, 'runtime');
+
+  /// 当前核心的**实例发现文件**（`<root>/runtime/core.json`）。
+  ///
+  /// 写入口径见 `store/core_instance.dart`：监听成功之后写、退出时删；硬杀留下的
+  /// 陈旧文件由下一个启动者探测后清理。
+  String get coreInstanceFile => p.join(runtimeDir, 'core.json');
+
   /// 某个插件**当前**那一份日志（`<root>/logs/plugins/<id>.log`）。
   String pluginLogFile(String pluginId) =>
       p.join(pluginLogsDir, '${safeSegment(pluginId)}.log');
@@ -217,6 +229,7 @@ class TreePaths {
       logsDir,
       hooksDir,
       storeDir,
+      runtimeDir,
     ]) {
       await Directory(dir).create(recursive: true);
     }
@@ -233,6 +246,7 @@ class TreePaths {
       logsDir,
       hooksDir,
       storeDir,
+      runtimeDir,
     ]) {
       Directory(dir).createSync(recursive: true);
     }

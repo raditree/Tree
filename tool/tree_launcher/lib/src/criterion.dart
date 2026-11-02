@@ -1,72 +1,98 @@
 /// 引导壳判据（**纯函数**，不碰 IO / 进程，便于单测与复用）。
 ///
-/// 判据：**不存在任何"存活"的 UI 连接声明 `plugin.manage`** 时需要打开引导页。
-/// 三种都开：
-/// 1. 零连接；
-/// 2. 只剩不具备 `plugin.manage` 的 UI；
-/// 3. 具备该能力的条目被停用（`disabledPluginIds`）。
+/// 判据（用户 2026-11-01 钉死，**配置口径**，不看连接）：
+/// - 启动时 `plugins.yaml` 里存在**启用状态**的 `runtime: ui` 插件 ⇒ **不开**引导页
+///   （核心已经/即将按清单拉起它，loader 不该再弹浏览器页去抢戏）；
+/// - 不存在 ⇒ **开**引导页（**即使界面已下载但被停用**也算“不存在”：用户停用它就是
+///   不想要它，引导页才是他重新打开的入口）。
+///
+/// 为什么不用“存活连接 + plugin.manage”那套旧口径：核心刚拉起时界面还没握手上，
+/// 那个判据必然判成“需要引导”，普通用户就会看到“桌面窗口 + 浏览器引导页”双开；
+/// 而“有启用的 UI 插件、但它没连上”该由核心的实例健康度报出来，不是 loader 的事。
 library;
 
-/// 需要 UI 管理能力的 capability 名（与设计 §7.1 一手证据一致）。
-const String pluginManageCapability = 'plugin.manage';
+/// `runtime` 里代表“图形界面插件”的归一化值（与核心 `PluginRuntime` 同口径）。
+const String uiRuntimeValue = 'ui';
 
-/// 一条 `/api/meta.ui[]` 的可判定视图。
-class UiConnectionView {
-  const UiConnectionView({
+/// 一条 `/api/plugin/snapshot` 的 `config.plugins[]` 判定视图。
+class PluginConfigView {
+  const PluginConfigView({
     required this.pluginId,
-    required this.connections,
-    required this.canManagePlugins,
+    required this.runtime,
+    required this.enabled,
   });
 
   final String pluginId;
-  final int connections;
-  final bool canManagePlugins;
 
-  bool get alive => connections > 0;
+  /// 归一化后的 runtime（空串 = 清单没写，按 headless 处理）。
+  final String runtime;
 
-  bool get usable => alive && canManagePlugins;
+  final bool enabled;
+
+  /// 是不是**启用中的界面插件**（判据的唯一条件）。
+  bool get isEnabledUi =>
+      enabled && runtime.trim().toLowerCase() == uiRuntimeValue;
 }
 
-/// 把 `/api/meta` 的原始 JSON 解析成可判定视图（宽容：坏数据 = 零连接）。
-List<UiConnectionView> parseUiConnections(Object? rawUi) {
-  if (rawUi is! List) return const <UiConnectionView>[];
-  final List<UiConnectionView> out = <UiConnectionView>[];
-  for (final Object? item in rawUi) {
+/// 把 `/api/plugin/snapshot` 解析成判定视图（宽容：坏数据 = 空清单）。
+///
+/// 后端不详 / 字段缺失的那些条目一律跳过：它们不是“可用的界面”，但也不阻止
+/// 别的好条目被认出来。
+List<PluginConfigView> parsePluginConfigs(Object? snapshotJson) {
+  if (snapshotJson is! Map) return const <PluginConfigView>[];
+  final Object? config = snapshotJson['config'];
+  if (config is! Map) return const <PluginConfigView>[];
+  final Object? plugins = config['plugins'];
+  if (plugins is! List) return const <PluginConfigView>[];
+  final List<PluginConfigView> out = <PluginConfigView>[];
+  for (final Object? item in plugins) {
     if (item is! Map) continue;
-    final Object? idValue = item['plugin_id'];
-    final Object? countValue = item['connections'];
-    final Object? capsValue = item['capabilities'];
-    final int connections = countValue is num ? countValue.toInt() : 0;
-    final bool manages = capsValue is List &&
-        capsValue.any((Object? cap) => cap?.toString() == pluginManageCapability);
+    // 快照口径是 `plugin_id`（见核心 `PluginConfig.toApiJson()`）；`id` 只在
+    // `plugins.yaml` 里出现。两者都认，免得判据因为键名不同而永远读不到条目
+    // （2026-11-01 实机：读 `id` 时全部被跳过 ⇒ 误开引导页 + 桌面窗口）。
+    final Object? rawId = item['plugin_id'] ?? item['id'];
+    final String id = rawId?.toString().trim() ?? '';
+    if (id.isEmpty) continue;
     out.add(
-      UiConnectionView(
-        pluginId: idValue?.toString() ?? '',
-        connections: connections < 0 ? 0 : connections,
-        canManagePlugins: manages,
+      PluginConfigView(
+        pluginId: id,
+        runtime: (item['runtime'] ?? '').toString(),
+        // 缺省 enabled = 开（与 plugins.yaml 的口径一致）。
+        enabled: item['enabled'] != false,
       ),
     );
   }
   return out;
 }
 
-/// 是否必须打开引导页。
+/// 快照够不够用来下结论（`config.plugins[]` 必须真的读到了）。
 ///
-/// [disabledPluginIds]：被停用的插件 id（loader 从 `/api/plugin/snapshot` 的
-/// `config.plugins[].enabled == false` 收集）。能力条目被停用 ⇒ 即使还留着一条
-/// 陈旧连接，也按"没有可用管理界面"处理。
-bool needsBootstrap(
-  Object? metaJson, {
-  Set<String> disabledPluginIds = const <String>{},
-}) {
-  if (metaJson is! Map) return true;
-  final List<UiConnectionView> ui = parseUiConnections(metaJson['ui']);
-  for (final UiConnectionView entry in ui) {
-    if (!entry.usable) continue;
-    if (disabledPluginIds.contains(entry.pluginId)) continue;
-    return false;
-  }
-  return true;
+/// 核心刚握手时 HTTP 可能已经通、但插件总线还在预热（`_warmUpPeripheralsAfterHandshake`
+/// 在 3s 预算内播种默认界面并 `plugins.start()`），此时 `config.plugins` 可能是空数组
+/// 甚至没有 `config` 段 —— 那是“还没准备好”，不是“没有界面插件”。loader 必须区分
+/// 两件事并按重试处理，否则会在一开机就误开引导页。
+bool snapshotReady(Object? snapshotJson) {
+  if (snapshotJson is! Map) return false;
+  final Object? config = snapshotJson['config'];
+  if (config is! Map) return false;
+  final Object? plugins = config['plugins'];
+  return plugins is List;
+}
+
+/// 启用中的 UI 插件 id（launcher 用它在没窗口时补发 restart）。
+Set<String> enabledUiPluginIdsOf(Object? snapshotJson) => <String>{
+  for (final PluginConfigView view in parsePluginConfigs(snapshotJson))
+    if (view.isEnabledUi) view.pluginId,
+};
+
+/// 是否必须打开引导页（**配置判据**，见文件头）。
+///
+/// [snapshotJson] 读不到结论（见 [snapshotReady]）时返回 **false**：宁可不开引导页
+/// （核心启动失败已在握手阶段报错；误开一张浏览器页反而更像“坏了”）——调用方会在
+/// 重试耗尽后打印一条可读提示。
+bool needsBootstrapByConfig(Object? snapshotJson) {
+  if (!snapshotReady(snapshotJson)) return false;
+  return enabledUiPluginIdsOf(snapshotJson).isEmpty;
 }
 
 /// 从 `/api/meta` 取生效品牌里可用的 `.ico` 绝对路径（role=exe）。
@@ -82,23 +108,4 @@ String? shortcutIconOf(Object? metaJson) {
   if (icon.isEmpty) return null;
   if (!icon.toLowerCase().endsWith('.ico')) return null;
   return icon;
-}
-
-/// 从 `/api/plugin/snapshot` 的原始 JSON 里收集被停用的插件 id。
-Set<String> disabledPluginIdsOf(Object? snapshotJson) {
-  if (snapshotJson is! Map) return const <String>{};
-  final Object? config = snapshotJson['config'];
-  if (config is! Map) return const <String>{};
-  final Object? plugins = config['plugins'];
-  if (plugins is! List) return const <String>{};
-  final Set<String> out = <String>{};
-  for (final Object? item in plugins) {
-    if (item is! Map) continue;
-    final Object? enabled = item['enabled'];
-    if (enabled == false) {
-      final Object? id = item['id'];
-      if (id != null) out.add(id.toString());
-    }
-  }
-  return out;
 }

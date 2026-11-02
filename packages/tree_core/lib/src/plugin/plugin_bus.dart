@@ -1151,6 +1151,9 @@ class PluginBus {
       coreUrl: coreUrl,
       coreToken: coreToken,
       windowId: windowId,
+      // 数据根随进程注入：UI 的用量账本 / 核心日志入口按它拼路径。
+      // 不注入时 UI 只能显示"拿不到核心数据根"，调用列表恒为 0 次。
+      dataRoot: dataDir,
       // UI 插件的进程输出同样进日志 API（stdout 是开发期诊断，stderr 是错误）。
       onStdoutLine: (String line) => pluginLog?.call(config.id, line, 'stdout'),
       onStderrLine: (String line) => pluginLog?.call(config.id, line, 'stderr'),
@@ -1827,6 +1830,13 @@ class PluginBus {
     await refreshToolDefinitions();
     return _hasInstance(pluginId);
   }
+
+  /// 某插件此刻**是否存在实例**（stdio 宿主或 UI 窗口；含“已退出但还没收尸”）。
+  ///
+  /// 只读观测口径，**不驱动任何行为**（重启 / 对账的副作用仍由各自的路径负责）。
+  /// REST 层用它回答「重启之后到底有没有东西在跑」：停用态点重启必须先启用，
+  /// 否则会出现「进程拉起来了、状态仍写着已停用」的自相矛盾。
+  bool isRunning(String pluginId) => _hasInstance(pluginId);
 
   /// **用户显式强制停止**一个插件实例：全项目里唯一能“因为有人按了按钮”而 `kill()`
   /// 的入口（D8）。

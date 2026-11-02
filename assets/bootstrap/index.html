@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="tree-bootstrap-build" content="3">
 <title>Tree 插件管理</title>
 <style>
 :root{color-scheme:dark}
@@ -35,13 +36,19 @@ tr:last-child td{border-bottom:none}
 .banner{display:none;padding:10px 14px;border-radius:10px;margin-bottom:14px;border:1px solid}
 .banner.error{display:block;color:#fecaca;background:#2a1215;border-color:#7f1d1d}
 .banner.ok{display:block;color:#bbf7d0;background:#0f2417;border-color:#14532d}
+.banner.info{color:#bfdbfe;background:#0c1b2e;border-color:#1e3a8a}
 .notice{display:none;color:#fde68a;background:#241e0c;border:1px solid #713f12;border-radius:8px;padding:6px 10px;margin-top:8px;font-size:12.5px}
 .hint{color:#8b98a9;font-size:12.5px;margin-top:6px}
+.hint code{background:#0d1117;border-radius:4px;padding:0 4px}
 .deps{margin-top:4px;font-size:12.5px;color:#9fb0c4}
 .deps code{background:#0d1117;border-radius:4px;padding:0 4px}
 .inline-empty{color:#8b98a9;padding:10px 0}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid #33404f;border-top-color:#93c5fd;border-radius:50%;animation:r .8s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes r{to{transform:rotate(360deg)}}
+.mask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);align-items:center;justify-content:center;padding:20px;z-index:10}
+.dialog{background:#171c23;border:1px solid #2b3644;border-radius:12px;padding:18px;width:min(520px,100%)}
+.dialog label{display:block;margin:10px 0 4px;font-size:12.5px;color:#93a1b3}
+.dialog input{width:100%}
 </style>
 </head>
 <body>
@@ -54,11 +61,26 @@ tr:last-child td{border-bottom:none}
   </header>
 
   <div id="errorBanner" class="banner error"></div>
-  <div id="readyBanner" class="banner ok">界面已就绪，可关闭本页。</div>
+  <div id="readyBanner" class="banner">界面已就绪，可关闭本页。</div>
+  <div id="versionBanner" class="banner info"></div>
 
   <div class="card" id="authCard">
     <h2>引导链接</h2>
     <div id="authBody" class="muted"><span class="spin"></span>正在用票据换取会话 token…</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <h2 style="margin:0">必需插件</h2>
+      <span class="spacer"></span>
+      <button id="installRequiredBtn" class="primary">补齐并安装</button>
+    </div>
+    <div class="hint">
+      未安装 <code>tree.agent</code> 时，旧数据（agents / 模型 / 会话）无法解析，界面上的相关列表会是空的。
+      安装来自发布仓库（Gitee 优先、GitHub 兜底）。
+    </div>
+    <div id="requiredBody" class="inline-empty"><span class="spin"></span>加载中…</div>
+    <div id="requiredNotice" class="notice"></div>
   </div>
 
   <div class="card">
@@ -92,6 +114,22 @@ tr:last-child td{border-bottom:none}
   </div>
 </div>
 
+<div id="editMask" class="mask">
+  <div class="dialog">
+    <h2 id="editTitle">编辑插件</h2>
+    <label>名称<input id="editName"></label>
+    <label>描述<input id="editDescription"></label>
+    <label>命令<input id="editCommand"></label>
+    <label>参数（空格分隔）<input id="editArgs"></label>
+    <div class="row" style="margin-top:14px">
+      <span class="spacer"></span>
+      <button id="editCancel">取消</button>
+      <button id="editSave" class="primary">保存</button>
+    </div>
+    <div id="editError" class="hint"></div>
+  </div>
+</div>
+
 <script>
 (function () {
   'use strict';
@@ -102,7 +140,116 @@ tr:last-child td{border-bottom:none}
   var readyShown = false;
   var pollTimer = null;
 
+  // 会话 token 生效时刻（判「401 是被吊销」还是「到期」用，见 showReady）。
+  var sessionStartedAt = 0;
+
+  // 会话 TTL 约 600s：**开页 5 分钟内就 401** 只可能是界面接管后核心吊销了它，
+  // 不可能是到期 —— 只有这一档才敢让页面自关；否则用户干等 10 分钟后页面自己
+  // 消失、界面却还没起来，就再没有可管理的入口了。
+  var REVOKE_CLOSE_WINDOW_MS = 5 * 60 * 1000;
+
+  // 发布索引条目（「必需插件」卡要从里面判断“装了没、有没有更新”）。
+  var _releaseEntries = [];
+
+  // 已配置清单条目（id → 配置；索引里缺那一条时的兜底判断用）。
+  var _configById = {};
+
+  // 「版本更新后引导清空」：用 cookie 记住上次打开本页时的核心版本。
+  //
+  // 为什么用 cookie 而不是 localStorage：核心每次启动的端口由内核分配（随机），
+  // localStorage 按 `scheme://host:port` 隔离——换个端口就等于换了一份空存储，
+  // 永远比不出“版本变了”。cookie 只按 host 隔离，跨端口还在。
+  var COOKIE_VERSION = 'tree_bootstrap_version';
+  var COOKIE_STATE_PREFIX = 'tree_bootstrap_state_';
+
+  // 必需的领域插件的根（依赖从发布索引的 requires 里自动补齐）。
+  var REQUIRED_ROOTS = ['tree.agent'];
+
   var $ = function (id) { return document.getElementById(id); };
+
+  function readCookie(name) {
+    var parts = document.cookie ? document.cookie.split(';') : [];
+    for (var i = 0; i < parts.length; i++) {
+      var pair = parts[i].trim();
+      if (pair.indexOf(name + '=') === 0) {
+        return decodeURIComponent(pair.slice(name.length + 1));
+      }
+    }
+    return '';
+  }
+
+  function writeCookie(name, value) {
+    document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=31536000; SameSite=Lax';
+  }
+
+  // 清掉本页自己留下的引导状态（版本变了就不再沿用上一版的任何提示状态）。
+  function clearGuideState() {
+    (document.cookie ? document.cookie.split(';') : []).forEach(function (pair) {
+      var key = pair.split('=')[0].trim();
+      if (key.indexOf(COOKIE_STATE_PREFIX) === 0) {
+        document.cookie = key + '=; path=/; max-age=0; SameSite=Lax';
+      }
+    });
+  }
+
+  function showVersionBanner(message) {
+    var banner = $('versionBanner');
+    if (!message) { banner.style.display = 'none'; banner.textContent = ''; return; }
+    banner.style.display = 'block';
+    banner.textContent = message;
+  }
+
+  function isSessionExpired(error) {
+    return !!error && (error.status === 401 || error.status === 403);
+  }
+
+  // 会话失效**不是出错**：界面一起来，引导票据本就作废。统一走这一句，
+  // 免得把「已经就绪」渲染成一条红色错误横幅（实机上的红条基本都来自这里）。
+  //
+  // `autoClose = false`：这一档分不清「界面接管后被吊销」还是「单纯到期」，
+  // 宁可只留一句“可关闭本页”，也不把一个界面还没起来的页面自己关掉。
+  function noteSessionExpired() {
+    showError('');
+    $('tokenState').className = 'badge off';
+    $('tokenState').textContent = '会话已失效';
+    showReady(false);
+  }
+
+  // 版本签名三要素（见 versionSignature）。
+  var _coreVersion = '';
+  var _apiVersion = '';
+  var _releaseTag = '';
+
+  // 对比版本签名；变了就重置引导状态并提示一句。
+  //
+  // 只读 `/api/meta` 与 `/api/plugin/release`（引导会话 token 允许访问的路径），
+  // 不额外要权限。
+  async function loadMeta() {
+    var meta = await api('/api/meta');
+    _coreVersion = (meta && meta.core_version) || '';
+    _apiVersion = (meta && meta.api_version) || '';
+    return meta;
+  }
+
+  // 版本签名 = 核心版本 + 协议版本 + 发布索引的 release tag。
+  //
+  // 为什么不是只比 `core_version`：核心那边是**协议版本**（长期不变，
+  // 发新装机包也不会动），真正随发版变化的是发布索引的 tag（v1.0.5 → v1.0.6）。
+  function versionSignature() {
+    if (!_coreVersion) return '';
+    return [_coreVersion, _apiVersion, _releaseTag].join('|');
+  }
+
+  function applyVersionCheck() {
+    var version = versionSignature();
+    if (!version) return;
+    var previous = readCookie(COOKIE_VERSION);
+    if (!previous) { writeCookie(COOKIE_VERSION, version); return; }
+    if (previous === version) return;
+    clearGuideState();
+    writeCookie(COOKIE_VERSION, version);
+    showVersionBanner('版本已更新，引导已重置。');
+  }
 
   function esc(value) {
     return String(value == null ? '' : value)
@@ -124,10 +271,19 @@ tr:last-child td{border-bottom:none}
     node.textContent = message;
   }
 
-  function showReady() {
+  // 界面接管后引导页没有继续存在的理由：先试着自关。
+  //
+  // 浏览器只允许“脚本开的窗口”被脚本关掉（本页通常由启动器用 `start` 打开），
+  // 所以自关经常失败：失败就**留着横幅**，让用户看到“可以关了”自己点 X。
+  // 不弹确认框、也不假装自己关了。
+  function showReady(autoClose) {
     if (readyShown) return;
     readyShown = true;
-    $('readyBanner').classList.add('ok');
+    var banner = $('readyBanner');
+    banner.classList.remove('error');
+    banner.classList.add('ok');
+    if (autoClose === false) return;
+    try { window.close(); } catch (e) { /* 关不掉：横幅留着 */ }
   }
 
   async function api(path, options) {
@@ -175,12 +331,22 @@ tr:last-child td{border-bottom:none}
         return parsed;
       });
       token = data.token || '';
+      sessionStartedAt = Date.now();
       $('authBody').innerHTML = '票据已兑换为会话 token（有效期约 ' + esc(data.expires_in || 600) +
         ' 秒）。界面就绪后本页会自动失效。';
       $('tokenState').className = 'badge ok';
       $('tokenState').textContent = '会话已授权';
       $('authCard').style.display = 'none';
       showError('');
+      try {
+        await loadMeta();
+      } catch (error) {
+        if (isSessionExpired(error)) {
+          noteSessionExpired();
+        } else {
+          showError('读取 /api/meta 失败：' + error.message);
+        }
+      }
       await loadAll();
       startMetaPolling();
     } catch (error) {
@@ -234,6 +400,8 @@ tr:last-child td{border-bottom:none}
       var ids = {};
       configs.forEach(function (config) { ids[config.id] = true; });
       instances.forEach(function (item) { ids[item.plugin_id] = true; });
+      _configById = {};
+      configs.forEach(function (config) { _configById[config.id] = config; });
       var list = Object.keys(ids).sort().map(function (id) {
         var config = null;
         configs.forEach(function (item) { if (item.id === id) config = item; });
@@ -246,6 +414,8 @@ tr:last-child td{border-bottom:none}
         return;
       }
       body.className = '';
+      var releaseById = {};
+      _releaseEntries.forEach(function (item) { releaseById[item.plugin_id] = item; });
       var html = '<table><thead><tr><th>插件</th><th>runtime / 源</th><th>状态</th><th>操作</th></tr></thead><tbody>';
       list.forEach(function (row) {
         var config = row.config || {};
@@ -254,13 +424,26 @@ tr:last-child td{border-bottom:none}
         var version = config.version || instance.version || '';
         var source = config.builtin ? '内置' : (config.release || config.source || '自定义');
         var enabled = config.enabled !== false;
+        // 只有声明了 suspension: keep 才会真“续上”；否则核心按冷启动（D3）。
+        var canSuspend = (config.suspension || '') === 'keep';
+        var releaseEntry = releaseById[row.id] || null;
         var actions = [];
-        actions.push('<button data-act="restart" data-id="' + esc(row.id) + '">重启</button>');
+        // 仓库里有更新：先把「更新」摆出来（带依赖，免得升完还起不来）。
+        if (releaseEntry && releaseEntry.has_update === true) {
+          actions.push('<button class="primary" data-act="install-deps" data-id="' + esc(row.id) + '">更新</button>');
+        }
+        // 启用 / 停用：**显式按钮**。停用态给「启用」——只摆一个复选框时，用户
+        // 看到「已停用」会以为这一条没法操作了（实机反馈过）。
+        // 停用态也不摆「热重启」：热重启会把插件拉起来，按钮本身就该说清这件事，
+        // 而不是让用户点了才发现开关被顺手打开了。
         if (enabled) {
+          actions.push('<button data-act="hot-restart" data-id="' + esc(row.id) + '">' +
+            (canSuspend ? '热重启（保留状态）' : '重启（冷启动）') + '</button>');
           actions.push('<button class="danger" data-act="disable" data-id="' + esc(row.id) + '">停用</button>');
         } else {
           actions.push('<button class="primary" data-act="enable" data-id="' + esc(row.id) + '">启用</button>');
         }
+        actions.push('<button data-act="edit" data-id="' + esc(row.id) + '">编辑</button>');
         actions.push('<button class="danger" data-act="uninstall" data-id="' + esc(row.id) + '">卸载</button>');
         html += '<tr>' +
           '<td><strong>' + esc(name) + '</strong><div class="muted">' + esc(row.id) +
@@ -276,7 +459,12 @@ tr:last-child td{border-bottom:none}
       setNotice('pluginsNotice', '');
     } catch (error) {
       body.className = 'inline-empty';
-      body.textContent = '插件列表加载失败：' + error.message;
+      if (isSessionExpired(error)) {
+        noteSessionExpired();
+        body.textContent = '界面已就绪，本页会话已失效（可关闭本页）。';
+      } else {
+        body.textContent = '插件列表加载失败：' + error.message;
+      }
     }
   }
 
@@ -316,7 +504,12 @@ tr:last-child td{border-bottom:none}
       body.innerHTML = html;
     } catch (error) {
       body.className = 'inline-empty';
-      body.textContent = '内置插件加载失败：' + error.message;
+      if (isSessionExpired(error)) {
+        noteSessionExpired();
+        body.textContent = '界面已就绪，本页会话已失效（可关闭本页）。';
+      } else {
+        body.textContent = '内置插件加载失败：' + error.message;
+      }
     }
   }
 
@@ -325,6 +518,8 @@ tr:last-child td{border-bottom:none}
     try {
       var data = await api('/api/plugin/release');
       var entries = (data && data.entries) || [];
+      _releaseEntries = entries;
+      _releaseTag = (data && data.tag) || '';
       var meta = [];
       if (data && data.source) meta.push('源：' + data.source);
       if (data && data.tag) meta.push('release：' + data.tag);
@@ -343,19 +538,26 @@ tr:last-child td{border-bottom:none}
       entries.forEach(function (item) {
         var installed = item.installed_version || '';
         var hasUpdate = item.has_update === true;
-        var label = installed
-          ? (hasUpdate ? '更新到 v' + esc(item.version) : '已安装 v' + esc(installed))
-          : '安装';
-        var actions = [];
-        actions.push('<button class="primary" data-act="install" data-id="' + esc(item.plugin_id) + '">' + label + '</button>');
         var deps = item.requires && item.requires.plugins ? item.requires.plugins : [];
+        var actions = [];
+        // 未装：两条路都留着 —— 「安装」连依赖一起补，「最小安装」只落它自己；
+        // 内网 / 想自己控制装哪些依赖的人不该被"自动"绑架。
+        if (!installed) {
+          actions.push('<button class="primary" data-act="install" data-id="' + esc(item.plugin_id) + '">安装</button>');
+          actions.push('<button data-act="install-minimal" data-id="' + esc(item.plugin_id) + '">最小安装</button>');
+        } else if (hasUpdate) {
+          actions.push('<button class="primary" data-act="install-deps" data-id="' + esc(item.plugin_id) + '">更新</button>');
+        } else {
+          actions.push('<span class="badge ok">已是最新</span>');
+        }
         if (deps.length) {
-          actions.push('<button data-act="install-deps" data-id="' + esc(item.plugin_id) + '">自动补齐依赖并安装</button>');
+          actions.push('<button data-act="install-deps-only" data-id="' + esc(item.plugin_id) + '">安装依赖</button>');
         }
         html += '<tr>' +
           '<td><strong>' + esc(item.name || item.plugin_id) + '</strong><div class="muted">' + esc(item.plugin_id) +
             (item.description ? ' · ' + esc(item.description) : '') + '</div></td>' +
-          '<td>' + esc(item.version || '') + '</td>' +
+          '<td>' + esc(item.version || '') +
+            (installed ? '<div class="muted">本机 v' + esc(installed) + '</div>' : '') + '</td>' +
           '<td>' + (deps.length ? dependencyRows(item.requires) : '<span class="muted">无</span>') + '</td>' +
           '<td><div class="row">' + actions.join('') + '</div></td>' +
           '</tr>';
@@ -368,7 +570,80 @@ tr:last-child td{border-bottom:none}
       setNotice('releaseNotice', '');
     } catch (error) {
       body.className = 'inline-empty';
-      body.textContent = '发布索引加载失败：' + error.message;
+      if (isSessionExpired(error)) {
+        noteSessionExpired();
+        body.textContent = '界面已就绪，本页会话已失效（可关闭本页）。';
+      } else {
+        body.textContent = '发布索引加载失败：' + error.message;
+      }
+    }
+  }
+
+  // 一组插件 + 它们在发布索引里声明的依赖（闭包），顺序按「先根、后依赖」。
+  function closureOf(roots) {
+    var byId = {};
+    _releaseEntries.forEach(function (item) { byId[item.plugin_id] = item; });
+    var rows = [];
+    var seen = {};
+    var queue = (roots || []).slice();
+    while (queue.length) {
+      var id = queue.shift();
+      if (!id || seen[id]) continue;
+      seen[id] = true;
+      var entry = byId[id] || null;
+      rows.push({ id: id, entry: entry, root: (roots || []).indexOf(id) >= 0 });
+      var deps = entry && entry.requires && entry.requires.plugins ? entry.requires.plugins : [];
+      deps.forEach(function (dep) { queue.push(dep.id || dep.plugin_id || ''); });
+    }
+    return rows;
+  }
+
+  function requiredClosure() {
+    return closureOf(REQUIRED_ROOTS);
+  }
+
+  function isMissing(row) {
+    if (row.entry && row.entry.installed_version) return false;
+    return !_configById[row.id];
+  }
+
+  async function loadRequirements() {
+    var body = $('requiredBody');
+    var rows = requiredClosure();
+    if (!rows.length) {
+      body.className = 'inline-empty';
+      body.textContent = '本地还没有发布索引缓存，无法判断必需插件是否已安装。点下方「刷新索引」联网拉取。';
+      return;
+    }
+    var missing = [];
+    var html = '<table><thead><tr><th>插件</th><th>说明</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    rows.forEach(function (row) {
+      var entry = row.entry || {};
+      var config = _configById[row.id];
+      var installedVersion = entry.installed_version || (config ? (config.version || '') : '');
+      var missingNow = isMissing(row);
+      if (missingNow) missing.push(row.id);
+      var kind = row.root ? '必需' : '依赖';
+      var state = missingNow
+        ? '<span class="badge warn">未安装</span>'
+        : '<span class="badge ok">已安装' + (installedVersion ? ' v' + esc(installedVersion) : '') + '</span>';
+      var action = missingNow
+        ? ('<button class="primary" data-act="required-install" data-id="' + esc(row.id) + '">安装</button>')
+        : '';
+      html += '<tr>' +
+        '<td><strong>' + esc(entry.name || row.id) + '</strong><div class="muted">' + esc(row.id) + '</div></td>' +
+        '<td>' + kind + '</td>' +
+        '<td>' + state + (!entry.plugin_id ? '<div class="muted">发布索引里没有这一条</div>' : '') + '</td>' +
+        '<td><div class="row">' + action + '</div></td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    body.className = '';
+    body.innerHTML = html;
+    if (missing.length) {
+      setNotice('requiredNotice', '缺少：' + missing.join('、') + '。未装 tree.agent 时旧数据（agents / 模型 / 会话）无法解析，相关列表会是空的。');
+    } else {
+      setNotice('requiredNotice', '');
     }
   }
 
@@ -380,11 +655,8 @@ tr:last-child td{border-bottom:none}
       if (successMessage) setNotice('pluginsNotice', successMessage);
       await loadAll();
     } catch (error) {
-      if (error.status === 401) {
-        showReady();
-        $('tokenState').className = 'badge off';
-        $('tokenState').textContent = '会话已失效';
-        showError('会话 token 已失效（通常表示界面已就绪）：' + error.message);
+      if (isSessionExpired(error)) {
+        noteSessionExpired();
       } else {
         showError(error.message);
       }
@@ -397,6 +669,84 @@ tr:last-child td{border-bottom:none}
     return api(path, { method: 'POST', body: body || {} });
   }
 
+  // ── 编辑弹窗（引导页没有插件面板那套编辑器，这里只放"改完能立刻生效"的四个字段）──
+  var _editingId = '';
+
+  function openEditor(id) {
+    var config = _configById[id] || {};
+    _editingId = id;
+    $('editTitle').textContent = '编辑插件 · ' + id;
+    $('editName').value = (config.name || '').toString();
+    $('editDescription').value = (config.description || '').toString();
+    $('editCommand').value = (config.command || '').toString();
+    $('editArgs').value = (config.args || []).join(' ');
+    $('editError').textContent = '';
+    $('editMask').style.display = 'flex';
+  }
+
+  function closeEditor() {
+    $('editMask').style.display = 'none';
+    _editingId = '';
+  }
+
+  function saveEditor() {
+    var id = _editingId;
+    if (!id) return;
+    var body = {
+      name: $('editName').value.trim(),
+      description: $('editDescription').value.trim(),
+      command: $('editCommand').value.trim(),
+      args: $('editArgs').value.split(/\s+/).filter(function (part) { return part.length > 0; })
+    };
+    $('editSave').disabled = true;
+    api('/api/plugin/configs/' + encodeURIComponent(id), { method: 'PATCH', body: body })
+      .then(function (data) {
+        closeEditor();
+        // 核心给的 notice（「配置已保存，但本次热应用失败…」）必须原样显示。
+        setNotice('pluginsNotice', (data && data.notice) ? data.notice : ('已保存：' + id));
+        return loadAll();
+      })
+      .catch(function (error) {
+        $('editError').textContent = isSessionExpired(error) ? '会话已失效，请重新打开引导页。' : error.message;
+        if (isSessionExpired(error)) noteSessionExpired();
+      })
+      .finally(function () {
+        $('editSave').disabled = false;
+      });
+  }
+
+  // 「安装依赖」：只装这条插件声明里缺的依赖，不动目标本身。
+  function installOnlyDependencies(button, id) {
+    var rows = closureOf([id]);
+    var missing = rows.filter(function (row) { return row.id !== id && isMissing(row); });
+    if (!missing.length) {
+      setNotice('releaseNotice', '依赖都已安装：' + id);
+      return;
+    }
+    button.disabled = true;
+    setNotice('releaseNotice', '正在安装依赖：' + missing.map(function (row) { return row.id; }).join('、'));
+    var chain = Promise.resolve();
+    missing.forEach(function (row) {
+      chain = chain.then(function () {
+        return post('/api/plugin/release/' + encodeURIComponent(row.id) + '/install', {
+          with_dependencies: true
+        });
+      });
+    });
+    chain.then(function () {
+      setNotice('releaseNotice', '依赖安装请求已完成：' + id);
+      return loadAll();
+    }).catch(function (error) {
+      if (isSessionExpired(error)) {
+        noteSessionExpired();
+      } else {
+        setNotice('releaseNotice', '安装依赖失败：' + id + '（' + error.message + '）');
+      }
+    }).finally(function () {
+      button.disabled = false;
+    });
+  }
+
   function bindActions() {
     document.addEventListener('click', function (event) {
       var button = event.target.closest('button[data-act]');
@@ -404,10 +754,26 @@ tr:last-child td{border-bottom:none}
       var id = button.getAttribute('data-id');
       var act = button.getAttribute('data-act');
       var releaseNotice = '';
-      if (act === 'restart') {
+      if (act === 'hot-restart') {
         runAction(button, function () {
-          return post('/api/plugin/configs/' + encodeURIComponent(id) + '/restart');
-        }, '已请求重启：' + id);
+          return post('/api/plugin/configs/' + encodeURIComponent(id) + '/restart', {
+            mode: 'hot', keep_state: true
+          });
+        }, '已热重启：' + id);
+      } else if (act === 'edit') {
+        openEditor(id);
+      } else if (act === 'install-minimal' || act === 'install-deps-only') {
+        if (act === 'install-minimal') {
+          releaseNotice = '正在最小安装：' + id;
+          setNotice('releaseNotice', releaseNotice);
+          runAction(button, function () {
+            return post('/api/plugin/release/' + encodeURIComponent(id) + '/install', {
+              with_dependencies: false
+            });
+          }, '安装请求完成：' + id);
+        } else {
+          installOnlyDependencies(button, id);
+        }
       } else if (act === 'disable') {
         runAction(button, function () {
           return api('/api/plugin/configs/' + encodeURIComponent(id), {
@@ -434,18 +800,71 @@ tr:last-child td{border-bottom:none}
           return post('/api/plugin/builtins/' + encodeURIComponent(id) + '/disable');
         }, '已停用内置插件：' + id);
       } else if (act === 'install' || act === 'install-deps') {
-        var withDeps = act === 'install-deps';
-        releaseNotice = '正在' + (withDeps ? '补齐依赖并' : '') + '安装：' + id;
+        // 「安装」= 连依赖一起补（用户口径里的「安装（带依赖）」）。
+        releaseNotice = '正在安装（含依赖）：' + id;
         setNotice('releaseNotice', releaseNotice);
         runAction(button, function () {
           return post('/api/plugin/release/' + encodeURIComponent(id) + '/install', {
-            with_dependencies: withDeps
+            with_dependencies: true
           });
         }, '安装请求完成：' + id);
+      } else if (act === 'required-install') {
+        button.disabled = true;
+        setNotice('requiredNotice', '正在安装：' + id);
+        post('/api/plugin/release/' + encodeURIComponent(id) + '/install', {
+          with_dependencies: true
+        }).then(function () {
+          setNotice('requiredNotice', '安装请求完成：' + id);
+          return loadAll();
+        }).catch(function (error) {
+          setNotice('requiredNotice', '安装失败：' + id + '（' + error.message + '）');
+        }).finally(function () {
+          button.disabled = false;
+        });
       }
     });
 
+    $('editCancel').addEventListener('click', closeEditor);
+    $('editSave').addEventListener('click', saveEditor);
+    $('editMask').addEventListener('click', function (event) {
+      if (event.target === $('editMask')) closeEditor();
+    });
+
     $('reloadBtn').addEventListener('click', loadAll);
+
+    // 「补齐并安装」：把必需插件闭包里缺的每一条都装一遍（带依赖，让核心自己
+    // 按 requires 的顺序落盘）。
+    $('installRequiredBtn').addEventListener('click', function () {
+      var button = $('installRequiredBtn');
+      var rows = requiredClosure();
+      if (!rows.length) {
+        setNotice('requiredNotice', '本地还没有发布索引缓存，先点下方「刷新索引」联网拉取。');
+        return;
+      }
+      var missing = rows.filter(isMissing);
+      if (!missing.length) {
+        setNotice('requiredNotice', '必需插件都已安装。');
+        return;
+      }
+      button.disabled = true;
+      setNotice('requiredNotice', '正在安装：' + missing.map(function (row) { return row.id; }).join('、'));
+      var chain = Promise.resolve();
+      missing.forEach(function (row) {
+        chain = chain.then(function () {
+          return post('/api/plugin/release/' + encodeURIComponent(row.id) + '/install', {
+            with_dependencies: true
+          });
+        });
+      });
+      chain.then(function () {
+        setNotice('requiredNotice', '安装请求已完成。');
+        return loadAll();
+      }).catch(function (error) {
+        setNotice('requiredNotice', '安装失败：' + error.message);
+      }).finally(function () {
+        button.disabled = false;
+      });
+    });
     $('reprobeBtn').addEventListener('click', function () {
       var button = $('reprobeBtn');
       button.disabled = true;
@@ -465,14 +884,19 @@ tr:last-child td{border-bottom:none}
         setNotice('releaseNotice', '刷新失败：' + error.message);
       }).finally(function () {
         button.disabled = false;
-        loadRelease();
+        loadAll();
       });
     });
   }
 
   async function loadAll() {
     if (!token) return;
-    await Promise.all([loadPlugins(), loadBuiltins(false), loadRelease()]);
+    // 先拉发布索引：「必需插件」卡要用它的 installed_version 判断装没装。
+    await loadRelease();
+    await Promise.all([loadPlugins(), loadBuiltins(false)]);
+    await loadRequirements();
+    // 版本签名要等发布索引（tag）拿到之后再比，所以放在最后。
+    applyVersionCheck();
   }
 
   function startMetaPolling() {
@@ -482,13 +906,17 @@ tr:last-child td{border-bottom:none}
         var meta = await api('/api/meta');
         var ui = (meta && meta.ui) || [];
         if (ui.length) {
-          showReady();
+          showReady(true);
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         }
       } catch (error) {
         if (error.status === 401 || error.status === 403) {
           // 会话 token 在首个 ui.hello 后会被核心吊销：这正是“界面就绪”的信号。
-          showReady();
+          // 但到期也是 401 —— 只有“开页不久就 401”才算界面接管（见常量注释）。
+          showReady(
+            sessionStartedAt > 0 &&
+              Date.now() - sessionStartedAt < REVOKE_CLOSE_WINDOW_MS
+          );
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         }
       }

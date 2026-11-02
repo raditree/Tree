@@ -26,6 +26,14 @@ const String kCompactBinaryName = 'tree_compact';
 const String kSamplePluginId = 'sample';
 const String kSampleBinaryName = 'tree_sample';
 
+/// 桌面端**默认界面插件**的身份（2026-11-01）。
+///
+/// 安装包不再把界面当主程序：主程序是不可卸载的引导壳 `Tree.exe`，界面以
+/// `runtime: ui` 插件形态与核心同目录（`tree_ui.exe` + `plugin.json`）。
+/// 因此首次启动必须把这条登记进 `plugins.yaml`，否则核心永远不会拉起界面。
+const String kDesktopUiPluginId = 'tree.ui.default';
+const String kDesktopUiBinaryName = 'tree_ui';
+
 /// 内置插件的**静态清单**（M9 §4.2：内置插件与自定义插件都要能在前端开/关）。
 ///
 /// 为什么清单在核心而不是前端：内置插件的"身份"必须由核心认定——前端只拿到
@@ -647,6 +655,72 @@ Future<List<String>> seedDefaultEnabledBuiltins({
     }
   }
   return seeded;
+}
+
+/// 首启把「随安装包发布的默认界面」登记成一条 `runtime: ui` 插件配置。
+///
+/// 为什么必须由核心做：安装器把 `Tree.exe` 交给不可卸载的引导壳，界面本身是
+/// `tree_ui.exe`（UI 插件）。核心只按 `plugins.yaml` 拉起插件 —— 没有条目就永远
+/// 没有界面，普通用户双击后只能看到控制台或浏览器引导页。
+///
+/// 三条口径：
+/// - **文件在才写**：`tree_ui(.exe)` 不在核心同目录 ⇒ 什么都不做（不写一条注定起不来的配置）；
+/// - **条目在就尊重现状**：只按用户的 `enabled` 走，绝不因为「界面是默认的」而自动重开；
+/// - **路径搬家只改 command**：升级 / 换安装目录后旧条目指向不存在的路径时，把
+///   command 重指到当前目录（`enabled` / `env` 原样保留）。
+///
+/// 返回本次真正写入或修正的 id 列表（空 = 什么都没做）。
+Future<List<String>> seedDesktopUiPlugin({
+  required PluginConfigStore store,
+  String? executableDir,
+  bool? isWindows,
+  void Function(String message)? log,
+}) async {
+  final String dir = executableDir ?? p.dirname(Platform.resolvedExecutable);
+  final bool windows = isWindows ?? Platform.isWindows;
+  final String command = p.join(
+    dir,
+    windows ? '$kDesktopUiBinaryName.exe' : kDesktopUiBinaryName,
+  );
+  if (!File(command).existsSync()) return const <String>[];
+
+  final Map<String, dynamic>? existing = store.readEntry(kDesktopUiPluginId);
+  if (existing != null) {
+    final String stored = '${existing['command'] ?? ''}'.trim();
+    if (stored == command) return const <String>[];
+    // 只有「默认界面」这一条才由这里修路径：用户手改过 command 的自定义条目不动。
+    if (existing['builtin'] != true) return const <String>[];
+    final PluginStoreResult fixed = store.update(
+      kDesktopUiPluginId,
+      <String, dynamic>{'command': command},
+    );
+    if (!fixed.ok) {
+      log?.call('默认界面插件路径修正失败：${fixed.error}');
+      return const <String>[];
+    }
+    log?.call('默认界面插件命令已重指：$stored → $command');
+    return <String>[kDesktopUiPluginId];
+  }
+
+  final PluginStoreResult result = store.upsert(<String, dynamic>{
+    'id': kDesktopUiPluginId,
+    'name': 'Tree 默认界面',
+    'description': '随安装包发布的默认图形界面（runtime: ui）。',
+    'command': command,
+    'args': <String>[],
+    'env': <String, String>{},
+    'enabled': true,
+    'granularity': 'team',
+    'scope': <String, dynamic>{},
+    'runtime': 'ui',
+    'requires': <String, dynamic>{'api': '>=1.0 <2.0'},
+    'builtin': true,
+  });
+  if (!result.ok) {
+    log?.call('默认界面插件登记失败：${result.error}');
+    return const <String>[];
+  }
+  return <String>[kDesktopUiPluginId];
 }
 
 /// **内置插件换代迁移**：清单已经把某一项换成随包二进制，而磁盘上那条还是老一代的

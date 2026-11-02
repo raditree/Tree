@@ -62,6 +62,7 @@ class UiHost {
     required String coreUrl,
     required String coreToken,
     String windowId = '',
+    String dataRoot = '',
     void Function(String line)? onStdoutLine,
     void Function(String line)? onStderrLine,
   }) async {
@@ -83,6 +84,9 @@ class UiHost {
           ...config.env,
           'TREE_CORE_URL': coreUrl,
           'TREE_CORE_TOKEN': coreToken,
+          // 数据根：UI 的用量账本 / 核心日志入口靠它拼路径（`<数据根>/data/...`）。
+          // 空串 = 未接线（老口径），此时 UI 显示"拿不到核心数据根"，**不猜路径**。
+          if (dataRoot.trim().isNotEmpty) 'TREE_DATA_ROOT': dataRoot.trim(),
           // 窗口身份：同一 UI 插件可以拉起多个窗口，进程靠它区分自己
           // （窗口级状态键 / ui.hello.window_id）。空串 = 单窗口口径，不注入。
           if (windowId.isNotEmpty) 'TREE_UI_WINDOW_ID': windowId,

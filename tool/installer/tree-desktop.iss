@@ -8,11 +8,13 @@
 ; （脚本会先构建应用与核心，再把上面这些宏传给 iscc）
 ;
 ; 设计要点：
-; 1. 必须安装**整个 Release 目录**：Flutter 引擎 DLL、data 目录、tree.exe 与
-;    tree_core.exe 缺一个应用都起不来；
-; 2. tree_core.exe 必须与 tree.exe **同目录**（CoreProcessLauncher 按"应用同目录"
-;    找核心），装完不要手工挪动；
-; 3. 用户数据（%APPDATA%\Tree：模型密钥、agent 配置、会话记录）**卸载时保留**，
+; 1. 必须安装**整个 Release 目录**：Flutter 引擎 DLL、data 目录、引导壳 Tree.exe、
+;    界面插件 tree_ui.exe（+ plugin.json）与 tree_core.exe 缺一个都起不来；
+; 2. 三个 exe 必须**同目录**：引导壳按"同目录"找核心（CoreProcessLauncher），核心按
+;    plugins.yaml 里的绝对路径找界面；装完不要手工挪动；
+; 3. `{#AppExe}` = **引导壳 Tree.exe**（不是界面）：它负责拉核心，核心再拉界面插件。
+;    双击快捷方式 → 引导壳 → 核心 → tree_ui.exe，这条链的任一环缺了都不会出窗口；
+; 4. 用户数据（%APPDATA%\Tree：模型密钥、agent 配置、会话记录）**卸载时保留**，
 ;    不静默删除用户手改过的文件。
 
 #ifndef AppName
