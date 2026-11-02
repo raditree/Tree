@@ -15,6 +15,26 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [1.0.5+1] — 2026-11-02
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **显示 / 详细两分：会话历史列表回显示行，重负载按 id 即查详情**
+  （**新增** [docs/pluginization/agent_api_contract.md](docs/pluginization/agent_api_contract.md)
+  总则 8 与表 1-3；新路由 `GET /api/conversations/{agentId}/messages/{messageId}`；
+  [packages/tree_protocol/lib/src/api_paths.dart](packages/tree_protocol/lib/src/api_paths.dart)）：
+  - 会话历史列表（`GET /api/conversations/{agentId}`）只回**显示行**（轻量形态，不含
+    `tool_arguments` / `tool_result` 等重负载键）；工具行的一行正文由写入侧预生成的
+    `preview` 承接（与 `toolLineValue` 同口径，规格 §3.1.2）；
+  - 详情端点单条即查、无分页：**在途优先**（流式中的消息未完整落库时回缓存最新态），
+    未命中回落会话库；agent / 消息不存在各回 404；
+  - 路由基线：插件面 54→55、契约总面 94→95、前端可调用面 72→73（核心永久面 40 不变）
+    ——由 [packages/tree_protocol/test/protocol_completeness_test.dart](packages/tree_protocol/test/protocol_completeness_test.dart)
+    「委派契约」用例钉住。
+
+  F1（存储层 Sembast 化）与 F4（中栏折叠组）均为实现层变化、未动任何断言，按口径不入册；
+  溯源看 git 历史（插件仓 `be0b1b7`、主仓 `f9cc17a`）。
+
 ## [1.0.4+3] — 2026-10-18
 
 ### 断言变化（新增 / 修改的 README 不变量）
