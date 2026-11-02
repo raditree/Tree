@@ -736,6 +736,14 @@ class PluginMonitorService extends ChangeNotifier {
   /// 最近一次拉取失败的面向用户错误信息（成功时清空；不覆盖旧快照）。
   String? get error => _error;
 
+  /// 插件清单（plugins.yaml）变更回调（WS `plugin_config_changed` 帧驱动）。
+  ///
+  /// 为什么需要：配置写入过去只落盘、不通知——面板的开关绑在打开那一刻拉到的
+  /// 清单快照上，别的窗口 / 别的写入路径（卸载连带停用、重启回滚）改了 `enabled`，
+  /// 界面照样显示启用（2026-11-01「盘上停用、界面启用」不对齐事故）。面板收到后
+  /// 重拉清单即可；入参是核心回包的 `data`（plugin_id / enabled? / removed? / source）。
+  void Function(Map<String, dynamic> change)? onConfigChanged;
+
   /// 面板可见期间调用（引用计数）；首次调用建立 WS 监听并拉取快照。
   Future<void> start({String teamId = ''}) async {
     _refs++;
@@ -808,8 +816,20 @@ class PluginMonitorService extends ChangeNotifier {
   /// （核心口径：插件活着，只是心跳连续丢失），因此合并结果绝不能落成"停用"。
   void handleMessage(Map<String, dynamic> data) {
     final Object? rawType = data['type'];
-    if (rawType is! String || rawType != 'plugin_status') {
-      return; // 未知类型忽略（含非字符串 type）
+    if (rawType is! String) {
+      return; // 非字符串 type 忽略
+    }
+    if (rawType == 'plugin_config_changed') {
+      final Object? raw = data['data'];
+      onConfigChanged?.call(
+        raw is Map
+            ? Map<String, dynamic>.from(raw)
+            : <String, dynamic>{},
+      );
+      return;
+    }
+    if (rawType != 'plugin_status') {
+      return; // 未知类型忽略
     }
     final Object? raw = data['data'];
     if (raw is! Map) {

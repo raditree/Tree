@@ -22,7 +22,7 @@ import 'plugin_panel.dart';
 /// - 站点页：可订阅数量 / 订阅者禁用 / 自定义配置，外加**站点启用 / 停用**（默认启用，
 ///   改后 PATCH 落 `config/stations.yaml`）；
 /// - 插件页：发布仓库的「从仓库装它 / 从仓库更新」（A+）+ **管理按钮区**（C 起：
-///   启用 / 停用 / 卸载 / 重启 / 热重启 / 编辑）。
+///   启用 / 停用 / 卸载 / 热重启 / 编辑）。
 ///
 /// 编辑仍然只有面板那一颗入口：字段校验与拉起进程的安全二次确认全在
 /// [PluginEditorDialog] 里，页面自己复述一遍就会分叉——所以「编辑」按钮经
@@ -282,7 +282,7 @@ class PluginDetailPage extends StatelessWidget {
   /// 安全二次确认只有一处实现）。null ⇒ 按钮不渲染。
   final Future<void> Function()? onEdit;
 
-  /// 管理按钮（启用 / 停用 / 卸载 / 重启 / 热重启）写成功后的回调：面板重拉清单
+  /// 管理按钮（启用 / 停用 / 卸载 / 热重启）写成功后的回调：面板重拉清单
   /// 并重新注入本页（否则详情页停在写之前的旧条目上）。null ⇒ 只发请求不回刷。
   final Future<void> Function()? onChanged;
 
@@ -776,7 +776,7 @@ class _RepoInstallActionState extends State<_RepoInstallAction> {
               child: Text(
                 _busy
                     ? '正在处理…'
-                    : (widget.needsArtifact ? '从仓库装它' : '从仓库更新'),
+                    : (widget.needsArtifact ? '安装' : '更新'),
                 style: const TextStyle(fontSize: 12),
               ),
             ),
@@ -793,7 +793,13 @@ class _RepoInstallActionState extends State<_RepoInstallAction> {
   }
 }
 
-/// 详情页的**管理按钮区**（C）：启用 / 停用 · 重启 · 热重启 · 编辑 · 卸载。
+/// 详情页的**管理按钮区**（C）：启用 / 停用 · 热重启 · 更新 · 编辑 · 卸载 · 安装/更新依赖。
+///
+/// 「更新」= 把**本插件**升到发布仓库里的新版本（顺带补依赖），只有索引里真有新版本
+/// 时才出现；「安装/更新依赖」只动 `requires.plugins`，不碰插件本体——两者不是一件事。
+///
+/// 普通重启与强制停止不再单独给按钮：它们都由「启用 / 停用」开关表达
+/// （关掉再打开 = 冷启动，停用即停止），多一颗只会让用户猜“该点哪个”。
 ///
 /// 分工与面板卡片那排按钮完全一致（同一套 [PluginAdminClient] 写面），页面不复述
 /// 任何核心判定：核心拒了就把 400 的中文原因**就地**显示在按钮下方（不是一条
@@ -817,7 +823,7 @@ class _PluginManageActions extends StatefulWidget {
   final String pluginId;
   final bool isBuiltin;
 
-  /// 落盘条目（空 = 只有运行实例没有条目：开关与卸载都没有对象，只留重启）。
+  /// 落盘条目（空 = 只有运行实例没有条目：开关与卸载都没有对象，只留热重启）。
   final Map<String, dynamic> entry;
 
   final Future<void> Function()? onEdit;
@@ -825,6 +831,36 @@ class _PluginManageActions extends StatefulWidget {
 
   @override
   State<_PluginManageActions> createState() => _PluginManageActionsState();
+}
+
+/// 一条声明的依赖 + 本机 / 发布版本（详情页「安装 / 更新依赖」用）。
+///
+/// `installed` 与 `missing` 分开：本机有条目就算装过（版本可能读不到），
+/// `upgradable` 只在两边版本都可读且不相等时才成立——不拿空版本号去"升级"。
+class _DependencyStatus {
+  const _DependencyStatus({
+    required this.id,
+    required this.spec,
+    required this.optional,
+    required this.installed,
+    required this.installedVersion,
+    required this.releaseVersion,
+  });
+
+  final String id;
+  final String spec;
+  final bool optional;
+  final bool installed;
+  final String installedVersion;
+  final String releaseVersion;
+
+  bool get upgradable =>
+      installed &&
+      installedVersion.isNotEmpty &&
+      releaseVersion.isNotEmpty &&
+      installedVersion != releaseVersion;
+
+  bool get needsInstall => !installed || upgradable;
 }
 
 class _PluginManageActionsState extends State<_PluginManageActions> {
@@ -836,11 +872,123 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
   /// 就地失败原因（非空 ⇒ 按钮下方红字；清空时机 = 下一次点任何一颗按钮）。
   String _error = '';
 
+  /// 依赖状态（null = 还没读到；空列表 = 这个插件没声明 requires.plugins）。
+  List<_DependencyStatus>? _deps;
+
+  /// 发布仓库里有这一条的新版本（详情页的「更新」按钮就靠它出现）。
+  bool _repoUpdate = false;
+
   @override
   void initState() {
     super.initState();
     _enabled = widget.entry['enabled'] != false;
+    _loadDependencies();
   }
+
+  /// 读依赖本机/发布版本：清单给"本机有没有"，发布索引给"两边版本各是多少"。
+  /// 两条读失败都只是让版本显示不完整，不影响按钮可用（装的时候核心会自己判）。
+  Future<void> _loadDependencies() async {
+    final List<Map<String, dynamic>> declared = _declaredDependencies();
+    final Set<String> installedIds = <String>{};
+    final Map<String, String> releaseVersions = <String, String>{};
+    final Map<String, String> installedVersions = <String, String>{};
+    bool repoUpdate = false;
+    try {
+      final Map<String, dynamic> configs = await widget.admin.fetchConfigs();
+      // 清单接口的键是 `configs`（与面板同一口径）；写成 `plugins` 会让这里
+      // 永远判成"依赖没装"，一键补全就会对着已装的依赖再点一次。
+      for (final Map<String, dynamic> item in _mapList(configs['configs'])) {
+        installedIds.add((item['id'] ?? '').toString());
+      }
+    } catch (_) {
+      // 清单读不到就让 installed 全为 false？不：宁可让按钮给核心去判，
+      // 也不在这里"猜一个缺依赖"。
+    }
+    try {
+      final Map<String, dynamic> listing = await widget.admin.fetchRelease();
+      for (final Map<String, dynamic> item in _mapList(listing['entries'])) {
+        final String id = (item['plugin_id'] ?? '').toString();
+        releaseVersions[id] = (item['version'] ?? '').toString();
+        final String installed = (item['installed_version'] ?? '').toString();
+        if (installed.isNotEmpty) {
+          installedVersions[id] = installed;
+          installedIds.add(id);
+        }
+        if (id == widget.pluginId) repoUpdate = item['has_update'] == true;
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _repoUpdate = repoUpdate;
+      _deps = declared.isEmpty
+          ? const <_DependencyStatus>[]
+          : <_DependencyStatus>[
+              for (final Map<String, dynamic> dep in declared)
+                _DependencyStatus(
+                  id: (dep['id'] ?? '').toString(),
+                  spec: (dep['version'] ?? '').toString(),
+                  optional: dep['optional'] == true,
+                  installed: installedIds.contains((dep['id'] ?? '').toString()),
+                  installedVersion:
+                      installedVersions[(dep['id'] ?? '').toString()] ?? '',
+                  releaseVersion:
+                      releaseVersions[(dep['id'] ?? '').toString()] ?? '',
+                ),
+            ];
+    });
+  }
+
+  /// 条目里声明的 `requires.plugins`（核心的 `PluginConfig.toApiJson()` 已带上）。
+  List<Map<String, dynamic>> _declaredDependencies() {
+    final Object? requires = widget.entry['requires'];
+    if (requires is! Map) return const <Map<String, dynamic>>[];
+    final Object? plugins = requires['plugins'];
+    if (plugins is! List) return const <Map<String, dynamic>>[];
+    return _mapList(plugins);
+  }
+
+  static List<Map<String, dynamic>> _mapList(Object? raw) => raw is List
+      ? <Map<String, dynamic>>[
+          for (final Object? item in raw)
+            if (item is Map) Map<String, dynamic>.from(item),
+        ]
+      : <Map<String, dynamic>>[];
+
+  /// 一键补全：缺的装、版本落后的更新；每条都带上它自己的依赖（免得再点第二轮）。
+  /// 失败逐条记下来一起显示，不因为一条失败就中断其余（装得上几条算几条）。
+  Future<void> _installDependencies() async {
+    if (_busy) return;
+    final List<_DependencyStatus> targets =
+        (_deps ?? const <_DependencyStatus>[])
+            .where((_DependencyStatus dep) => dep.needsInstall)
+            .toList();
+    if (targets.isEmpty) {
+      _snack('依赖都已满足');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+    });
+    final List<String> failed = <String>[];
+    for (final _DependencyStatus dep in targets) {
+      try {
+        await widget.admin.installRelease(dep.id, withDependencies: true);
+      } catch (error) {
+        failed.add('${dep.id}：${_reason(error)}');
+      }
+    }
+    if (!mounted) return;
+    setState(() => _error = failed.join('；'));
+    if (failed.isEmpty) _snack('依赖已安装或更新');
+    await _loadDependencies();
+    await widget.onChanged?.call();
+  }
+
+  /// 条目声明了 `suspension: keep` 才真能「续上」；没声明时核心按冷启动，
+  /// 按钮文案不能先承诺状态会保留（示例插件就没有这条声明）。
+  bool get _canSuspend =>
+      (widget.entry['suspension'] ?? '').toString() == 'keep';
 
   /// 一次写操作：成功 ⇒ 显示回包结果并回调面板回刷；失败 ⇒ 原因就地显示。
   /// 返回是否成功（卸载靠它决定要不要关掉详情页）。
@@ -887,11 +1035,6 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
     if (ok && mounted) setState(() => _enabled = next);
   }
 
-  Future<void> _restart() => _run(
-    () => widget.admin.restartConfig(widget.pluginId),
-    successText: '已重启插件 ${widget.pluginId}',
-  );
-
   /// 热重启：文案跟着回包的 `resumed` 走——“续上了”与“换了一世”是两件事（与面板同口径）。
   Future<void> _hotRestart() => _run(
     () => widget.admin.restartConfig(widget.pluginId, mode: 'hot'),
@@ -899,6 +1042,14 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
         ? '已热重启插件 ${widget.pluginId}，状态续到了第 ${result['generation'] ?? '?'} 代'
         : '已重启插件 ${widget.pluginId}，但按冷启动（目标没声明 suspension: keep '
               '或没递快照）：这不是失败，但状态确实没续上',
+  );
+
+  /// 从发布仓库更新到最新版（顺带补齐依赖）：只有索引里"这一条有新版本"时才出现。
+  ///
+  /// 内置项的更新入口在页面上那张「发布仓库」卡里——同一件事不在页面上摆两遍。
+  Future<void> _updateFromRelease() => _run(
+    () => widget.admin.installRelease(widget.pluginId, withDependencies: true),
+    successText: '已更新 ${widget.pluginId}（依赖已一并补齐）',
   );
 
   /// 卸载：先确认（不可逆动作），成功后关掉详情页——条目都没了，这一页没有对象。
@@ -975,19 +1126,26 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
                   style: const TextStyle(fontSize: 12),
                 ),
               ),
-            TextButton(
-              key: Key('plugin-detail-restart-$id'),
-              onPressed: _busy ? null : _restart,
-              child: const Text('重启', style: TextStyle(fontSize: 12)),
-            ),
-            TextButton(
-              key: Key('plugin-detail-hot-restart-$id'),
-              onPressed: _busy ? null : _hotRestart,
-              child: const Text(
-                '热重启（保留状态）',
-                style: TextStyle(fontSize: 12),
+            // 停用态不摆热重启：点它核心会先把 enabled 写成 true 再拉起，等于用
+            // 「热重启」的按钮做了「启用」的事（与卡片、引导页同口径）。没有落盘
+            // 条目时没有开关可点，热重启是唯一的手动动作，照旧保留。
+            if (!hasEntry || _enabled)
+              TextButton(
+                key: Key('plugin-detail-hot-restart-$id'),
+                onPressed: _busy ? null : _hotRestart,
+                child: Text(
+                  _canSuspend ? '热重启（保留状态）' : '重启（冷启动）',
+                  style: const TextStyle(fontSize: 12),
+                ),
               ),
-            ),
+            // 内置项也摆这颗：以前只给自定义项，内置项想更新只能去下面那张
+            // 「发布仓库」卡里找同一件事，管理按钮区和别处不一致。
+            if (_repoUpdate)
+              TextButton(
+                key: Key('plugin-detail-update-$id'),
+                onPressed: _busy ? null : _updateFromRelease,
+                child: const Text('更新', style: TextStyle(fontSize: 12)),
+              ),
             if (hasEntry && widget.onEdit != null)
               TextButton(
                 key: Key('plugin-detail-edit-$id'),
@@ -1005,6 +1163,30 @@ class _PluginManageActionsState extends State<_PluginManageActions> {
               ),
           ],
         ),
+        if (_deps != null && _deps!.isNotEmpty) ...<Widget>[
+          Text(
+            '依赖（未装或落后的会挡住插件启用）',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
+          for (final _DependencyStatus dep in _deps!)
+            Text(
+              '· ${dep.id}${dep.spec.isEmpty ? '' : ' ${dep.spec}'} — '
+              '${dep.installed ? (dep.installedVersion.isEmpty ? '已装' : '已装 v${dep.installedVersion}') : '未安装'}'
+              '${dep.optional ? '（可选）' : ''}',
+              key: Key('plugin-detail-dep-${dep.id}'),
+              style: TextStyle(
+                fontSize: 11,
+                color: dep.needsInstall
+                    ? (dep.optional ? Colors.orange : cs.error)
+                    : cs.onSurfaceVariant,
+              ),
+            ),
+          TextButton(
+            key: Key('plugin-detail-install-deps-$id'),
+            onPressed: _busy ? null : _installDependencies,
+            child: const Text('安装/更新依赖', style: TextStyle(fontSize: 12)),
+          ),
+        ],
         if (_busy)
           Text(
             '正在处理…',

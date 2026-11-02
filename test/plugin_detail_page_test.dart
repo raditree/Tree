@@ -33,7 +33,8 @@ class _FakeAdmin implements PluginAdminClient {
   /// `source` / `repo_version` 的那一条，用来钉详情页的「来源」行）。
   Map<String, dynamic> configsResponse = _configs();
 
-  static Map<String, dynamic> _configs() => <String, dynamic>{
+  static Map<String, dynamic> _configs({String demoSuspension = ''}) =>
+      <String, dynamic>{
     'path': 'C:/data/config/plugins.yaml',
     'configs': <dynamic>[
       <String, dynamic>{
@@ -45,6 +46,7 @@ class _FakeAdmin implements PluginAdminClient {
         'enabled': true,
         'granularity': 'team',
         'scope': <String, dynamic>{'team_id': 't1'},
+        if (demoSuspension.isNotEmpty) 'suspension': demoSuspension,
       },
       // 2026-10-18 用户定稿：内置项装进来后就是一条**普通条目**——面板把它当普通
       // 插件列（同一种 key / 同一套按钮），"内置"这层身份只在详情页按 id 现查补上。
@@ -164,12 +166,15 @@ class _FakeAdmin implements PluginAdminClient {
     'install': <String, dynamic>{'ok': true, 'plugin_id': 'sample', 'version': '1.2.0'},
   };
 
-  @override
-  Future<Map<String, dynamic>> fetchRelease() async => <String, dynamic>{
+  /// 发布索引的读缓存回包（默认“没有缓存”）。依赖区要按它判断发布版本。
+  Map<String, dynamic> releaseResponse = <String, dynamic>{
     'ok': false,
     'error': '没有缓存',
     'entries': <dynamic>[],
   };
+
+  @override
+  Future<Map<String, dynamic>> fetchRelease() async => releaseResponse;
 
   @override
   Future<Map<String, dynamic>> refreshRelease() async {
@@ -185,8 +190,11 @@ class _FakeAdmin implements PluginAdminClient {
   }
 
   @override
-  Future<Map<String, dynamic>> installRelease(String id) async {
-    calls.add('release-install:$id');
+  Future<Map<String, dynamic>> installRelease(
+    String id, {
+    bool withDependencies = false,
+  }) async {
+    calls.add('release-install:$id${withDependencies ? ':with-deps' : ''}');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return installResponse;
   }
@@ -830,7 +838,7 @@ void main() {
         'runtime': 'binary',
       };
 
-  testWidgets('详情页发布仓库：缺成品给「从仓库装它」，点了先刷新索引再 install', (
+  testWidgets('详情页发布仓库：缺成品给「安装」，点了先刷新索引再 install', (
     WidgetTester tester,
   ) async {
     // 默认夹具 resolution.ok=false（本机没装 Python）⇒ needsArtifact ⇒ 装它。
@@ -859,7 +867,7 @@ void main() {
       findsOneWidget,
       reason: '详情页是缺成品时的第二个入口（卡片在面板上，详情页就地也能装）',
     );
-    expect(find.descendant(of: detail, matching: find.text('从仓库装它')), findsOneWidget);
+    expect(find.descendant(of: detail, matching: find.text('安装')), findsOneWidget);
 
     await tester.tap(button);
     await tester.pumpAndSettle();
@@ -883,7 +891,7 @@ void main() {
     );
   });
 
-  testWidgets('详情页发布仓库：成品在 ⇒ 同一颗按钮显示「从仓库更新」', (
+  testWidgets('详情页发布仓库：成品在 ⇒ 同一颗按钮显示「更新」', (
     WidgetTester tester,
   ) async {
     final Map<String, dynamic> resolvable = _FakeAdmin._builtins();
@@ -906,7 +914,7 @@ void main() {
     expect(
       find.descendant(
         of: find.byType(PluginDetailPage),
-        matching: find.text('从仓库更新'),
+        matching: find.text('更新'),
       ),
       findsOneWidget,
       reason: '已装/有更新时同一颗按钮换文案（不消失：它就是更新入口）',
@@ -984,6 +992,163 @@ void main() {
     );
   });
 
+  // ── UI 注册依赖（2026-11-01）：详情页一键补全 ────────────────────────────
+
+  /// 带 `requires.plugins` 的清单条目（形状 = 核心 `PluginConfig.toApiJson()`）。
+  Map<String, dynamic> configsWithDependency() => <String, dynamic>{
+    'path': 'C:/data/config/plugins.yaml',
+    'configs': <dynamic>[
+      <String, dynamic>{
+        'id': 'demo',
+        'name': '演示插件',
+        'command': 'python',
+        'args': <String>['demo.py'],
+        'enabled': true,
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        'requires': <String, dynamic>{
+          'api': '>=1.0 <2.0',
+          'plugins': <dynamic>[
+            <String, dynamic>{
+              'id': 'tree.agent',
+              'version': '>=0.28.0',
+              'optional': true,
+            },
+          ],
+        },
+      },
+    ],
+    'runtime': <String, dynamic>{
+      'demo': <String, dynamic>{'running': true, 'health': 'ok', 'known': true},
+    },
+  };
+
+  Map<String, dynamic> releaseListing({String installedVersion = ''}) =>
+      <String, dynamic>{
+        'ok': true,
+        'error': '',
+        'tag': 'v1.0.5',
+        'online': true,
+        'entries': <dynamic>[
+          <String, dynamic>{
+            'plugin_id': 'tree.agent',
+            'name': 'Tree 智能体',
+            'version': '0.28.0',
+            'installed_version': installedVersion,
+            'has_update': installedVersion.isEmpty,
+            'runtime': 'binary',
+          },
+        ],
+      };
+
+  testWidgets('详情页依赖区：列出未装的依赖，一键补全按条带 with_dependencies 装', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )
+      ..configsResponse = configsWithDependency()
+      ..releaseResponse = releaseListing();
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    // 依赖区要能说清「谁、要什么版本、装没装、是不是可选」
+    expect(find.textContaining('依赖（未装或落后的会挡住插件启用）'), findsOneWidget);
+    final Finder dep = find.byKey(const Key('plugin-detail-dep-tree.agent'));
+    expect(dep, findsOneWidget);
+    expect(
+      tester.widget<Text>(dep).data,
+      contains('未安装'),
+      reason: '本机没装要说出来，否则“一键补全”成了黑箱',
+    );
+    expect(tester.widget<Text>(dep).data, contains('（可选）'));
+
+    await tester.tap(
+      find.byKey(const Key('plugin-detail-install-deps-demo')),
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      admin.calls,
+      contains('release-install:tree.agent:with-deps'),
+      reason: '补依赖也要带上它自己的依赖（免得再点第二轮）',
+    );
+  });
+
+  testWidgets('详情页依赖区：已装且已最新时点补全不发任何安装请求', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )
+      ..configsResponse = configsWithDependency()
+      ..releaseResponse = releaseListing(installedVersion: '0.28.0');
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    expect(
+      tester
+          .widget<Text>(find.byKey(const Key('plugin-detail-dep-tree.agent')))
+          .data,
+      contains('已装 v0.28.0'),
+    );
+    await tester.tap(
+      find.byKey(const Key('plugin-detail-install-deps-demo')),
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      admin.calls.where((String c) => c.startsWith('release-install:')),
+      isEmpty,
+      reason: '已满足就别再装一遍（那会平白替换一次文件）',
+    );
+    expect(find.text('依赖都已满足'), findsOneWidget);
+  });
+
+  testWidgets('详情页：索引里有新版时给「更新」，点了带依赖装', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..releaseResponse = <String, dynamic>{
+      'ok': true,
+      'error': '',
+      'tag': 'v1.0.5',
+      'online': true,
+      'entries': <dynamic>[
+        <String, dynamic>{
+          'plugin_id': 'demo',
+          'name': '演示插件',
+          'version': '1.2.0',
+          'installed_version': '1.0.0',
+          'has_update': true,
+          'runtime': 'binary',
+        },
+      ],
+    };
+    await _pump(tester, svc: await _service(), admin: admin);
+
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
+    await tester.pumpAndSettle();
+
+    final Finder update = find.byKey(const Key('plugin-detail-update-demo'));
+    expect(update, findsOneWidget, reason: '仓库里有新版 ⇒ 详情页给「更新」');
+    await tester.tap(update);
+    await tester.pumpAndSettle();
+    expect(
+      admin.calls,
+      contains('release-install:demo:with-deps'),
+      reason: '更新也要补依赖（否则升完可能起不来）',
+    );
+  });
+
   testWidgets('自定义插件详情页不渲染发布仓库区块（那是内置项缺成品的入口）', (
     WidgetTester tester,
   ) async {
@@ -1035,11 +1200,10 @@ void main() {
       findsOneWidget,
       reason: '详情页显示在 DetailPanel 里（C：不再 Navigator.push）',
     );
-    // 管理按钮区：插件 = 启用/停用 · 重启 · 热重启 · 编辑 · 卸载
+    // 管理按钮区：插件 = 启用/停用 · 热重启 · 编辑 · 卸载（普通重启已撤掉）
     final Finder detail = find.byType(PluginDetailPage);
     for (final String key in <String>[
       'plugin-detail-toggle-demo',
-      'plugin-detail-restart-demo',
       'plugin-detail-hot-restart-demo',
       'plugin-detail-edit-demo',
       'plugin-detail-uninstall-demo',
@@ -1050,6 +1214,14 @@ void main() {
         reason: '详情页要有 $key',
       );
     }
+    expect(
+      find.descendant(
+        of: detail,
+        matching: find.byKey(const Key('plugin-detail-restart-demo')),
+      ),
+      findsNothing,
+      reason: '普通重启不再给按钮（关掉再打开开关即可）',
+    );
 
     // 关闭（注入态没有路由可返回，只能显式 ×）：清空注入、DetailPanel 回到空态
     await tester.tap(find.byKey(const Key('plugin-detail-close')));
@@ -1059,7 +1231,7 @@ void main() {
     expect(find.text('点中栏的工具调用或思考'), findsOneWidget);
   });
 
-  testWidgets('管理按钮：停用发 PATCH enabled、重启与热重启各发各的 mode', (
+  testWidgets('管理按钮：热重启发 mode=hot，停用后只剩「启用」', (
     WidgetTester tester,
   ) async {
     final _FakeAdmin admin = _FakeAdmin(
@@ -1069,6 +1241,18 @@ void main() {
     await _showTab(tester, 'plugin-tab-installed');
     await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
     await tester.pumpAndSettle();
+
+    // demo 没声明 suspension: keep ⇒ 按钮如实写「冷启动」，不先承诺保留状态
+    expect(
+      find.descendant(
+        of: find.byType(PluginDetailPage),
+        matching: find.text('重启（冷启动）'),
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.byKey(const Key('plugin-detail-hot-restart-demo')));
+    await tester.pumpAndSettle();
+    expect(admin.calls, contains('restart:demo:hot'));
 
     // 自定义项（当前已启用）：点「停用」⇒ updateConfig(id, enabled:false)
     expect(
@@ -1086,13 +1270,43 @@ void main() {
     await tester.pumpAndSettle();
     expect(admin.calls, contains('update:demo:off'));
 
-    await tester.tap(find.byKey(const Key('plugin-detail-restart-demo')));
-    await tester.pumpAndSettle();
-    expect(admin.calls, contains('restart:demo:cold'));
+    // 停用态不摆热重启：点它核心会先把 enabled 写成 true 再拉起（等于偷偷启用）
+    expect(
+      find.byKey(const Key('plugin-detail-hot-restart-demo')),
+      findsNothing,
+      reason: '停用态点热重启会把条目悄悄启用（核心 restart 先写 enabled:true）',
+    );
+    expect(
+      tester
+          .widget<Text>(
+            find.descendant(
+              of: find.byKey(const Key('plugin-detail-toggle-demo')),
+              matching: find.byType(Text),
+            ),
+          )
+          .data,
+      '启用',
+    );
+  });
 
-    await tester.tap(find.byKey(const Key('plugin-detail-hot-restart-demo')));
+  testWidgets('声明了 suspension: keep ⇒ 按钮写明「热重启（保留状态）」', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin(
+      stationResponses: <String, Map<String, dynamic>>{},
+    )..configsResponse = _FakeAdmin._configs(demoSuspension: 'keep');
+    await _pump(tester, svc: await _service(), admin: admin);
+    await _showTab(tester, 'plugin-tab-installed');
+    await tester.tap(find.byKey(const Key('plugin-detail-custom-demo')));
     await tester.pumpAndSettle();
-    expect(admin.calls, contains('restart:demo:hot'));
+
+    expect(
+      find.descendant(
+        of: find.byType(PluginDetailPage),
+        matching: find.text('热重启（保留状态）'),
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets('内置项装进来后与自定义同一条命：开关走 PATCH（不再打内置专属端点）', (

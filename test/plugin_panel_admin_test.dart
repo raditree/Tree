@@ -280,8 +280,12 @@ class _FakeAdmin implements PluginAdminClient {
   }
 
   @override
-  Future<Map<String, dynamic>> installRelease(String id) async {
-    calls.add('release:install:$id');
+  Future<Map<String, dynamic>> installRelease(
+    String id, {
+    bool withDependencies = false,
+  }) async {
+    // 「安装」与「自动安装」要能分得清：带了依赖补齐就多记一段。
+    calls.add('release:install:$id${withDependencies ? ':with-deps' : ''}');
     if (failWrite.isNotEmpty) throw Exception(failWrite);
     return installResponse;
   }
@@ -414,18 +418,35 @@ void main() {
       reason: '内置项（从仓库装的）未启用',
     );
     expect(tester.widget<Switch>(customSwitch).value, isTrue);
-    // 内置项走**普通条目**那一套按钮：编辑 / 删除 / 重启都在，没有"停用并隐藏"那套
-    expect(find.byKey(const Key('plugin-edit-sample')), findsOneWidget);
-    expect(find.byKey(const Key('plugin-delete-sample')), findsOneWidget);
-    expect(find.byKey(const Key('plugin-restart-sample')), findsOneWidget);
-    expect(find.textContaining('删除 = 停用并隐藏'), findsNothing);
-    // 自定义项有 编辑 / 删除 / 重启
-    expect(find.byKey(const Key('plugin-edit-demo')), findsOneWidget);
-    expect(find.byKey(const Key('plugin-delete-demo')), findsOneWidget);
-    expect(find.byKey(const Key('plugin-restart-demo')), findsOneWidget);
-    // 阶段 3：热重启（保留状态）与强制停止与「重启」并列，不是替掉它
+    // 卡片只留「热重启 / 启用」与开关：编辑 / 卸载 / 更新 / 补依赖都收进详情页
+    // （卡片上塞满按钮只会让人更难选，2026-11-01 用户定稿）。
+    //
+    // 停用态给**显式「启用」**而不是「热重启」：热重启会把插件拉起来，按钮本身
+    // 就该说清这件事（旧版这里只有热重启，点完“进程在跑但开关仍写着已停用”）。
+    expect(
+      find.byKey(const Key('plugin-enable-sample')),
+      findsOneWidget,
+      reason: '停用项要有明确的「启用」入口',
+    );
+    expect(find.byKey(const Key('plugin-hot-restart-sample')), findsNothing);
     expect(find.byKey(const Key('plugin-hot-restart-demo')), findsOneWidget);
-    expect(find.byKey(const Key('plugin-force-stop-demo')), findsOneWidget);
+    expect(
+      find.byKey(const Key('plugin-edit-sample')),
+      findsNothing,
+      reason: '编辑已收进详情页',
+    );
+    expect(find.byKey(const Key('plugin-edit-demo')), findsNothing);
+    expect(find.byKey(const Key('plugin-delete-sample')), findsNothing);
+    expect(find.byKey(const Key('plugin-delete-demo')), findsNothing);
+    expect(find.textContaining('的「编辑」'), findsNothing);
+    expect(
+      find.textContaining('看插件介绍、依赖与管理'),
+      findsNWidgets(2),
+      reason: '卡片底部的指向句要说清重活都去哪了',
+    );
+    // 普通重启与强制停止不再给按钮：都由「启用 / 停用」开关表达，多一颗只是累赘
+    expect(find.byKey(const Key('plugin-restart-demo')), findsNothing);
+    expect(find.byKey(const Key('plugin-force-stop-demo')), findsNothing);
     // 清单真实路径与生效方式必须显示
     expect(
       find.textContaining('清单文件：C:/data/config/plugins.yaml'),
@@ -471,26 +492,16 @@ void main() {
     );
   });
 
-  testWidgets('强制停止要先确认，确认后才是 mode=force_stop（取消就什么都不发）', (WidgetTester tester) async {
-    final _FakeAdmin admin = _FakeAdmin()
-      ..writeResponse = <String, dynamic>{'ok': true, 'killed': 1};
+  testWidgets('强制停止按钮已撤掉（停用开关就是停止，不再有第二颗能 kill 的按钮）', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
     await _showTab(tester, 'plugin-tab-installed');
 
-    await tester.tap(find.byKey(const Key('plugin-force-stop-demo')));
-    await tester.pumpAndSettle();
-    expect(find.text('强制停止这个插件？'), findsOneWidget);
-    // 取消：一个写请求也不该发出去（强杀是唯一能 kill 用户进程的按钮）。
-    await tester.tap(find.text('取消'));
-    await tester.pumpAndSettle();
-    expect(admin.calls, isNot(contains('restart:demo:force_stop')));
-
-    await tester.tap(find.byKey(const Key('plugin-force-stop-demo')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('plugin-force-stop-confirm')));
-    await tester.pumpAndSettle();
-    expect(admin.calls, contains('restart:demo:force_stop'));
-    expect(find.textContaining('显式 kill'), findsOneWidget);
+    expect(find.byKey(const Key('plugin-force-stop-demo')), findsNothing);
+    expect(find.byKey(const Key('plugin-force-stop-confirm')), findsNothing);
+    expect(find.text('强制停止这个插件？'), findsNothing);
   });
 
   testWidgets('每项开关同一颗键：内置项装进来也走普通 PATCH enabled', (WidgetTester tester) async {
@@ -637,45 +648,30 @@ void main() {
     expect(body['enabled'], isTrue);
   });
 
-  testWidgets('删除要二次确认，确认后才发请求', (WidgetTester tester) async {
+  testWidgets('卡片不再有卸载 / 编辑按钮：重活都收进详情页', (WidgetTester tester) async {
     final _FakeAdmin admin = _FakeAdmin();
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
     await _showTab(tester, 'plugin-tab-installed');
 
-    await tester.tap(find.byKey(const Key('plugin-delete-demo')));
-    await tester.pumpAndSettle();
-    expect(find.text('删除插件？'), findsOneWidget);
-    expect(
-      admin.calls.where((String c) => !c.startsWith('release:')),
-      isEmpty,
-      reason: '确认之前不发写请求（release:refresh 是 B 进页面的后台索引刷新，不算）',
-    );
-
-    await tester.tap(find.byKey(const Key('plugin-delete-confirm')));
-    await tester.pumpAndSettle();
-    expect(admin.calls, contains('delete:demo'));
-  });
-
-  testWidgets('内置项删除走普通确认框：不再有“停用并隐藏”那条退路', (WidgetTester tester) async {
-    final _FakeAdmin admin = _FakeAdmin();
-    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
-    await _showTab(tester, 'plugin-tab-installed');
-
-    await tester.tap(find.byKey(const Key('plugin-delete-sample')));
-    await tester.pumpAndSettle();
-    // 普通删除确认框（不是 E 的那张「从面板隐藏这个内置插件？」）
-    expect(find.text('删除插件？'), findsOneWidget);
+    // 2026-11-01 用户定稿：卡片只做“概览 + 开关 + 热重启”，卸载 / 编辑 / 更新 /
+    // 补依赖全在详情页；内置项与自定义项同一套口径（不再有“停用并隐藏”那条退路）。
+    for (final String key in <String>[
+      'plugin-delete-demo',
+      'plugin-delete-sample',
+      'plugin-delete-confirm',
+      'plugin-edit-demo',
+      'plugin-edit-sample',
+    ]) {
+      expect(find.byKey(Key(key)), findsNothing, reason: '卡片上不该再有 $key');
+    }
+    expect(find.text('删除插件？'), findsNothing);
     expect(find.text('从面板隐藏这个内置插件？'), findsNothing);
     expect(find.textContaining('hidden_builtins'), findsNothing);
     expect(
       admin.calls.where((String c) => !c.startsWith('release:')),
       isEmpty,
-      reason: '确认之前不发写请求',
+      reason: '进页面不该发任何写请求',
     );
-
-    await tester.tap(find.byKey(const Key('plugin-delete-confirm')));
-    await tester.pumpAndSettle();
-    expect(admin.calls, contains('delete:sample'));
   });
 
   testWidgets('旧核心（清单接口不可用）：退回只读实例列表并说明原因', (WidgetTester tester) async {
@@ -747,7 +743,7 @@ void main() {
         online: false,
         tag: 'v0.0.9',
         entries: <Map<String, dynamic>>[
-          _releaseEntry(id: 'cached1', name: '缓存里那条', installed: '1.0.0'),
+          _releaseEntry(id: 'cached1', name: '缓存里那条'),
         ],
       );
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
@@ -772,7 +768,7 @@ void main() {
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
 
     // 默认 = 未安装：索引区块 + 添加自定义插件入口在，已装 / 站点内容不在
-    expect(find.text('从发布仓库更新'), findsOneWidget);
+    expect(find.text('从发布仓库安装'), findsOneWidget);
     expect(
       find.byKey(const Key('plugin-add')),
       findsOneWidget,
@@ -784,7 +780,7 @@ void main() {
     await _showTab(tester, 'plugin-tab-installed');
     expect(find.text('插件实例（2）'), findsOneWidget);
     expect(find.text('看门狗'), findsOneWidget);
-    expect(find.text('从发布仓库更新'), findsNothing);
+    expect(find.text('从发布仓库安装'), findsNothing);
 
     await _showTab(tester, 'plugin-tab-stations');
     expect(find.text('站点（已建 0/4 类）'), findsOneWidget);
@@ -836,7 +832,7 @@ void main() {
 
     expect(admin.calls, contains('release:refresh'));
     expect(find.text('发布版演示插件'), findsOneWidget);
-    expect(find.textContaining('发布 1.2.0 · 本机未装'), findsOneWidget);
+    expect(find.textContaining('发布 1.2.0'), findsOneWidget);
     expect(find.textContaining('刚拉的索引（release v0.1.0）'), findsOneWidget);
     expect(
       find.textContaining('跳过：bad：version'),
@@ -862,6 +858,54 @@ void main() {
       find.text('已从发布仓库安装 demo2（1.2.0）'),
       findsOneWidget,
       reason: '装了哪一版要说出来，只说“成功”等于没说',
+    );
+  });
+
+  testWidgets('发布仓库：未装的条目给「自动安装」，它带 with_dependencies 走核心', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[_releaseEntry()],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    // 未安装 ⇒ 两颗按钮：只装目标 / 连它声明的依赖一起补齐
+    expect(
+      find.byKey(const Key('plugin-release-auto-install-demo2')),
+      findsOneWidget,
+    );
+    await tester.tap(find.byKey(const Key('plugin-release-auto-install-demo2')));
+    await tester.pumpAndSettle();
+    expect(
+      admin.calls,
+      contains('release:install:demo2:with-deps'),
+      reason: '「自动安装」= with_dependencies:true（核心只补缺失依赖、不升级既有）',
+    );
+  });
+
+  testWidgets('发布仓库：已装的条目不在「未安装」栏重复出现（更新在详情页）', (
+    WidgetTester tester,
+  ) async {
+    final _FakeAdmin admin = _FakeAdmin()
+      ..refreshResponse = _releaseListing(
+        entries: <Map<String, dynamic>>[_releaseEntry(installed: '1.0.0')],
+      );
+    await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
+    await tester.tap(find.byKey(const Key('plugin-release-refresh')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const Key('plugin-release-install-demo2')),
+      findsNothing,
+      reason: '刚装好的条目还留在「未安装」里，看起来就像没装成功',
+    );
+    expect(
+      find.textContaining('索引里的条目都已安装'),
+      findsOneWidget,
+      reason: '不能静默空着：要说清它们去哪了（开关在「已安装」栏、更新在详情页）',
     );
   });
 
@@ -897,7 +941,7 @@ void main() {
         online: false,
         tag: 'v0.0.9',
         entries: <Map<String, dynamic>>[
-          _releaseEntry(id: 'cached1', name: '缓存里那条', installed: '1.0.0'),
+          _releaseEntry(id: 'cached1', name: '缓存里那条'),
         ],
       );
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
@@ -913,19 +957,26 @@ void main() {
     expect(find.textContaining('本地缓存（release v0.0.9，不是最新）'), findsOneWidget);
   });
 
-  testWidgets('发布仓库：已是最新时按钮禁用而不是消失', (WidgetTester tester) async {
+  testWidgets('发布仓库：已装与未装混在一起时，只列未装并告知另有几条已安装', (
+    WidgetTester tester,
+  ) async {
     final _FakeAdmin admin = _FakeAdmin()
       ..refreshResponse = _releaseListing(
         entries: <Map<String, dynamic>>[
           _releaseEntry(id: 'same', installed: '1.2.0', hasUpdate: false),
+          _releaseEntry(id: 'fresh', name: '还没装的'),
         ],
       );
     await _pumpPanel(tester, svc: await _serviceWith(), admin: admin);
     await tester.tap(find.byKey(const Key('plugin-release-refresh')));
     await tester.pumpAndSettle();
 
-    final Finder button = find.byKey(const Key('plugin-release-install-same'));
-    expect(button, findsOneWidget, reason: '隐藏会让人以为这一条不能装');
-    expect(tester.widget<TextButton>(button).onPressed, isNull);
+    expect(find.byKey(const Key('plugin-release-install-same')), findsNothing);
+    expect(
+      find.byKey(const Key('plugin-release-install-fresh')),
+      findsOneWidget,
+      reason: '未装的那条照样可装（不能因为同栏有已装条目就整段不列）',
+    );
+    expect(find.textContaining('另有 1 条已安装'), findsOneWidget);
   });
 }

@@ -62,7 +62,13 @@ abstract class PluginAdminClient {
   ///
   /// 旧进程没确认退出就**不换文件**（核心不为换文件而强杀插件），那种失败回
   /// 400 + 原因；这里抛成异常，面板直接显示那句话。
-  Future<Map<String, dynamic>> installRelease(String id);
+  ///
+  /// [withDependencies] = true 即「自动安装」：核心先按索引里的 `requires.plugins`
+  /// 补齐缺失依赖（只补缺失、不升级既有），再装目标本身。
+  Future<Map<String, dynamic>> installRelease(
+    String id, {
+    bool withDependencies = false,
+  });
 
   /// 从**本地 zip** 装一条插件：POST /api/plugin/install/local。
   ///
@@ -154,8 +160,13 @@ class ApiPluginAdminClient implements PluginAdminClient {
       ApiService.refreshPluginRelease();
 
   @override
-  Future<Map<String, dynamic>> installRelease(String id) =>
-      ApiService.installPluginRelease(id);
+  Future<Map<String, dynamic>> installRelease(
+    String id, {
+    bool withDependencies = false,
+  }) => ApiService.installPluginRelease(
+    id,
+    withDependencies: withDependencies,
+  );
 
   @override
   Future<Map<String, dynamic>> installLocal(String zipPath) =>
@@ -203,7 +214,8 @@ class ApiPluginAdminClient implements PluginAdminClient {
 /// 数据源两条，分工明确：
 /// 1. 清单（读写）——[PluginAdminClient]（默认 REST /api/plugin/configs 与
 ///    /api/plugin/builtins）：插件实例分「内置」「自定义」两组，**每一项各有自己的
-///    开关**（M9 §4.2：不是统一开关），另有 编辑 / 删除 / 重启；
+///    开关**（M9 §4.2：不是统一开关），另有 热重启；编辑 / 卸载 / 更新 / 补依赖
+///    收在详情页（卡片只留开关与热重启，不让一排按钮抢走注意力）；
 /// 2. 运行态（只读）——[PluginMonitorService]（快照 + WS 增量）：站点 / 看门狗 /
 ///    心跳健康度，以及清单接口不可用时（旧核心）的实例列表兜底。
 ///
@@ -241,6 +253,13 @@ class PluginPanel extends StatefulWidget {
   /// 插件管理接口覆盖（**测试注入用**；null = 走 REST 的 [ApiPluginAdminClient]）。
   final PluginAdminClient? admin;
 
+  /// 面板当前是否可见（左栏 IndexedStack **保持挂载**，切页不重建，
+  /// 可见性只能由调用方告知）。false → true 时无条件重拉清单：面板打开
+  /// 那一刻的快照可能早已被别的写入路径改掉（2026-11-01 开关不对齐事故，
+  /// 与 WS `plugin_config_changed` 广播互为兜底——广播漏了/断连期间改的，
+  /// 重新可见这一眼也要看到真的）。
+  final bool visible;
+
   const PluginPanel({
     super.key,
     this.teamId,
@@ -248,6 +267,7 @@ class PluginPanel extends StatefulWidget {
     this.onCollapse,
     this.service,
     this.admin,
+    this.visible = true,
   });
 
   @override
@@ -324,6 +344,8 @@ class _PluginPanelState extends State<PluginPanel> {
   void initState() {
     super.initState();
     _svc.addListener(_onChanged);
+    // 清单变更广播 → 重拉（核心任一写点改了 plugins.yaml 都会推这一帧）。
+    _svc.onConfigChanged = _onConfigChanged;
     _svc.start(teamId: widget.teamId ?? '');
     _loadAdmin();
     // 发布仓库（B，覆盖阶段 5「面板打开不联网」那条定稿）：先读本地缓存，打开那
@@ -342,10 +364,18 @@ class _PluginPanelState extends State<PluginPanel> {
     if (oldWidget.teamId != widget.teamId) {
       _svc.setTeam(widget.teamId ?? '');
     }
+    // 重新可见 ⇒ 无条件重拉清单：IndexedStack 保持挂载，切页/展开不会走
+    // initState，不补这一刀，面板就会一直显示打开那一刻的旧开关状态。
+    if (widget.visible && !oldWidget.visible) {
+      _loadAdmin();
+    }
   }
 
   @override
   void dispose() {
+    if (_svc.onConfigChanged == _onConfigChanged) {
+      _svc.onConfigChanged = null;
+    }
     _svc.removeListener(_onChanged);
     _svc.stop();
     super.dispose();
@@ -354,6 +384,13 @@ class _PluginPanelState extends State<PluginPanel> {
   void _onChanged() {
     if (mounted) {
       setState(() {});
+    }
+  }
+
+  /// WS `plugin_config_changed` 到达：重拉清单（开关、内置目录、运行态一起刷新）。
+  void _onConfigChanged(Map<String, dynamic> change) {
+    if (mounted) {
+      _loadAdmin();
     }
   }
 
@@ -465,19 +502,22 @@ class _PluginPanelState extends State<PluginPanel> {
 
   /// 装一条（含写盘 + 热应用）：走 [_submit] ⇒ 提交期间禁用该项、结果如实显示、
   /// 之后重拉清单与快照（新装的那一条应该立刻出现在「已安装」栏里）。
-  Future<void> _installRelease(String id) => _submit(
-    id,
-    () => _admin.installRelease(id),
-    successFrom: (Map<String, dynamic> result) {
-      final Object? install = result['install'];
-      final String version = install is Map
-          ? (install['version'] ?? '').toString()
-          : '';
-      return version.isEmpty
-          ? '已从发布仓库安装 $id'
-          : '已从发布仓库安装 $id（$version）';
-    },
-  );
+  ///
+  /// [withDependencies] = true 是「自动安装」：核心先补齐缺失依赖再装目标。
+  Future<void> _installRelease(String id, {bool withDependencies = false}) =>
+      _submit(
+        id,
+        () => _admin.installRelease(id, withDependencies: withDependencies),
+        successFrom: (Map<String, dynamic> result) {
+          final Object? install = result['install'];
+          final String version = install is Map
+              ? (install['version'] ?? '').toString()
+              : '';
+          return version.isEmpty
+              ? '已从发布仓库安装 $id'
+              : '已从发布仓库安装 $id（$version）';
+        },
+      );
 
   /// 从**本地 zip** 装一条（离线 / 内网环境用）。
   ///
@@ -778,8 +818,12 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  Future<void> _restart(String id) =>
-      _submit(id, () => _admin.restartConfig(id), successText: '已重启插件 $id');
+  /// 热重启的两种真面目：声明了 `suspension: keep` 才续得上；没声明时核心
+  /// 按冷启动（D3），按钮上就不该写「保留状态」。
+  String _hotRestartLabel(Map<String, dynamic> entry) =>
+      (entry['suspension'] ?? '').toString() == 'keep'
+      ? '热重启（保留状态）'
+      : '重启（冷启动）';
 
   /// 热重启（保留状态）：文案跟着回包的 `resumed` 走 —— “换了一世”与“续上了”是两件事。
   ///
@@ -793,98 +837,6 @@ class _PluginPanelState extends State<PluginPanel> {
         : '已重启插件 $id，但按冷启动（目标没声明 suspension: keep 或没递快照）'
               '：这不是失败，但状态确实没续上',
   );
-
-  /// 强制停止：**用户显式动作**，全框架唯一能因界面按钮而 `kill()` 的入口（D8）。
-  ///
-  /// 所以上面有确认对话框；而看门狗 / 心跳 / “跑得太久”都不得走到这里。
-  Future<void> _forceStop(String id) async {
-    final ColorScheme cs = Theme.of(context).colorScheme;
-    final bool? confirmed = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: const Text('强制停止这个插件？'),
-        content: Text(
-          '先按优雅路径要求它退出；它没走完时会被显式 kill。\n'
-          '站点订阅、工具表与 UI 槽位会一并收掉。\n'
-          '注意：条目仍是启用时，下一次对账会把它再拉起来 —— 想不再跑请关掉开关。',
-          style: const TextStyle(fontSize: 12),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            key: const Key('plugin-force-stop-confirm'),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            style: FilledButton.styleFrom(backgroundColor: cs.error),
-            child: const Text('强制停止'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await _submit(
-      id,
-      () => _admin.restartConfig(id, mode: 'force_stop'),
-      successFrom: (Map<String, dynamic> result) =>
-          (result['killed'] as num? ?? 0).toInt() > 0
-              ? '已强制停止插件 $id（显式 kill；原因已记进日志）'
-              : '已停止插件 $id（它自己走完了，没需要强杀）',
-    );
-  }
-
-  /// 卡片的两个新动作（热重启 / 强制停止），放在既有按钮行**下面一行**。
-  ///
-  /// 为什么不挤进原来那行：五个 TextButton 在右栏那个宽度上会直接 RenderFlex 溢出
-  /// （而溢出在 widget 测试里是以异常计数的，不是一个“看得到但拖一下”的小问题）；
-  /// 用 [Wrap] 单独一行既能自适应也不丢可读性。
-  List<Widget> _lifecycleActions(String id) {
-    final ColorScheme cs = Theme.of(context).colorScheme;
-    return <Widget>[
-      TextButton(
-        key: Key('plugin-hot-restart-$id'),
-        onPressed: _busy.contains(id) ? null : () => _hotRestart(id),
-        child: const Text('热重启（保留状态）', style: TextStyle(fontSize: 12)),
-      ),
-      TextButton(
-        key: Key('plugin-force-stop-$id'),
-        onPressed: _busy.contains(id) ? null : () => _forceStop(id),
-        child: Text(
-          '强制停止',
-          style: TextStyle(fontSize: 12, color: cs.error),
-        ),
-      ),
-    ];
-  }
-
-  Future<void> _delete(Map<String, dynamic> entry) async {
-    final String id = (entry['id'] ?? '').toString();
-    final bool? confirmed = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext ctx) => AlertDialog(
-        title: const Text('删除插件？'),
-        content: Text(
-          '将从 plugins.yaml 里删除「$id」（条目与开关一并消失）。'
-          '删除后需要重启核心才会断开正在运行的实例。',
-          style: const TextStyle(fontSize: 12),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            key: const Key('plugin-delete-confirm'),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await _submit(id, () => _admin.deleteConfig(id), successText: '已删除插件 $id');
-  }
 
   /// 添加 / 编辑弹窗（内置插件也能编辑；id 不可改）。
   Future<void> _openEditor({
@@ -1083,12 +1035,13 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 「未安装」栏（默认）：发布索引条目 + 添加自定义插件入口，按名字 / id 可检索。
+  /// 「未安装」栏（默认）：**只列还没装的**发布索引条目 + 添加自定义插件入口。
+  ///
+  /// 已装的条目不出现在这里：它们归「已安装」栏（开关 / 热重启，更新在详情页）。
+  /// 两栏都列一遍的话，用户在「未安装」里看到自己刚装好的插件会以为没装成功。
   List<Widget> _uninstalledTab(ColorScheme cs) => <Widget>[
     _buildSearchField(cs),
-    // 区块名沿用「从发布仓库更新」不改口径：索引里既有没装过的（装它）也有装过的
-    // （更新它），使用说明.txt 按这个名字指路。
-    _sectionTitle(cs, '从发布仓库更新'),
+    _sectionTitle(cs, '从发布仓库安装'),
     _buildReleaseSection(cs),
     const SizedBox(height: 12),
     _tappable(
@@ -1276,14 +1229,13 @@ class _PluginPanelState extends State<PluginPanel> {
   }
 
   /// 已安装插件卡片——**内置与自定义同一条命**（2026-10-18 用户定稿）：
-  /// 内置项装进来后就是一条普通条目，这张卡不再分岔；只在编辑时按 id 补一份内置
-  /// 清单（`spec` / `isBuiltin`），让编辑器仍能显示内置默认值。
+  /// 内置项装进来后就是一条普通条目，这张卡不再分岔；它是"概览 + 开关"，
+  /// 编辑 / 卸载 / 更新 / 补依赖都在详情页里（卡片只留「热重启」与开关）。
   Widget _configCard(ColorScheme cs, Map<String, dynamic> entry) {
     final String id = (entry['id'] ?? '').toString();
     final String name = (entry['name'] ?? '').toString();
     final bool enabled = entry['enabled'] != false;
     final Map<String, dynamic> runtime = _runtimeOf(id);
-    final Map<String, dynamic>? spec = _builtinItemOf(id);
     final List<String> args = <String>[
       for (final Object? a in (entry['args'] as List<dynamic>? ?? <dynamic>[]))
         a.toString(),
@@ -1361,38 +1313,35 @@ class _PluginPanelState extends State<PluginPanel> {
               '心跳降级：${runtime['reason']}（插件仍注册运行，非停用）',
               style: const TextStyle(fontSize: 11, color: Colors.orange),
             ),
-          Row(
+          // 已安装卡片只给「启用 / 停用」开关与「热重启」；编辑、卸载、更新、
+          // 补依赖这些"重活"都收在详情页里（卡片上塞满按钮只会更难选）。
+          //
+          // 停用态给一颗**显式「启用」**：只有开关时，用户看到「已停用」会以为
+          // 这一条已经没法操作了（旧版这里还并排摆着「热重启」，那会拉起进程却
+          // 不改 enabled，状态继续停在「已停用」——自相矛盾，见核心侧修复）。
+          Wrap(
+            spacing: 4,
             children: <Widget>[
-              TextButton(
-                key: Key('plugin-edit-$id'),
-                onPressed: _busy.contains(id)
-                    ? null
-                    : () => _openEditor(
-                        entry: entry,
-                        spec: spec,
-                        isBuiltin: spec != null,
-                      ),
-                child: const Text('编辑', style: TextStyle(fontSize: 12)),
-              ),
-              TextButton(
-                key: Key('plugin-restart-$id'),
-                onPressed: _busy.contains(id) ? null : () => _restart(id),
-                child: const Text('重启', style: TextStyle(fontSize: 12)),
-              ),
-              TextButton(
-                key: Key('plugin-delete-$id'),
-                onPressed: _busy.contains(id) ? null : () => _delete(entry),
-                child: Text(
-                  '删除',
-                  style: TextStyle(fontSize: 12, color: cs.error),
+              if (!enabled)
+                TextButton(
+                  key: Key('plugin-enable-$id'),
+                  onPressed: _busy.contains(id)
+                      ? null
+                      : () => _toggleCustom(entry, true),
+                  child: const Text('启用', style: TextStyle(fontSize: 12)),
+                )
+              else
+                TextButton(
+                  key: Key('plugin-hot-restart-$id'),
+                  onPressed: _busy.contains(id) ? null : () => _hotRestart(id),
+                  child: Text(
+                    _hotRestartLabel(entry),
+                    style: const TextStyle(fontSize: 12),
+                  ),
                 ),
-              ),
             ],
           ),
-          // 热重启 / 强制停止（阶段 3）：与「重启」并列而不是替掉它 ——
-          // 三件事对用户的差别是“会不会丢状态”与“是不是必须立即停下”。
-          Wrap(spacing: 4, children: _lifecycleActions(id)),
-          _detailAffordance(cs, '看插件介绍与工具'),
+          _detailAffordance(cs, '看插件介绍、依赖与管理'),
         ],
       ),
     );
@@ -1411,7 +1360,7 @@ class _PluginPanelState extends State<PluginPanel> {
   ///
   /// known=false 表示这条配置**还没被总线对账过**（例如刚写盘、或在旧核心上）。
   /// 热应用（applyConfigs）落地后这种情况不再出现：写入即对账，所以这里
-  /// 提示用户"可点重启或看原因"，而不是断言一定要重启核心。
+  /// 提示用户"可点「热重启」或看原因"，而不是断言一定要重启核心。
   ///
   /// **阶段看 `lifecycle`**（阶段 2 新增的第三个轴）：重启中 / 已挂起都不能说成
   /// “未运行”——前者是安排内的一世交替（站点请求由核心有界暂存后重放），后者是
@@ -1429,8 +1378,8 @@ class _PluginPanelState extends State<PluginPanel> {
     if (runtime['running'] == true) {
       return runtime['health'] == 'degraded' ? '状态：运行中（心跳降级，仍注册）' : '状态：运行中';
     }
-    if (runtime['known'] == true) return '状态：已启用但未运行（可点「重启」）';
-    return '状态：已启用但未运行（可点「重启」，或看上方原因）';
+    if (runtime['known'] == true) return '状态：已启用但未运行（可点「热重启」）';
+    return '状态：已启用但未运行（可点「热重启」，或看上方原因）';
   }
 
   /// 运行态颜色（与 [_runtimeText] 同一判据顺序，否则文字说“重启中”而颜色说“没跑”）。
@@ -1555,9 +1504,22 @@ class _PluginPanelState extends State<PluginPanel> {
               : '本地缓存（release $_releaseTag，不是最新）');
     // 检索只过滤**条目行**：来源行、失败原因、索引路径、skipped 都是“这份索引
     // 自己怎么了”的诊断，跟找不找得到某一条无关，不跟着消失。
+    //
+    // 已安装的条目**这一栏不列**（它们归「已安装」栏）：否则“刚装完它还在未安装
+    // 里”看起来就像没装成功。
     final List<Map<String, dynamic>> visible = _releaseEntries
-        .where(_matchesSearch)
+        .where(
+          (Map<String, dynamic> entry) =>
+              _matchesSearch(entry) &&
+              (entry['installed_version'] ?? '').toString().isEmpty,
+        )
         .toList(growable: false);
+    final int installedHidden = _releaseEntries
+        .where(
+          (Map<String, dynamic> entry) =>
+              (entry['installed_version'] ?? '').toString().isNotEmpty,
+        )
+        .length;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -1611,9 +1573,21 @@ class _PluginPanelState extends State<PluginPanel> {
             cs,
             '没有匹配「${_searchQuery.trim()}」的条目（按名字 / id 检索）',
           )
+        else if (visible.isEmpty)
+          _emptyHint(
+            cs,
+            installedHidden > 0
+                ? '索引里的条目都已安装：开关与热重启在「已安装」栏，更新在插件详情页。'
+                : '索引里没有待安装的条目。',
+          )
         else
           for (final Map<String, dynamic> entry in visible)
             _releaseRow(cs, entry),
+        if (installedHidden > 0 && visible.isNotEmpty)
+          Text(
+            '另有 $installedHidden 条已安装：开关与热重启在「已安装」栏，更新在插件详情页。',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
         if (_releaseSkipped.isNotEmpty) ...<Widget>[
           const SizedBox(height: 4),
           for (final String line in _releaseSkipped)
@@ -1626,65 +1600,67 @@ class _PluginPanelState extends State<PluginPanel> {
     );
   }
 
-  /// 一条发布条目（名字 + 版本对比 + 装它那颗按钮）。
+  /// 一条**待安装**的发布条目（名字 + 版本 + 装它那颗按钮）。
   ///
-  /// “已是最新”时按钮**禁用而不是隐藏**：隐藏会让人以为这一条不能装，而它其实
-  /// 只是没必要再装一次。提交期间该条目禁用（连点会叠出两次放置）。
+  /// 这一栏只列还没装的条目（[_buildReleaseSection] 已按 `installed_version`
+  /// 过滤），所以这里恒为「安装」语义：已装条目的开关在「已安装」栏、更新在
+  /// 插件详情页，不在这里再出现一次（否则会看起来像"没装成功"）。
+  ///
+  /// 卡片必须 `width: double.infinity`：它挂在 `Column(crossAxisAlignment:
+  /// start)` 下，不给宽度时整张卡按内容收缩成一条窄柱、右侧留一大片空白。
   Widget _releaseRow(ColorScheme cs, Map<String, dynamic> entry) {
     final String id = (entry['plugin_id'] ?? '').toString();
     final String name = (entry['name'] ?? '').toString();
     final String version = (entry['version'] ?? '').toString();
-    final String installed = (entry['installed_version'] ?? '').toString();
-    final bool hasUpdate = entry['has_update'] == true;
     final String title = name.isEmpty ? id : name;
     final bool busy = _busy.contains(id);
     return Container(
+      width: double.infinity,
       margin: const EdgeInsets.only(top: 6),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         border: Border.all(color: Theme.of(context).dividerColor),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  title,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                if (title != id)
-                  Text(
-                    id,
-                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-                  ),
-                Text(
-                  installed.isEmpty
-                      ? '发布 $version · 本机未装'
-                      : '发布 $version · 本机 $installed',
-                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-                ),
-              ],
-            ),
+          Text(
+            title,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
           ),
-          if (!hasUpdate && installed.isNotEmpty) _pill(cs, '已是最新'),
-          const SizedBox(width: 6),
-          TextButton(
-            key: Key('plugin-release-install-$id'),
-            onPressed: hasUpdate && !busy ? () => _installRelease(id) : null,
-            child: Text(
-              busy
-                  ? '安装中…'
-                  : (installed.isEmpty
-                        ? '安装'
-                        : (hasUpdate ? '更新' : '已是最新')),
-            ),
+          if (title != id)
+            Text(id, style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+          Text(
+            '发布 $version',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
+          // 「安装」= 只装目标本身；「自动安装」= 连它声明依赖一起补齐。
+          // 两者都保留：内网 / 想自己控制装哪些依赖的人不该被"自动"绑架。
+          Wrap(
+            spacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: <Widget>[
+              TextButton(
+                key: Key('plugin-release-install-$id'),
+                onPressed: busy ? null : () => _installRelease(id),
+                child: Text(
+                  busy ? '安装中…' : '安装',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+              TextButton(
+                key: Key('plugin-release-auto-install-$id'),
+                onPressed: busy
+                    ? null
+                    : () => _installRelease(id, withDependencies: true),
+                child: Text(
+                  busy ? '安装中…' : '自动安装',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
           ),
         ],
       ),

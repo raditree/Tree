@@ -452,6 +452,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   int _todoRefreshTrigger = 0;
   int _toolRunsRefreshTrigger = 0;
 
+  /// agent 列表退避重试的待触发计时器（dispose 时取消，避免页面销毁后仍挂着定时器）。
+  Timer? _agentsRetryTimer;
+
   /// 活动栏里「插件管理」的位置（引导第 5 步）。
   static const int _pluginPanelIndex = 1;
 
@@ -470,6 +473,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _agentsRetryTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     DetailSelection.instance.removeListener(_onDetailSelected);
     WorkspaceRefreshService.instance.removeListener(_onWorkspaceChanged);
@@ -519,19 +523,43 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   }
 
   /// 从后端加载已持久化的 agent 列表
-  Future<void> _loadAgents() async {
+  ///
+  /// **启动期竞态**：UI 插件连上核心往往比领域插件就绪早一步（`GET /api/agents` 的
+  /// 归属是 tree.agent，它经收集站申报路由要晚将近 1 秒）。第一次请求撞上"路由还
+  /// 没有"就会停在空列表——用户看到的是「重启后 agent 全没了」，数据其实好好躺在
+  /// `agents/` 里。所以失败时按退避重试几次，成功即停；请求成功但确实是空列表是
+  /// 正常结果（新装环境没有 agent），不重试。
+  ///
+  /// 重试用 [Timer] 而不是 `Future.delayed`：页面销毁时前者能在 [dispose] 里取消，
+  /// 后者会在组件树拆掉之后仍挂着，测试里直接报 "A Timer is still pending"。
+  void _loadAgents({int retries = 5}) {
+    unawaited(_attemptLoadAgents(0, retries));
+  }
+
+  Future<void> _attemptLoadAgents(int attempt, int retries) async {
     try {
       final List<Agent> agents = await ApiService.getAgents();
       if (!mounted) return;
       setState(() {
         _agents = agents;
       });
+      return;
     } catch (e) {
-      // 加载失败保留空列表，用户仍可尝试创建
-      if (mounted) {
+      if (!mounted) return;
+      if (attempt >= retries) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('加载 Agent 列表失败: $e')));
+        return;
       }
+      // 200ms → 400ms → … 退避；插件就绪通常在 1~2 秒内。
+      _agentsRetryTimer?.cancel();
+      _agentsRetryTimer = Timer(
+        Duration(milliseconds: 200 * (attempt + 1)),
+        () {
+          _agentsRetryTimer = null;
+          if (mounted) _attemptLoadAgents(attempt + 1, retries);
+        },
+      );
     }
   }
 
@@ -1513,6 +1541,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           // 站点/槽位都以**团队**为单位：成员要回指团队，否则面板会被过滤成「站点（0）」
           teamId: _selectedAgent?.teamScopeId,
           showHeader: false,
+          // IndexedStack 保持挂载：把"现在轮到这个面板露脸"告诉它，
+          // 重新可见时它会重拉插件清单（开关显示不停留在旧快照）。
+          visible: _leftPanel == _pluginPanelIndex && !_leftCollapsed,
           onCollapse: () {
             setState(() {
               _leftCollapsed = true;
