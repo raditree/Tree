@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/agent.dart';
@@ -1267,16 +1269,17 @@ class _TeammateDetailPageState extends State<TeammateDetailPage> {
   bool get _memberWorking =>
       _working || (_member['live_status'] as String?) == 'working';
 
-  /// 让这个成员停下当前这一轮（与中栏标题栏原来那颗停止键同一帧：`stop` +
-  /// agent_id/session_id）。成员面板因此可以顺手暂停 teammates（用户 2026-10-04）。
+  /// 让这个成员停下当前这一轮（A5 起 WS `stop` 已被核心移除：走委派端点
+  /// `POST /api/agents/{agentId}/cancel`，tree.agent 承接）。成员面板因此可以
+  /// 顺手暂停 teammates（用户 2026-10-04）。
   void _stopMember() {
-    _webSocket.send(<String, dynamic>{
-      'type': 'stop',
-      'data': <String, dynamic>{
-        'agent_id': widget.memberId,
-        'session_id': widget.sessionId,
-      },
-    });
+    unawaited(() async {
+      try {
+        await ApiService.cancelAgent(widget.memberId);
+      } catch (error) {
+        debugPrint('[teammates] 停止成员失败（${widget.memberId}）：$error');
+      }
+    }());
   }
 
   Widget _buildMessageInput() {

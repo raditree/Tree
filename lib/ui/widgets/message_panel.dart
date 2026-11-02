@@ -1316,6 +1316,17 @@ class _MessagePanelState extends State<MessagePanel> {
       return;
     }
 
+    // 核心对非法 / 已移除的上行帧会回 `error` 帧（如 A5 后的 `user_message`）。
+    // 以前这里没有分支 ⇒ 拒绝被静默吞掉，用户只看到「发出去了、没反应」。
+    if (type == 'error') {
+      final Object? payload = data['data'];
+      final String text = payload is Map
+          ? (payload['message'] ?? payload['error'] ?? '').toString()
+          : '';
+      _showSnackBar(text.isEmpty ? '核心拒绝了本次请求' : text);
+      return;
+    }
+
     // 账本会在**没有对话帧**的时刻增长：压缩那两路（内置 `compact` / 插件中转经执行站
     // `llm.call`）都是核心内部或**插件进程**发起的调用，只写 `usage.jsonl`、不发对话帧
     // ⇒ 实时行入口（[_appendCallUsage] 那条路）永远收不到它们。
@@ -1918,10 +1929,15 @@ class _MessagePanelState extends State<MessagePanel> {
     if (agent != null) {
       _ensureExecutorsReady(agent.id);
     }
-    _webSocket.send(<String, dynamic>{
-      'type': 'user_answer',
-      'data': {'question_id': messageId, 'answers': answers},
-    });
+    // A5 起 WS `user_answer` 已被核心移除（会回 error 帧）：作答走委派端点
+    // `POST /api/questions/{qid}/answer`（tree.agent 承接）。
+    unawaited(() async {
+      try {
+        await ApiService.answerQuestion(messageId, answers);
+      } catch (error) {
+        _showSnackBar('作答失败：${_errorText(error)}');
+      }
+    }());
     // 通知右栏「问题回复」页标记该问题已回复
     QuestionUpdateService.instance.notifyChanged();
   }
@@ -1933,13 +1949,16 @@ class _MessagePanelState extends State<MessagePanel> {
     // 看临时员工视角时**只停它**（用户 2026-10-04：允许用户停止 subagent 的工作）——
     // agent 级的 stop 会级联停掉它的成员/子树，那不是这里该发生的事。
     final String viewId = _effectiveViewId;
-    _webSocket.send(<String, dynamic>{
-      'type': 'stop',
-      'data': {
-        'agent_id': viewId.isEmpty ? agent.id : viewId,
-        'session_id': _currentSessionId,
-      },
-    });
+    // A5 起 WS `stop` 已被核心移除（会回 error 帧）：停下只走委派端点
+    // （tree.agent 承接）。临时员工视角只停它自己（`sub_…` 收件人 cancel
+    // 时不做团队级联），所以收件人用它的 id。
+    unawaited(() async {
+      try {
+        await ApiService.cancelAgent(viewId.isEmpty ? agent.id : viewId);
+      } catch (error) {
+        _showSnackBar('停止失败：${_errorText(error)}');
+      }
+    }());
     // 本地先把它的状态翻成空闲：帧回来之前别让那颗停止键卡在那里
     if (viewId.isNotEmpty) {
       setState(() => _workingSubagents.remove(viewId));
@@ -2013,15 +2032,32 @@ class _MessagePanelState extends State<MessagePanel> {
       _modeLocked = true;
     });
 
-    _webSocket.sendMessage(<String, dynamic>{
-      'type': 'user_message',
-      'agent_id': toSubagent ? viewId : agent.id,
-      'content': text,
-      // 工作空间相对路径（附件已由前端上传完成），核心把它写进提示词。
-      // 临时员工与发起者**共享同一个工作空间**，所以上传目标仍是这个 agent。
-      'attachments': attachments,
-      'session_id': _currentSessionId,
-    });
+    // A5 起核心只认委派端点（tree.agent 的 POST /api/agents/{id}/messages）；
+    // 仍走 WS `user_message` 会被核心回一条 error 帧
+    // （「该上行帧已随核心领域面移除」），表现就是「气泡发出去了、什么都没发生」。
+    try {
+      final Map<String, dynamic> ack = await ApiService.sendAgentMessage(
+        toSubagent ? viewId : agent.id,
+        text,
+        sessionId: _currentSessionId,
+        attachments: attachments,
+      );
+      // 新建会话：回包会带真正的 session_id（与本地默认的 session_default 不同）。
+      // 不切过去的话，历史与后续帧都还按旧会话过滤，看起来像"消息没落库"。
+      final String ackSession = (ack['session_id'] as String? ?? '').trim();
+      if (ackSession.isNotEmpty && ackSession != _currentSessionId) {
+        _pendingSessionId = ackSession;
+        unawaited(_loadSessions());
+      }
+    } catch (error) {
+      _showSnackBar('消息发送失败：${_errorText(error)}');
+      // 乐观气泡没有落库：整表作废后重拉，回到落盘的真实历史
+      if (mounted) {
+        setState(_clearWindow);
+        unawaited(_loadHistory());
+      }
+      return false;
+    }
     return true;
   }
 
