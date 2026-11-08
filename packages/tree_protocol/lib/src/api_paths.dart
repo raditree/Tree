@@ -126,8 +126,6 @@ abstract final class ApiPaths {
   static const String settingsMissedHeartbeatLimit =
       '/api/settings/missed-heartbeat-limit';
 
-  static const String settingsDataCollection = '/api/settings/data-collection';
-
   /// 插件**发布源**设置（GET 读 / POST 写）：源顺序（Gitee / GitHub）与两个令牌。
   ///
   /// 令牌**永不回显**（响应只给 `token_set` 布尔），保存后立即热应用到运行中的
@@ -337,33 +335,6 @@ abstract final class ApiPaths {
   /// `cascade=false`，其余 `cascade=true`；未知 agent ⇒ 404。
   static const String agentCancel = '/api/agents/{agentId}/cancel';
 
-  // ── 日志 / 存储（插件化新增，核心永久面）──────────────────────────────
-
-  /// 日志源枚举（GET）：`{sources:[{id, kind, size?, modified?}]}`。
-  ///
-  /// 源 id 只有两种合法形态：`core` 与 `plugin:<插件 id>`；后者只列**已配置
-  /// 或已存在日志文件**的插件（见 `docs/pluginization/ui-pluginization.md` §3.1）。
-  static const String logSources = '/api/logs/sources';
-
-  /// 单个日志源的尾部读（GET `?tail=&since=`）与清空（DELETE）。
-  ///
-  /// `since` 的口径是**行号**（1 起）：从第 `since` 行开始返回；回包 `next_since`
-  /// 是下一次继续读时应传的行号（没有新行时等于 EOF+1；若 `since` 已越过当前
-  /// EOF，例如清空后日志又从第 1 行写起，则回到 EOF+1）。`tail` 默认 200、上限
-  /// 5000；单次响应硬上限 1 MiB，超限返回最后一页并带 `truncated:true`。
-  static const String logSource = '/api/logs/{source}';
-
-  /// 某个命名空间的键列表（GET `?limit=&cursor=`）。
-  static const String storeNamespace = '/api/store/{ns}';
-
-  /// 某个键的读取（GET）/ 写入（PUT）/ 删除（DELETE）。
-  ///
-  /// 写入是二进制原样存取（核心不解析）：已存在的键必须带 `If-Match`（或
-  /// `?etag=` / `X-Tree-Etag`）做乐观锁，`*` 表示无条件覆盖；不存在的键允许
-  /// 不带 etag 创建。调用方命名空间由 `X-Tree-Plugin-Id` 头判定（缺省 = `core`），
-  /// `ns` 必须与调用方一致，否则一律 403（不泄露目标命名空间是否存在）。
-  static const String storeEntry = '/api/store/{ns}/{key}';
-
   // ── 契约与方法路由集合（L-28 起：委派不再有静态白名单）─────────────────
 
   /// 方法路由键：`METHOD /pattern`，与 `CoreRouter.routes` 的键格式逐字一致。
@@ -374,11 +345,14 @@ abstract final class ApiPaths {
   static String routeKey(String method, String pattern) =>
       '${method.toUpperCase()} $pattern';
 
-  /// **核心永久面：43 条方法路由。**
+  /// **核心永久面：35 条方法路由。**
   ///
-  /// 平台控制面 20（含 UI 多窗口 3）+ 传输设置 12（含发布源 3）+ 引导壳 3
-  /// + 发现面 1 + 日志 3 + 存储 4。只增不删：交接完成后核心 router 的键集必须**恰好等于**本集合
-  /// （见 `docs/pluginization/ui-pluginization.md` §4.1 / §4.5）。
+  /// 平台控制面 20（含 UI 多窗口 3）+ 传输设置 11（含发布源 3）+ 引导壳 3
+  /// + 发现面 1。核心 router 的键集必须**恰好等于**本集合（见
+  /// `docs/pluginization/ui-pluginization.md` §4.1 / §4.5）。
+  ///
+  /// 2026-11-08 收窄 43 → 35：删除 `store/*` 4、`logs/*` 3、`settings/data-collection`
+  /// 1（UI 与插件仓源码零调用，见 `docs/pluginization/ui-source-migration-recon.md` §2.5）。
   static const Set<String> coreOwned = <String>{
     // 平台控制面（20）：装插件的前提，也是引导页唯一依赖。
     'GET $pluginSnapshot',
@@ -402,7 +376,7 @@ abstract final class ApiPaths {
     'GET $pluginWindows',
     'POST $pluginWindows',
     'DELETE $pluginWindowsOfPlugin',
-    // 传输 / 判活设置（9）：交给插件会与传输层形成循环依赖。
+    // 传输 / 判活设置（11）：交给插件会与传输层形成循环依赖。
     'GET $settingsFrameRate',
     'POST $settingsFrameRate',
     'GET $settingsHeartbeatInterval',
@@ -411,7 +385,6 @@ abstract final class ApiPaths {
     'GET $settingsMissedHeartbeatLimit',
     'PATCH $settingsMissedHeartbeatLimit',
     'POST $settingsMissedHeartbeatLimit',
-    'POST $settingsDataCollection',
     'GET $settingsPluginReleaseSources',
     'POST $settingsPluginReleaseSources',
     'POST $settingsPluginReleaseSourcesTest',
@@ -421,18 +394,9 @@ abstract final class ApiPaths {
     'POST $bootstrapTicket',
     // 发现面（1）。
     'GET $meta',
-    // 日志 API（3）。
-    'GET $logSources',
-    'GET $logSource',
-    'DELETE $logSource',
-    // 数据存储 API（4）。
-    'GET $storeNamespace',
-    'GET $storeEntry',
-    'PUT $storeEntry',
-    'DELETE $storeEntry',
   };
 
-  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 43 条（36 + UI 多窗口 3 + 本地安装 1 + 发布源设置 3）。
+  /// A5 后迁移债台账已清零：核心 router == [coreOwned] 35 条（平台 20 + 传输设置 11 + 引导壳 3 + 发现面 1）。
   ///
   /// 历史：这里曾登记 52 条「核心仍实现、待交接」的域路由；A5 已删除核心实现，
   /// git 3 条也按用户决定从契约中删除。保留空集合只为兼容旧门禁形状；
@@ -516,7 +480,7 @@ abstract final class ApiPaths {
     'POST $fileRename',
   };
 
-  /// 契约全集（98 = [coreOwned] 43 + [delegated] 55）。
+  /// 契约全集（90 = [coreOwned] 35 + [delegated] 55）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -620,7 +584,6 @@ abstract final class ApiPaths {
     settingsTokenRate,
     settingsHeartbeatInterval,
     settingsMissedHeartbeatLimit,
-    settingsDataCollection,
     settingsPluginReleaseSources,
     settingsPluginReleaseSourcesTest,
     meta,
@@ -654,10 +617,6 @@ abstract final class ApiPaths {
     agentSubagentTranscript,
     agentMessages,
     agentCancel,
-    logSources,
-    logSource,
-    storeNamespace,
-    storeEntry,
   };
 
   /// 全部路径（保留 + 账号组）。

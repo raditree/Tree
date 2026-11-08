@@ -189,7 +189,7 @@ class CoreLogSink {
   }
 }
 
-/// 日志 API 的**源注册与尾部读**（`GET/DELETE /api/logs/...`）。
+/// 插件日志的**源注册与尾部读**（原日志 API 已于 2026-11-08 删除，保留给内部排查与测试）。
 ///
 /// 合法源只有两种：
 /// - `core` → `<数据根>/logs/core.log`（与 [CoreLogSink] 同一份）；

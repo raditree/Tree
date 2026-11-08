@@ -26,7 +26,7 @@
 | 车道 | 当前一步 | 状态 | 下一步 | 方案 |
 | --- | --- | --- | --- | --- |
 | **A UI 移仓** | MIG-UI-1 门禁先行 | 待开始 | MIG-UI-2 契约冻结 + 黑盒 | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
-| **B 核心收窄** | CORE-FACE-1 删 8 条端点 | 待开始（可立刻开） | 基线改 35/55/90/70 | 同上 §2.5 |
+| **B 核心收窄** | — | 空闲（S7 已完成） | 待新任务（S9 归车道 C） | 同上 §2.5 |
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |

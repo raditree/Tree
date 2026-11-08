@@ -10,9 +10,9 @@ import 'package:tree_protocol/tree_protocol.dart';
 /// 保留的覆盖：
 /// - 启动 / 握手 / 随机端口；
 /// - 本地 token 鉴权（HTTP + WS 升级拒绝）；
-/// - 路由覆盖度不变量：核心 router **恰好**是 [ApiPaths.coreOwned] 的 39 条；
+/// - 路由覆盖度不变量：核心 router **恰好**是 [ApiPaths.coreOwned] 的 35 条；
 /// - 未知路径一律 404（M7 起无 501 桩）；
-/// - 核心仍实现的传输设置端点（帧率 / 数据收集开关）。
+/// - 核心仍实现的传输设置端点（帧率）。
 ///
 /// 领域路由（agents / models / sessions / files / specs / todos / questions /
 /// tools-running / token-rate …）的实现已随 A5 删除，其行为测试在插件仓。
@@ -131,15 +131,15 @@ void main() {
   });
 
   group('路由覆盖度不变量', () {
-    test('核心 router 键集 == coreOwned（A5 后只有平台面 43 条）', () {
+    test('核心 router 键集 == coreOwned（只有平台面 35 条）', () {
       final Set<String> registered = server.router.routes.toSet();
       final Set<String> stubs = server.stubRouter.patterns;
       final Set<String> coreOwned = ApiPaths.coreOwned;
 
       expect(
         coreOwned.length,
-        43,
-        reason: '核心永久面 43 条（36 + UI 多窗口 3 + 本地安装 1 + 发布源设置 3）',
+        35,
+        reason: '核心永久面 35 条（平台 20 + 传输设置 11 + 引导壳 3 + 发现面 1）',
       );
       expect(
         registered,
@@ -192,7 +192,7 @@ void main() {
   });
 
   group('设置（核心永久面）', () {
-    test('帧率夹取与数据收集开关', () async {
+    test('帧率夹取', () async {
       final _Res initial = await client.send('GET', ApiPaths.settingsFrameRate);
       expect(initial.json['frame_rate'], CoreSettings.frameRateMin);
       expect(initial.json['min'], CoreSettings.frameRateMin);
@@ -204,16 +204,6 @@ void main() {
         body: <String, dynamic>{'frame_rate': 99999},
       );
       expect(set.json['frame_rate'], CoreSettings.frameRateMax);
-
-      expect(
-        (await client.send(
-          'POST',
-          ApiPaths.settingsDataCollection,
-          body: <String, dynamic>{'enabled': true},
-        )).status,
-        200,
-      );
-      expect(server.settings.dataCollectionEnabled, isTrue);
     });
   });
 }

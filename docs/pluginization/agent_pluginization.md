@@ -94,8 +94,8 @@ UI (runtime: ui) ──WS──> tree_core ──转发──> 订阅者
 | 传输 | stdio 行式 JSON-RPC（与现有插件一致） |
 | 对外 API | 36 条委派路由，由 `system.collect.api.routes` 申报 |
 | 对外事件 | 注册广播站，topic 沿用原帧名 |
-| 持久化 | 小状态走 `/api/store/tree.agent`；大对象（会话、流水）落在插件自有目录 |
-| 日志 | 写 `/api/logs/plugin:tree.agent`（沿用核心日志 API） |
+| 持久化 | 全部落在插件自有目录（核心 `/api/store` 已于 2026-11-08 删除） |
+| 日志 | 由核心 `PluginLogSink` 落盘到 `<数据根>/logs/plugins/<id>.log`（`/api/logs` 读接口已删） |
 | 生命周期 | 常驻；`suspension: keep`（热重启不丢在途生成状态） |
 
 ---
@@ -313,11 +313,11 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 | --- | --- |
 | 插件生命周期 / 看门狗 / 站点总线 | 任何领域模型（agent / session / team / model / question） |
 | WS / REST 传输与委派路由 | PTY、终端会话、子进程（除拉起插件外） |
-| 通用键值存储 `/api/store/*`、日志 `/api/logs/*` | 业务数据读写（agents.yaml、会话、用量账本） |
+| （2026-11-08 起核心不再提供通用键值存储与日志读接口） | 业务数据读写（agents.yaml、会话、用量账本）；插件持久化只写自身目录 |
 | ~~通用 workspace 租约登记~~（**片 3 撤除**：`lease_id → dir` 在 `local_executor` / `ssh_executor` 里） | 文件读 / 写 / 列目录 / 路径守卫 |
 | 认证（核心令牌、UI 附着） | 跨 team / 跨 agent 的领域授权 |
 
-> 关于「核心只 store 业务数据」：准确说是**只 store 通用数据**——键值、日志（租约已于 2026-10-31 片 3 交给执行器插件）。业务记录（agent/会话/团队/模型）在迁移后归插件自有目录，核心连格式都不认识。
+> 关于「核心只 store 业务数据」：核心已不持任何业务数据（租约已于 2026-10-31 片 3 交给执行器插件；通用键值与日志读接口于 2026-11-08 删除）。业务记录（agent/会话/团队/模型）归插件自有目录，核心连格式都不认识。
 >
 > 注意：`exec.command` / `file.*` / `terminal.*` **不在**核心站点表里——它们由 `local_executor` / `ssh_executor` 插件自建并注册，核心只在总线里转发。
 
@@ -327,7 +327,7 @@ UI（文件浏览 / 终端）──REST 委派──> core ──> 对应执行�
 
 | 名称 | 属于谁 | 存哪 / 谁注入 | 本期结论 |
 | --- | --- | --- | --- |
-| **模型供应商 API Key**（OpenAI/Anthropic 等） | agent 领域 | 插件自有配置 / `/api/store/tree.agent`；核心不持有 | 随 `tree.agent` 走，明文落盘 + 权限收紧（Windows ACL `icacls` 收紧到当前用户），不写日志 |
+| **模型供应商 API Key**（OpenAI/Anthropic 等） | agent 领域 | 插件自有配置；核心不持有 | 随 `tree.agent` 走，明文落盘 + 权限收紧（Windows ACL `icacls` 收紧到当前用户），不写日志 |
 | **落盘加密主密钥**（若启用加密） | 宿主 | **核心**在启动插件时通过 `config.env` 注入（如 `TREE_AGENT_SECRET`），或取自 OS 凭据管理器 | 本期**不做**加密；未来只允许核心注入，**不是 loader** |
 | `TREE_CORE_TOKEN` | 核心 | loader/核心注入 UI 插件，用于附着认证 | 与 agent 无关，不属于本迁移 |
 
@@ -567,7 +567,7 @@ A1–A4 期间核心与插件**双跑**（同一数据目录，核心只读、�
 | `store/tree_paths.dart` | agent 1 / team 1 / tool 1 | 路径布局 | 插件自备（改为接收 `data_dir`） |
 | `store/write_queue.dart` | agent 1 | 串行写 | 插件自备 |
 | `store/yaml_codec.dart` | mcp 1 | YAML 编解码 | 插件自备（或用 pub 依赖 `yaml`） |
-| `store/usage_log.dart` | agent 1 / llm 3 | 用量记录 | 走核心 `/api/logs`，或插件自备账本 |
+| `store/usage_log.dart` | agent 1 / llm 3 | 用量记录 | 插件自备账本（核心日志 API 已删） |
 | `util/ids.dart` | agent 3 / team 1 / llm 1 | id 生成 | 插件自备 |
 | `util/tokens.dart` | agent 2 / llm 5 | token 估算 | 插件自备 |
 | `util/liveness.dart` | team 1 / mcp 3 | 心跳判活 | 插件自备（MCP 则迁 `mcp` 插件） |

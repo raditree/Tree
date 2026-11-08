@@ -22,7 +22,7 @@
 
 1. UI 前端可安装、卸载、启停、替换，与现有插件走**同一条**分发/落盘/生命周期管道。
 2. 主题、布局、窗口内形态（主界面 / 悬浮球 / 面板）全部由 UI 插件自己决定；核心只负责**进程级窗口实例**（多窗口 = 多进程）与窗口身份（`w1`/`w2`），不解释窗口内容。
-3. 核心的 REST 面收束为 **40 条方法路由**：平台控制面 20（含 UI 多窗口 3、本地 zip 安装 1）、传输设置 9、引导壳 3、发现面 1、日志 API 3、数据存储 API 4。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（36 条移交 agent 插件）。
+3. 核心的 REST 面收束为 **35 条方法路由**：平台控制面 20（含 UI 多窗口 3、本地 zip 安装 1）、传输设置 11（含发布源设置 3）、引导壳 3、发现面 1。**核心不再保留任何 agent / 会话 / 运行监督 / 提问 / 远端链路类端点**（37 条移交 agent 插件），也不再保留日志 API 与数据存储 API（2026-11-08 删除，零调用方）。
 4. 领域端点 **15 条路径 / 18 条方法路由**（Spec 2、MCP 3、文件 13）迁给领域插件；**Git 3 条已按用户决定删除（2026-10-25）**。
 5. **agent 能力完全剥离为插件**（承接方见 [agent\_pluginization.md](agent_pluginization.md)），功能零丢失。
 6. 全部 UI 被卸载后，系统仍可恢复：由一个**不可卸载的极小引导壳**提供插件管理。
@@ -87,10 +87,6 @@
 | `/bootstrap`             | GET                | 送磁盘上的引导页 HTML（内容不冻结，可独立更新）                                                                                                           |
 | `/api/bootstrap/session` | POST               | 一次性票据兑换短时会话 token                                                                                                                    |
 | `/api/bootstrap/ticket`  | POST               | 主 token 申请引导票据（loader 用；会话 token 不可申请）                                                                                              |
-| `/api/logs/sources`      | GET                | 日志源枚举（`core`、`plugin:<id>`）                                                                                                          |
-| `/api/logs/{source}`     | GET / DELETE       | 尾部读（NDJSON，`tail`/`since`）/ 清空轮转                                                                                                     |
-| `/api/store/{ns}`        | GET                | 列键（分页）                                                                                                                               |
-| `/api/store/{ns}/{key}`  | GET / PUT / DELETE | 读写删；`PUT` 带 `etag` 乐观锁                                                                                                               |
 
 ### 3.2 WS 帧新增
 
@@ -181,12 +177,12 @@
 
 ***
 
-## 4. API 端点归属总表（终态 94 条方法路由 / 70 条路径）
+## 4. API 端点归属总表（终态 90 条方法路由 / 70 条路径）
 
 > 判据：**卸载的是能力，端点跟着能力走。** 只把端点搬走、能力仍在核心，属于纯代理，不算卸载。
-> 2026-11-01 重算：核心 40（36 + UI 多窗口 3 + 本地 zip 安装 1）+ agent 36（含 2 条新增）+ spec 2 + mcp 3 + files 13 = 94；**git 3 条已按用户决定删除**（不再属于契约）。
+> 2026-11-08 重算：核心 35（平台 20 + 传输设置 11 + 引导壳 3 + 发现面 1）+ agent 37（34 存量 + 2 新增 + 1 消息详情）+ spec 2 + mcp 3 + files 13 = 90；**git 3 条已按用户决定删除**（不再属于契约）。
 
-### 4.1 核心永久面（40 条）
+### 4.1 核心永久面（35 条）
 
 **平台控制面（20）** — 装插件的前提，也是引导页唯一依赖。
 
@@ -200,9 +196,11 @@
 | `GET /api/plugin/stations/{id}`、`PATCH .../{id}/config`、`POST .../{id}/subscribers/{key}`      | <br />                           | <br />                                                                    |
 | `GET /api/plugin/windows`（列出窗口）、`POST /api/plugin/windows`（新建窗口）、`DELETE /api/plugin/windows/{id}`（全关） | UI 多窗口：进程必须由核心拉起 | <br /> |
 
-**传输 / 判活设置（9 条方法路由）** — 交给插件会与传输层形成循环依赖。
+**传输 / 判活设置（11 条方法路由）** — 交给插件会与传输层形成循环依赖。
 
-`/api/settings/frame-rate`（GET/POST）、`/heartbeat-interval`（GET/PATCH/POST）、`/missed-heartbeat-limit`（GET/PATCH/POST）、`/data-collection`（POST）。
+`/api/settings/frame-rate`（GET/POST）、`/heartbeat-interval`（GET/PATCH/POST）、`/missed-heartbeat-limit`（GET/PATCH/POST）、`/plugin-release-sources`（GET/POST）+ `/plugin-release-sources/test`（POST）。
+
+> `/api/settings/data-collection` 已于 2026-11-08 删除（桌面单用户形态没有收集方，UI 零调用）。
 
 > `/api/settings/token-rate` **不在此列**：它是 LLM 取 token 的节奏，属 agent 领域，随 `tree.agent` 迁走（[agent_pluginization.md §4.8](agent_pluginization.md)）。
 
@@ -210,33 +208,18 @@
 
 **发现面（1，新增）** — `GET /api/meta`：核心版本、`api_version`、可用路由、站点、capability、UI 连接、`can_manage_plugins`。
 
-**日志 API（3，新增）** — 核心与插件的运行日志出口，插件不各自造日志接口。
+**日志 API（0，2026-11-08 删除）** — 原 3 条读接口（源枚举 / 尾部读 / 清空）随核心面收窄删除，UI 与插件仓源码零调用。
 
-| 端点                                     | 说明                            |
-| -------------------------------------- | ----------------------------- |
-| `GET /api/logs/sources`                | 列出可用日志源（`core`、`plugin:<id>`） |
-| `GET /api/logs/{source}?tail=N&since=` | 读尾部，NDJSON 行                  |
-| `DELETE /api/logs/{source}`            | 清空/轮转                         |
-
-**写入侧（核心，2026-10-25 补齐）**：插件日志文件此前只被测试手工种植、没有任何生产者，`/api/logs/plugin:<id>` 读不到插件自己写的东西。现在由核心的 `PluginLogSink` 统一落盘：
+**写入侧（核心，保留）**：插件日志仍由核心的 `PluginLogSink` 统一落盘到 `<数据根>/logs/plugins/<id>.log`，供人工排查：
 
 | 来源 | 行样式 | 触发 |
 | --- | --- | --- |
 | 插件 stderr | `<本地时间戳> plugin=<id> [stderr] <原始行>` | `PluginHost` 收到 stderr 的每一行 |
 | 插件 `log` 通知 | `<本地时间戳> plugin=<id> [notify:<level>] <message>` | 插件 → 核心的 `log` 通知（仍照常广播成 `plugin_event`） |
 
-口径：每个插件一份文件、write-behind 队列串行、8 MiB × 5 份轮转、失败只报一次并降级；非法插件 id 直接跳过（日志出口不能成为路径注入面）。**插件不得自建日志文件**——日志 API 是唯一出口。
+口径：每个插件一份文件、write-behind 队列串行、8 MiB × 5 份轮转、失败只报一次并降级；非法插件 id 直接跳过（日志出口不能成为路径注入面）。
 
-**数据存储 API（4，新增）** — 插件持久化的唯一公共出口，避免每个插件自带一套落盘格式。
-
-| 端点                             | 说明                    |
-| ------------------------------ | --------------------- |
-| `GET /api/store/{ns}`          | 列键（带分页）               |
-| `GET /api/store/{ns}/{key}`    | 读值                    |
-| `PUT /api/store/{ns}/{key}`    | 写值（JSON，带 `etag` 乐观锁） |
-| `DELETE /api/store/{ns}/{key}` | 删键                    |
-
-约束：`ns` 必须等于调用方 `plugin_id`（核心自身用 `core`），跨命名空间读写一律 403；单值上限 1 MB，单命名空间上限 64 MB，超限给可读错误。**核心不解释值的内容。**
+**数据存储 API（0，2026-11-08 删除）** — 原 4 条键值接口（列键 / 读 / 写 / 删）随核心面收窄删除，UI 与插件仓源码零调用；插件持久化改用自身目录。
 
 ### 4.1.1 UI 多窗口（2026-10-25 落地）
 
@@ -260,11 +243,11 @@
 - **上限与非 UI 目标**：每插件默认 8 个窗口（`PluginBus.maxUiWindowsPerPlugin`）；不是 `ui` /
   未启用 / 依赖不满足 ⇒ `POST` 回 409 并给可读原因。
 
-### 4.2 agent 面（34 条存量 + 2 条新增 = 36 条 → agent 插件，批次 F/G）
+### 4.2 agent 面（34 条存量 + 2 条新增 + 1 条消息详情 = 37 条 → agent 插件，批次 F/G）
 
 **核心不再保留其中任何一条。** 承接方：`tree.agent` 插件（见 [agent\_pluginization.md](agent_pluginization.md)）。
 
-> 2026-10-25 按 `_registerRoutes` 逐条重数：旧「23 存量 / 25 移交」是**数错的**，实际 34 存量。
+> 2026-10-25 按 `_registerRoutes` 逐条重数：旧「23 存量 / 25 移交」是**数错的**，实际 34 存量；2026-11-08 复算加上消息详情端点，共 37。
 
 | 组 | 条数 | 端点 |
 | --- | --- | --- |
@@ -272,13 +255,13 @@
 | 模型池 | 4 | `GET/POST /api/models`、`PATCH/DELETE /api/models/{id}` |
 | 团队 | 4 | `GET .../teammates`、`PATCH /api/agents/{leader}/teammate/{member}`、`GET .../teammate/{id}/log`、`POST .../teammate/{id}/message` |
 | 子 agent | 2 | `GET .../subagents`、`GET .../subagents/{sid}/transcript` |
-| 会话 / 历史 | 8 | `GET/DELETE /api/conversations/{id}`、`GET/POST .../sessions`、`GET/PATCH/DELETE .../sessions/{sid}`、`POST .../sessions/{sid}/specs` |
+| 会话 / 历史 | 9 | `GET/DELETE /api/conversations/{id}`、`GET .../messages/{mid}`、`GET/POST .../sessions`、`GET/PATCH/DELETE .../sessions/{sid}`、`POST .../sessions/{sid}/specs` |
 | 维护 | 3 | `POST .../reset`、`POST .../compact`、`POST .../ssh/reconnect` |
 | 提问 | 2 | `GET /api/questions`、`POST /api/questions/{qid}/answer` |
 | 运行监督 | 2 | `GET /api/tools/running`、`POST /api/tools/running/{handle}/close` |
 | token 节奏（领域设置） | 2 | `GET/POST /api/settings/token-rate` |
 | 上行改委派（新增） | 2 | `POST /api/agents/{id}/messages`（替代 `send_message`）、`POST /api/agents/{id}/cancel`（替代 `cancel`） |
-| **合计** | **36** | |
+| **合计** | **37** | |
 
 > `answer_question` 已有 REST 等价物，不新增。**不保留插件 → UI 的反向请求通道**：上行一律走委派端点。
 
@@ -311,24 +294,24 @@
 
 禁止用 base64 把整文件塞进一行 JSON。
 
-### 4.5 合计数（2026-10-25 按 `_registerRoutes` 实测；L-28 落地时复核）
+### 4.5 合计数（2026-11-08 按 `_registerRoutes` 实测复核）
 
 | 分类 | 路径 / 方法路由 | 归属 |
 | --- | --- | --- |
-| 核心永久面 | 29 / 40（含 UI 多窗口 3、本地 zip 安装 1） | `tree_core` |
-| agent 面 | — / 36（34 存量 + 2 新增） | `tree.agent` 插件 |
+| 核心永久面 | 26 / 35（含 UI 多窗口 3、本地 zip 安装 1） | `tree_core` |
+| agent 面 | — / 37（34 存量 + 2 新增 + 1 消息详情） | `tree.agent` 插件 |
 | 领域面 JSON | — / 5（spec 2 + mcp 3） | `spec` / `mcp` |
 | 领域面二进制 | — / 13（files） | `files` |
-| **合计** | **70 / 94** | |
+| **合计** | **70 / 90** | |
 
-> 94 条方法路由（`coreOwned` 40 + `delegated` 54）。**Git 3 条已删除**；旧「93」口径含 git，不再适用（当前 94 = 40 + 54）。
+> 90 条方法路由（`coreOwned` 35 + `delegated` 55）。**Git 3 条已删除**；旧「94」口径含日志/存储/数据收集 8 条，2026-11-08 已删（当前 90 = 35 + 55）。
 >
-> `ApiPaths.kept` 保持**路径**集合语义（72 条）：契约 94 条方法路由去重为 70 条路径，其中 `DELETE /api/files/{workspaceId}` 与 GET 共用常量（`fileDelete` 是 `files` 的别名）只列一次；另加执行器插件的 2 条终端路径（`/api/terminal/{local|ssh}/sessions`，插件申报、不在 94 条契约内）。契约的方法路由维度由下面的静态集合表达。
+> `ApiPaths.kept` 保持**路径**集合语义（70 条）：契约 90 条方法路由去重为 68 条路径，其中 `DELETE /api/files/{workspaceId}` 与 GET 共用常量（`fileDelete` 是 `files` 的别名）只列一次；另加执行器插件的 2 条终端路径（`/api/terminal/{local|ssh}/sessions`，插件申报、不在 90 条契约内）。契约的方法路由维度由下面的静态集合表达。
 
 契约新增三个**方法路由**（`METHOD /pattern`）集合：
 
-- `ApiPaths.coreOwned`（40）：核心永久面，**只增不删**。交接完成后核心 router 的键集必须**恰好等于**它。
-- `ApiPaths.delegated`（54）：契约中归插件的全部方法路由（agent 36 + spec 2 + mcp 3 + files 13）。**git 3 已删除；只作契约与验收口径，运行期不再当白名单用**（L-28）。
+- `ApiPaths.coreOwned`（35）：核心永久面，只保留平台点位（2026-11-08 删 8 条零调用端点）。核心 router 的键集必须**恰好等于**它。
+- `ApiPaths.delegated`（55）：契约中归插件的全部方法路由（agent 37 + spec 2 + mcp 3 + files 13）。**git 3 已删除；只作契约与验收口径，运行期不再当白名单用**（L-28）。
 - `ApiPaths.pendingHandoffRoutes`（0）：A5 已删完核心域实现、G1 删除 git 后清零；保留空集合只为兼容旧门禁形状，不再登记迁移债。
 
 **L-28 已决（2026-10-25）：委派去静态白名单。** 插件申报改走**命名空间规则**：
@@ -345,7 +328,7 @@
 
 门禁随之改为（`test/server_test.dart`）：
 
-1. 核心 router 键集 == `coreOwned`（40 条）；
+1. 核心 router 键集 == `coreOwned`（35 条）；
 2. `coreOwned ∩ delegated == ∅`，`pendingHandoffRoutes` 为空集；
 3. 核心 router 的路径 ⊆ `ApiPaths.kept`（前端可调用面仍在契约内）。
 
@@ -635,7 +618,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 22. **信封必带只读上下文**：`workspace_dir` / `data_dir` / `agent_id` / `team_id` 是固定字段，缺任何一个都视为契约不完整。
 23. **二进制不走 JSON 内联**：大请求用 `body_path`，大响应用 `result_path`，禁止 base64 内联。
 24. **核心不含领域概念**：收束完成后，核心代码与契约中不得出现 agent / session / question / teammate / model 的领域模型与路由；这些词只允许出现在迁移注释里。
-25. **存储命名空间隔离**：`/api/store/{ns}` 的 `ns` 必须等于调用方 `plugin_id`，跨命名空间一律 403；核心不解释值内容。
+25. **存储 API 已退场**：原 `/api/store/{ns}` 的命名空间隔离规则随 2026-11-08 删除一并退场；插件持久化只写自身目录，核心不再提供公共键值存储。
 26. **领域帧所有权归插件**：核心只按 topic 转发 `station_delivery`，不解释 payload、不维护领域帧的白名单。
 27. **迁移期功能零丢失**：任一领域端点/帧在插件侧未验收通过前，核心侧实现不得删除；删除与交接必须在同一批次内完成。
 28. **UI 功能调用一律 REST（无例外）**：一次性动作、查询**以及终端输入**都走委派端点；终端输出不是"调用"，由执行器插件经广播站单向下推。**不新增任何流式上行帧**（2026-10-25 定案）。
@@ -687,7 +670,7 @@ UI 插件可申报图标，核心通过内置点位 `system.collect.ui.branding`
 
 | 层           | 用例                                                                                      |
 | ----------- | --------------------------------------------------------------------------------------- |
-| 协议          | 契约集合自检（`coreOwned` 40 / `delegated` 54 / `pendingHandoffRoutes` 0、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀拒收、核心已实现同键标 shadowed）、新帧名登记、`api/delegate` 计数基线 |
+| 协议          | 契约集合自检（`coreOwned` 35 / `delegated` 55 / `pendingHandoffRoutes` 0、互不重叠）、委派命名空间规则（自由 `/api/x` 可申报、保留前缀拒收、核心已实现同键标 shadowed）、新帧名登记、`api/delegate` 计数基线 |
 | 核心 · 站点 WS  | 订广播投递、越界订阅拒绝、`ui.hello` 身份不符拒绝、空 scope 通配、`topics[]` 过滤生效                               |
 | 核心 · UI 自建站 | 可注册广播；注册收集/中转/执行被拒；同 id 不同配置拒收；关一个窗口不销毁站点；最后连接断开注销并广播 `closed`；自环投递带 `origin_plugin_id` |
 | 核心 · UI 多窗口 | 同插件开第二个窗口（w1/w2 两个 pid、快照 `windows=2`、`TREE_UI_WINDOW_ID` 注入）；关一个窗口插件仍在线且不发 `closed`；最后一个窗口才下线；多个 UI 插件并存互不影响；窗口上限 / 非 UI 目标 409 |
