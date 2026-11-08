@@ -36,7 +36,8 @@ void main() {
       'packages/tree_local_exec/README.md',
       'packages/tree_core/README.md',
       'packages/tree_core_cli/README.md',
-      'lib/README.md',
+      // UI 源码已迁入插件仓（S2/S3）：README 跟着搬，门禁跨仓检查同一套约定。
+      'plugins/tree.ui.default/lib/README.md',
     ];
     for (final String rel in modules) {
       final File file = File('$repo/$rel');
@@ -166,8 +167,19 @@ void main() {
             // 路径里有裸 % —— 原样拿去解析，失败自然会被下面报出来。
           }
           final String resolved = resolveRelative(base, decoded);
+          // UI 源码（lib/test/windows/assets）已迁入插件仓（S3）：历史文档（尤其
+          // CHANGELOG）里的这些链接指向迁移前的家。只要插件仓那份还在，就认可它有
+          // 出处——不静默放行已经彻底丢失的路径，也不强求改写历史记录。
+          final bool uiOwned = const <String>['lib/', 'test/', 'windows/', 'assets/']
+              .any(resolved.startsWith);
+          final bool movedUiFile = uiOwned &&
+              (File('$repo/plugins/tree.ui.default/$resolved').existsSync() ||
+                  Directory('$repo/plugins/tree.ui.default/$resolved')
+                      .existsSync());
           expect(
-            File('$repo/$resolved').existsSync() || Directory('$repo/$resolved').existsSync(),
+            File('$repo/$resolved').existsSync() ||
+                Directory('$repo/$resolved').existsSync() ||
+                movedUiFile,
             isTrue,
             reason: '$rel 里的链接指向不存在的路径：$target',
           );

@@ -501,22 +501,19 @@ void main() {
   });
 }
 
-/// UI 源码根（cwd = `packages/tree_core`）。迁移前是桌面仓根 `lib/`，迁移后是
-/// 插件仓 `plugins/tree.ui.default/lib/`（ui-source-migration-recon.md D7）。
+/// UI 源码根（cwd = `packages/tree_core`）：插件仓的 `plugins/tree.ui.default/lib`
+/// （S3 起桌面仓根不再有 `lib/`）。
 ///
-/// 两处都不存在就**直接失败**：静默跳过会让「前端心跳仍是 10s」这条跨仓前提
-/// 无声失效。**S3 删源时删掉回落分支，只留新路径。**
+/// 不存在就**直接失败**：静默跳过会让「前端心跳仍是 10s」这条跨仓前提无声失效。
 Directory _uiSourceRoot() {
   final Directory repoRoot = Directory('../..');
-  final Directory migrated = Directory(
+  final Directory root = Directory(
     '${repoRoot.path}/plugins/tree.ui.default/lib',
   );
-  final Directory legacy = Directory('${repoRoot.path}/lib');
-  final Directory root = migrated.existsSync() ? migrated : legacy;
   if (!root.existsSync()) {
     fail(
-      'UI 源码目录不存在（找过 ${migrated.path}、${legacy.path}）：'
-      '迁移没搬完或路径漂了——门禁不许静默降级',
+      'UI 源码目录不存在：${root.path}——'
+      '插件仓没检出到 plugins/，或迁移路径漂了（门禁不许静默降级）',
     );
   }
   return root;

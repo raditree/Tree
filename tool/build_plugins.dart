@@ -85,6 +85,17 @@ Future<void> main(List<String> args) async {
   final List<Map<String, dynamic>> indexEntries = <Map<String, dynamic>>[];
 
   for (final _PluginManifest manifest in manifests) {
+    // UI 插件是 Flutter 工程：`dart compile exe` 编不了，也有自己的打包入口。
+    // **显式跳过并指路**（不是静默跳过）：README 明写"静默跳过会让面板只剩
+    // 没得上"，这里要让人一眼看到该用哪个脚本。
+    if (manifest.runtime == 'ui') {
+      stdout.writeln(
+        '[skip] ${manifest.id} 是 UI 插件（runtime: ui），'
+        '由 tool/package_ui_plugin.dart 产出（见 docs/pluginization/'
+        'ui-source-migration-recon.md）',
+      );
+      continue;
+    }
     final String? invalid = manifest.validate(dirName: manifest.dirName);
     if (invalid != null) {
       failures.add('${manifest.id}：$invalid');

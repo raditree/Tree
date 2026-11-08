@@ -64,11 +64,23 @@ try {
     $env:TREE_INSTANCE_KEY = "dev-$($ready.port)"
 
     Write-Host "[dev] 核心就绪：$coreUrl（pid $($ready.pid)）"
-    Write-Host '[dev] 启动 UI（flutter run）...'
+    Write-Host '[dev] 启动 UI（flutter run，工作目录 = 插件仓的 tree.ui.default）...'
 
-    & flutter run -d windows `
-        "--dart-define=TREE_CORE_URL=$coreUrl" `
-        "--dart-define=TREE_CORE_TOKEN=$($ready.token)"
+    # UI 源码已迁入插件仓（桌面仓的 plugins/ 是本地挂载点）：flutter run 必须在
+    # 那个目录里跑，否则读不到它的 pubspec 与 windows/。
+    $uiDir = Join-Path $repoRoot 'plugins/tree.ui.default'
+    if (-not (Test-Path (Join-Path $uiDir 'pubspec.yaml'))) {
+        throw "[dev] 找不到 UI 工程：$uiDir（插件仓没挂到 plugins/？）"
+    }
+    Push-Location $uiDir
+    try {
+        & flutter run -d windows `
+            "--dart-define=TREE_CORE_URL=$coreUrl" `
+            "--dart-define=TREE_CORE_TOKEN=$($ready.token)"
+    }
+    finally {
+        Pop-Location
+    }
 }
 finally {
     if (-not $core.HasExited) {

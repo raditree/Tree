@@ -19,11 +19,12 @@ import 'dart:io';
 ///
 /// 选项：
 ///   --build               先跑 `flutter build windows --release`（默认用已有产物）
-///   --release-dir DIR     发行目录（默认 build/windows/x64/runner/Release）
-///   --out DIR             产物目录（默认 dist）
+///   --ui-dir DIR          UI 插件源码目录（默认 plugins/tree.ui.default）
+///   --release-dir DIR     发行目录（默认 <ui-dir>/build/windows/x64/runner/Release）
+///   --out DIR             产物目录（默认 dist，相对仓库根）
 ///   --index FILE          要合并进索引的文件（默认 build/plugins/plugin-index.json）
 ///   --no-index            只打包，不动发布索引
-///   --version x.y.z       插件版本（默认取 pubspec.yaml 的 `+` 之前部分）
+///   --version x.y.z       插件版本（默认取 UI 的 pubspec.yaml 的 `+` 之前部分）
 ///   --no-zip              只准备目录，不压缩
 ///
 /// 排除：`*.pdb`、核心 `tree_core.exe`、引导壳（`Tree.exe` / `tree_launcher.exe`）
@@ -60,24 +61,30 @@ const List<Map<String, dynamic>> kUiPluginDependencies = <Map<String, dynamic>>[
 Future<void> _package(List<String> args) async {
   final _Options options = _Options.parse(args);
   final Directory root = Directory.current;
-  final File pubspec = File(_join(root.path, 'pubspec.yaml'));
+  // UI 源码住在插件仓（桌面仓的 plugins/ 是本地挂载点），不再是仓根 Flutter 工程。
+  final Directory uiDir = Directory(_join(root.path, options.uiDir));
+  final File pubspec = File(_join(uiDir.path, 'pubspec.yaml'));
   if (!pubspec.existsSync()) {
-    throw const _UsageError('请在仓库根目录运行（找不到 pubspec.yaml）', 2);
+    throw const _UsageError(
+      '找不到 UI 工程的 pubspec.yaml：检查 --ui-dir（默认 plugins/tree.ui.default）'
+      '或插件仓是否已 clone 到 plugins/',
+      2,
+    );
   }
   final Map<String, String> pubspecData = _readPubspec(pubspec);
   final String version =
       options.version ?? _versionOf(pubspecData['version'] ?? '0.0.0');
-  final String appExeName = '${_binaryName(root)}.exe';
+  final String appExeName = '${_binaryName(uiDir)}.exe';
   final Directory releaseDir = Directory(
     options.releaseDir ??
-        _join(root.path, 'build/windows/x64/runner/Release'),
+        _join(uiDir.path, 'build/windows/x64/runner/Release'),
   );
 
   if (options.build) {
     final int code = await _runLive(
       'flutter',
       <String>['build', 'windows', '--release', '--no-tree-shake-icons'],
-      root.path,
+      uiDir.path,
     );
     if (code != 0) {
       throw _UsageError('flutter build windows 失败（exit=$code）', code);
@@ -377,6 +384,7 @@ class _Options {
     this.version,
     this.releaseDir,
     this.index,
+    this.uiDir = 'plugins/tree.ui.default',
   });
 
   final bool build;
@@ -387,6 +395,9 @@ class _Options {
   final String? releaseDir;
   final String? index;
 
+  /// UI 插件源码目录（相对仓库根）。
+  final String uiDir;
+
   static _Options parse(List<String> args) {
     bool build = false;
     bool noZip = false;
@@ -395,6 +406,7 @@ class _Options {
     String? version;
     String? releaseDir;
     String? index;
+    String uiDir = 'plugins/tree.ui.default';
     for (int i = 0; i < args.length; i++) {
       final String arg = args[i];
       String value() {
@@ -415,6 +427,8 @@ class _Options {
           out = value();
         case '--index':
           index = value();
+        case '--ui-dir':
+          uiDir = value();
         case '--version':
           version = value();
         case '--release-dir':
@@ -434,6 +448,7 @@ class _Options {
       version: version,
       releaseDir: releaseDir,
       index: index,
+      uiDir: uiDir,
     );
   }
 }

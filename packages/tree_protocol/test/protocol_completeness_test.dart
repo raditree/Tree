@@ -299,21 +299,18 @@ void main() {
   });
 }
 
-/// UI 源码根。迁移前住在桌面仓根 `lib/`，迁移后在插件仓
-/// `plugins/tree.ui.default/lib/`（见 docs/pluginization/ui-source-migration-recon.md D7）。
+/// UI 源码根：插件仓的 `plugins/tree.ui.default/lib`（S3 起桌面仓根不再有 `lib/`）。
 ///
-/// 新路径存在就优先新路径（S2 起源码只在插件仓那份可改）；两处都没有就**直接失败**，
-/// 不允许像旧写法那样静默跳过——「门禁变绿但没扫到界面」是最坏的失败方式。
-/// **S3 删源时删掉回落分支，只留新路径。**
+/// 目录不存在就**直接失败**，不允许像旧写法那样静默跳过——「门禁变绿但没扫到界面」
+/// 是最坏的失败方式。桌面仓/CI 都要先把插件仓检出到 `plugins/`。
 Directory _uiSourceRoot(Directory repoRoot) {
-  final Directory migrated =
-      Directory('${repoRoot.path}/plugins/tree.ui.default/lib');
-  final Directory legacy = Directory('${repoRoot.path}/lib');
-  final Directory root = migrated.existsSync() ? migrated : legacy;
+  final Directory root = Directory(
+    '${repoRoot.path}/plugins/tree.ui.default/lib',
+  );
   if (!root.existsSync()) {
     fail(
-      'UI 源码目录不存在（找过 ${migrated.path}、${legacy.path}）：'
-      '迁移没搬完或路径漂了——门禁不许静默降级',
+      'UI 源码目录不存在：${root.path}——'
+      '插件仓没检出到 plugins/，或迁移路径漂了（门禁不许静默降级）',
     );
   }
   return root;

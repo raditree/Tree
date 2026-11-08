@@ -19,6 +19,7 @@ import 'package:tree_protocol/tree_protocol.dart';
 ///
 /// 选项：
 ///   --flutter path     flutter.bat 路径（未给则读 FLUTTER_ROOT 环境变量）
+///   --ui-dir dir       UI 插件源码目录（默认 plugins/tree.ui.default）
 ///   --skip-build         跳过 flutter build windows --release（用已有产物）
 ///   --release-dir dir  直接指定已构建的 Release 目录（隐含 --skip-build）
 ///   --out dir          产物目录（默认 dist）
@@ -49,16 +50,31 @@ Future<void> _package(List<String> args) async {
     await _fail('请在仓库根目录运行（找不到 pubspec.yaml 或核心入口）', 2);
   }
 
+  // UI 源码住在插件仓（桌面仓的 plugins/ 是它的本地挂载点），不再是仓根 Flutter 工程。
+  final Directory uiDir = Directory(_join(root.path, options.uiDir));
+  final File uiPubspec = File(_join(uiDir.path, 'pubspec.yaml'));
+  if (!uiPubspec.existsSync()) {
+    await _fail(
+      '找不到 UI 工程：${uiPubspec.path}\n'
+      '插件仓没挂到 plugins/ 时请先 clone，或用 --ui-dir 指定目录。',
+      2,
+    );
+  }
+
   final Map<String, String> pubspec = _readPubspec(root);
+  final Map<String, String> uiPubspecData = _readPubspec(uiDir);
   final String appName = pubspec['name'] ?? 'tree';
   // 应用可执行文件名来自 windows/CMakeLists.txt 的 BINARY_NAME（不是 pubspec 的
   // name）：本项目里是 Tree.exe，写死成 name 会找不到文件（M7f 第一次跑就踩了）
-  final String appExeName = '${_binaryName(root)}.exe';
+  final String appExeName = '${_binaryName(uiDir)}.exe';
+  // 两个版本口径（D3）：安装包 / 核心 / loader 用桌面仓版本；界面插件用 UI 自己的。
   final String version = options.version ?? _versionOf(pubspec['version']);
+  final String uiVersion =
+      options.version ?? _versionOf(uiPubspecData['version'] ?? '0.0.0');
   const String coreEntry = 'packages/tree_core_cli/bin/tree_core.dart';
   final Directory releaseDir = options.releaseDir != null
       ? Directory(options.releaseDir!)
-      : Directory(_join(root.path, 'build/windows/x64/runner/Release'));
+      : Directory(_join(uiDir.path, 'build/windows/x64/runner/Release'));
   final Directory outDir = Directory(_join(root.path, options.out));
   final String coreExe = _join(releaseDir.path, 'tree_core.exe');
   final String appExe = _join(releaseDir.path, appExeName);
@@ -90,7 +106,7 @@ Future<void> _package(List<String> args) async {
       'windows',
       '--release',
       '--no-tree-shake-icons',
-    ], root.path);
+    ], uiDir.path);
     if (code != 0) {
       await _fail('flutter build windows 失败（exit=$code）', code);
     }
@@ -135,8 +151,8 @@ Future<void> _package(List<String> args) async {
     stdout.writeln('   界面改名：$appExeName → tree_ui.exe（替换上一轮产物）');
   }
   if (File(uiExe).existsSync()) {
-    _writeUiManifest(releaseDir, version);
-    stdout.writeln('   界面清单：plugin.json（tree.ui.default $version）');
+    _writeUiManifest(releaseDir, uiVersion);
+    stdout.writeln('   界面清单：plugin.json（tree.ui.default $uiVersion）');
   }
 
   // ② 编译核心并放进同一个目录（发行版布局的硬要求）
@@ -160,7 +176,7 @@ Future<void> _package(List<String> args) async {
 
   // ②a 图标字体门禁：`lib/` 里用到的每个 Icons.* 都必须真在字体里
   // （见 §① 的说明：子集化/字体缺失 = 按钮一片空白，且只有发布版才看得见）
-  await _checkIconFont(root, flutterRoot, releaseDir);
+  await _checkIconFont(uiDir, flutterRoot, releaseDir);
 
   // ②b 原生资源（Dart native assets）拷进发行目录
   //
@@ -171,7 +187,7 @@ Future<void> _package(List<String> args) async {
   // 用户机器上一打开 PDF 就报找不到 pdfium（本机测试发现不了：测试环境用的是
   // .dart_tool/lib 下的那份）。
   final Directory nativeAssets = Directory(
-    _join(root.path, 'build/native_assets/windows'),
+    _join(uiDir.path, 'build/native_assets/windows'),
   );
   if (nativeAssets.existsSync()) {
     for (final FileSystemEntity entity in nativeAssets.listSync()) {
@@ -742,7 +758,7 @@ String _binaryName(Directory root) {
 /// 万一有人把第一道去掉，这里会立刻点名"哪几个图标在用、但字体里没有"，
 /// 而不是把一堆空白按钮发给用户。
 Future<void> _checkIconFont(
-  Directory root,
+  Directory uiDir,
   String flutterRoot,
   Directory releaseDir,
 ) async {
@@ -756,7 +772,7 @@ Future<void> _checkIconFont(
     await _fail('图标字体不存在：${font.path}（flutter_assets 不完整？）', 4);
   }
   final Set<int> available = _fontCodepoints(font.readAsBytesSync());
-  final Map<String, List<String>> used = _iconsUsedInLib(root);
+  final Map<String, List<String>> used = _iconsUsedInLib(uiDir);
   final Map<String, int> codepoints = _iconCodepoints(flutterRoot);
   final List<String> missing = <String>[];
   final List<String> unknown = <String>[];
@@ -790,10 +806,10 @@ Future<void> _checkIconFont(
 /// `lib/**/*.dart` 里出现过的 `Icons.<名字>`（值 = 出现在哪些文件里，报错时点名）。
 ///
 /// `Icons.adaptive` 是命名空间（`Icons.adaptive.more` 之类），不是图标本身，跳过。
-Map<String, List<String>> _iconsUsedInLib(Directory root) {
+Map<String, List<String>> _iconsUsedInLib(Directory uiDir) {
   final RegExp pattern = RegExp(r'Icons\.(\w+)');
   final Map<String, List<String>> out = <String, List<String>>{};
-  final Directory lib = Directory(_join(root.path, 'lib'));
+  final Directory lib = Directory(_join(uiDir.path, 'lib'));
   for (final FileSystemEntity entity in lib.listSync(recursive: true)) {
     if (entity is! File || !entity.path.endsWith('.dart')) continue;
     final String source = entity.readAsStringSync();
@@ -801,7 +817,7 @@ Map<String, List<String>> _iconsUsedInLib(Directory root) {
       final String name = match.group(1)!;
       if (name == 'adaptive') continue;
       final String where = entity.path
-          .substring(root.path.length + 1)
+          .substring(uiDir.path.length + 1)
           .replaceAll('\\', '/');
       (out[name] ??= <String>[]).add(where);
     }
@@ -1040,6 +1056,7 @@ class _Options {
     this.installer = false,
     this.noZip = false,
     this.skipVerify = false,
+    this.uiDir = 'plugins/tree.ui.default',
   });
 
   final String? flutter;
@@ -1052,12 +1069,16 @@ class _Options {
   final bool noZip;
   final bool skipVerify;
 
+  /// UI 插件源码目录（相对仓根）。
+  final String uiDir;
+
   static _Options parse(List<String> args) {
     String? flutter;
     String? iscc;
     String? releaseDir;
     String out = 'dist';
     String? version;
+    String uiDir = 'plugins/tree.ui.default';
     bool skipBuild = false;
     bool installer = false;
     bool noZip = false;
@@ -1069,6 +1090,8 @@ class _Options {
           flutter = value();
         case '--iscc':
           iscc = value();
+        case '--ui-dir':
+          uiDir = value();
         case '--release-dir':
           releaseDir = value();
           skipBuild = true;
@@ -1101,6 +1124,7 @@ class _Options {
       installer: installer,
       noZip: noZip,
       skipVerify: skipVerify,
+      uiDir: uiDir,
     );
   }
 }
