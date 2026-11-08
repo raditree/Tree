@@ -429,6 +429,36 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
 - 验证：analyze 0、单测 19/19（plan 4 条）、插件自检 38/0、
   `build_plugins --only tree.docnorm` 产物自检通过；协议仓 docs/plugin 契约 14/14。
 
+**DN-5 实施记录（2026-11-09）**：`tree.docnorm` 新增只读命令 `docnorm.generate`，
+实现在 `plugins/tree.docnorm/lib/src/generate.dart`；`plan.dart` 抽出
+`PlanContext` / `PlanUnit` / `loadPlanContext`，plan 与 generate 共用同一份
+仓库 / 配置 / 扫描 / 变更归集 / 注入单元。
+
+- **只补缺章节**：目标单元必须有 README；缺失章节 = `DocPolicy.requiredSections`
+  命中该 README 的章节 − README 已存在的章节（无规则时用模块默认四节「职责 /
+  入口 / 边界 / 测试」）；无 README ⇒ `readme_missing`、章节齐全 ⇒
+  `sections_present`，两种情况 **0 次 `llm.call`**，且不凭空新建 README。
+- **三模式 × 三档**：模式沿用 plan（`readme` / `declarations` / `assertions` /
+  `full`，默认 `auto`），档位 `comments` / `declarations` / `full`（`tier` 可覆盖，
+  默认由模式推导）；显式 `full` 超 `full_code_limit` 时降为 `readme` 并写 `reasons`。
+- **`context_cap` 闸**：prompt 估计超限时先按 `full → declarations → comments`
+  降档；仍超则按文件贪心分块；单文件仍超则丢弃（`reasons` 记「已丢弃」）并标
+  `degraded`；`stage_budget` 累计，不足时停止后续调用并标 `exhausted`。
+- **`llm.call` 接线**：经 tree.agent 宿主能力站发 `messages`（system + user），
+  失败也带回已付费的 `text` / `json`（known-issues #31）；解析严格 JSON
+  `{"sections":[{"heading","body"}]}`，只接受本次请求的缺失章节，额外标题 /
+  空正文 / 过短正文进 `rejected`，失败或无 JSON ⇒ `degraded`，**不用占位内容补齐**。
+- **输出**：`documents[]` 逐单元报告 mode / tier / missing / generated / rejected /
+  calls / tokens / degraded；顶层 `sections[]`（`doc` / `heading` / `body` /
+  `mode: append`）可直接作为 `docnorm.baseline` 的 `sections`。命令整体只读
+  （`dry_run: true`），落盘仍由 baseline `--commit` 执行。
+- **依赖**：`plugin.json` 增加 `requires.plugins: tree.agent (>=0.28.0)`（`llm.call`
+  的提供方），版本升 `0.4.0`（pubspec / plugin.json / 插件常量同步）。
+- 验证：analyze 0、单测 28/28（generate 9 条：缺章节生成、已存在 0 调用、
+  无 README 跳过、额外标题/过短正文拒绝、LLM 失败与非法 JSON degraded、
+  full 降档、按文件分块、单文件丢弃、stage_budget 停止）、插件自检 42/0、
+  `build_plugins --only tree.docnorm` 产物自检通过；协议仓 docs/plugin 契约 14/14。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
