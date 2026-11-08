@@ -15,6 +15,7 @@
 | [plugin-development.md](plugin-development.md) | 写插件的系统指南：一分钟上手、协议与生命周期、站点与点位（点位由核心与插件申报，数量以 `/api/meta` 为准）、scope 两套含义、执行站命令、流式接管、UI 槽位、调试 |
 | [exec_station_contract.md](exec_station_contract.md) | **执行站契约**（L-25）：`station/command` 回包信封的六个键、两个执行站命令表逐条对照（本机 8 / SSH 10 与四处能力差异）、失败来源全清单与错误码表、逐命令幂等标注、八环传递链与门禁设计 |
 | [pluginization/scope-de-domainization-recon.md](pluginization/scope-de-domainization-recon.md) | **L-23 `scope` 去领域化侦查**（本期不实现）：wire 消费点、4 类判定点、12 个插件的空 `scope` 声明、C1→C2 方案与 S0~S4 执行序 / 验收判据 |
+| [pluginization/agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) | **Agent loop 三线结构侦察与语义对齐（AC-1）**：Agent 实例 / 消息机 / loop 的现状对照、统一信封与直投/排队语义、队列落档、状态机、广播/执行/中转站点面、12 处冲突点与 AC-1~AC-6 切片 |
 | [conversation-sembast-and-collapse-recon.md](conversation-sembast-and-collapse-recon.md) | **会话存储 Sembast 化 + 中栏工具折叠侦查与拍板**：显示/详细双 store、seq 排序键、jsonl 一次性迁移、详情端点、N>3 折叠组与 TC-COLLAPSE-01 零位移判据（F1~F4 执行规格） |
 | [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) | **SSH 执行器「中转站」协议**：core ⇄ ssh_executor 插件 ⇄ tree_agent 三层的消息面、错误码、分块帧、版本协商、后台任务落盘台账与 PTY 契约（中转站 =「处理拓展点位」：首选 `ssh.execute` 点位投递、`tunnel.*` 作兼容层） |
 | [known-issues.md](known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证 / 遗留），按发现顺序编号 |

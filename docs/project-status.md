@@ -30,9 +30,11 @@
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
+| **F Agent loop 整理** | AC-2 消息机改造 | 进行中（AC-1 已完成） | AC-3 loop 前置 + 注入点 | [agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) §5 |
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
-`B`、`E` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
+`B`、`E`、`F` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
+`F` 的 C1~C12 已全部拍板，AC-1~AC-6 均无阻塞。
 
 ## 并行规则
 
