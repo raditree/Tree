@@ -30,11 +30,15 @@
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
-| **G 设置页与配色** | SET-UI-1 设置页左目录 + 响应式 | 待开始 | SET-UI-2 中性主题 → SET-UI-3 消息流 → SET-UI-4 右栏自适应宽度 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
+| **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
+| **H 标准开发流生产线** | P0 文档归一化：DN-1 落档完成（本质=包功能收束；图谱定 GraphRAG），待拍板 D1~D26 | 待开始 | DN-2 适配层 → DN-3 契约侦查 + 规则源 → DN-7 收束产物 → 解锁 P1；**DN-9/DN-10（GraphRAG 索引 + 检索/边检查）须在 P3 准备阶段前完成** | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8 |
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
 `B`、`E`、`G` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
 `G` 只改 UI 插件仓，不动核心/协议；D1~D6 已有默认口径（见方案 §8），可直接开工。
+`H` 必须先完成 P0 文档归一化（产线的项目资产与索引依赖它），之后按 P1→P8 顺序推进；
+P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8（通用工具，不绑定本仓语言与门禁；本质=包功能收束，供产线免做全面侦查）；
+`H` 只新增 `tree.production.line` 插件与 UI 面，不改核心面 35 条基线。
 
 ## 并行规则
 
