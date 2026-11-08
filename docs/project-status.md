@@ -30,11 +30,11 @@
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
-| **F Agent loop 整理** | — | 已完成（AC-1~AC-6） | 待新任务 | [agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) §5 |
+| **G 设置页与配色** | SET-UI-1 设置页左目录 + 响应式 | 待开始 | SET-UI-2 中性主题 → SET-UI-3 消息流 → SET-UI-4 右栏自适应宽度 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
-`B`、`E`、`F` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
-`F` 的 C1~C12 已全部拍板，AC-1~AC-6 均无阻塞。
+`B`、`E`、`G` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
+`G` 只改 UI 插件仓，不动核心/协议；D1~D6 已有默认口径（见方案 §8），可直接开工。
 
 ## 并行规则
 
