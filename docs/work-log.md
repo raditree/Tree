@@ -6,6 +6,7 @@
 
 | 日期 | 事项 | 结论 / 关键数字 | 提交 | 原文档 |
 | --- | --- | --- | --- | --- |
+| 2026-11-08 | 核心面收窄 S7（43 → 35） | 删 store 4 / logs 3 / data-collection 1；基线改 coreOwned 35 / delegated 55 / contract 90 / kept 70；protocol 68 + core 657 全绿 | `223e9b9` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §2.5 |
 | 2026-11-08 | 过程文档拆分 | status 只管阶段与当前事项；work-log 记过去式；完成即迁出 | `ba0e1ef` | [project-status.md](project-status.md) |
 | 2026-11-08 | 项目状态入口上线 | 阶段模型（快速/稳定性/发版/维护/大版本）、待办总表、维护规则生效 | `4dc823b`、`9d1174d` | [project-status.md](project-status.md) |
 | 2026-11-08 | UI 移仓方案定稿 | 核心只认 `ui`/`headless`、UI 零依赖（自持契约）、核心面 43→35、S1–S9 与回滚 | `70d6c9c`、`bae779d`、`91ad646` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) |
