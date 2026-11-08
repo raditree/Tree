@@ -92,11 +92,22 @@ jobs:
         run: dart run tool/check_plugin_repo_contract.dart --plugin-root plugins
 
   app:
-    name: UI（flutter analyze + test）
+    name: UI（插件仓 flutter analyze + test）
     runs-on: windows-latest
     timeout-minutes: 40
+    # UI 源码已迁入插件仓（S2/S3）：桌面仓不再含 Flutter 工程，界面门禁在这里
+    # 跨仓跑——与 protocol / core 两个 job 检出 plugins/ 的做法一致。
+    defaults:
+      run:
+        working-directory: plugins/tree.ui.default
     steps:
       - uses: actions/checkout@v4
+      - name: 检出插件仓（UI 源码所在）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLUGIN_REPO }}
+          ref: ${{ env.PLUGIN_REF }}
+          path: plugins
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_SDK }}
