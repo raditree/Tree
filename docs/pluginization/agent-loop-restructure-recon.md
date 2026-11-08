@@ -434,6 +434,9 @@ UI 对 `role=system` 的显示口径也要确认（当前可能按未知 role �
 > + 来源身份强制（只认核心 `meta.triggered_by`）+ scope fail-closed + 状态快照
 > （working/idle、queue_depth、own_running、subagent_running）；
 > analyze 0、tree.agent 427 全绿（新增 5 条）。
+> **AC-6 已完成**：抽出 `LlmInvoker` 调用边界（默认 `TransportLlmInvoker` 原样转发、
+> 请求字节不变）+ 引擎 `invokerFactory` 接管点；LLM 插件留作后续独立立项；
+> analyze 0、tree.agent 431 全绿（新增 4 条）。**AC-1~AC-6 全部收口。**
 
 | 切片 | 内容 | 证明点 / 门禁 |
 | --- | --- | --- |
