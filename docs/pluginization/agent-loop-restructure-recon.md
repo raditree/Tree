@@ -421,6 +421,9 @@ UI 对 `role=system` 的显示口径也要确认（当前可能按未知 role �
 > 2026-11-08 已拍板 C1~C12 全部条目，无剩余待确认项；AC-1~AC-6 均无阻塞。
 > **AC-1 已完成**：加法 schema + `inbox.jsonl` 台账 + `AgentInstance` 骨架；
 > analyze 0、tree.agent 396 全绿（新增 16 条）。
+> **AC-2 已完成**：信封校验 + 特殊来源规则 + direct/queue 双队列 + tip 不唤醒 /
+> task 唤醒 + `agent.state` 状态广播 + 去掉「到达即打断」；
+> analyze 0、tree.agent 408 全绿（新增 12 条）。
 
 | 切片 | 内容 | 证明点 / 门禁 |
 | --- | --- | --- |
