@@ -76,6 +76,8 @@ void main() {
       'packages',
       'tool',
       'assets',
+      // UI 源码迁移后住在这里（插件仓本地挂载点）；迁移前目录不存在则跳过。
+      'plugins/tree.ui.default',
     ]) {
       final Directory dir = Directory('${root.path}/$name');
       if (dir.existsSync()) await scan(dir);
@@ -85,12 +87,13 @@ void main() {
   });
 }
 
-/// 从当前工作目录向上找到仓库根（同时含 `packages/tree_core` 与 `lib`）。
+/// 从当前工作目录向上找到仓库根（同时含 `packages/tree_core` 与根 `pubspec.yaml`）。
+/// 不用 `lib/` 做判据：UI 源码迁移后会离开桌面仓根（见 ui-source-migration-recon.md）。
 Directory _repoRoot() {
   Directory cursor = Directory.current;
   for (int i = 0; i < 8; i++) {
     if (Directory('${cursor.path}/packages/tree_core').existsSync() &&
-        Directory('${cursor.path}/lib').existsSync()) {
+        File('${cursor.path}/pubspec.yaml').existsSync()) {
       return cursor;
     }
     final Directory parent = cursor.parent;

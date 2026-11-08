@@ -20,6 +20,8 @@ const Map<String, String> pendingCoreInbound = <String, String>{};
 
 void main() {
   final Directory repoRoot = Directory('../..');
+  final Directory uiRoot = _uiSourceRoot(repoRoot);
+  final String uiRel = _relativeTo(repoRoot, uiRoot.path);
 
   test('源码里的 "type" 字面量全部是协议帧或在登记表中', () {
     final Set<String> scanned = _scanTypeLiterals(repoRoot);
@@ -72,9 +74,7 @@ void main() {
   });
 
   test('前端使用的 /api 路径全部在 ApiPaths 中声明', () {
-    final Map<String, Set<String>> used = _scanFrontendApiPaths(
-      Directory('${repoRoot.path}/lib'),
-    );
+    final Map<String, Set<String>> used = _scanFrontendApiPaths(uiRoot);
     expect(used, isNotEmpty, reason: '未扫描到任何 /api 路径字符串');
 
     final Set<String> declared = ApiPaths.all.map(_normalizePath).toSet();
@@ -110,9 +110,7 @@ void main() {
   });
 
   test('前端已不再引用账号体系路径（M1b 删除登录与账号设置）', () {
-    final Map<String, Set<String>> used = _scanFrontendApiPaths(
-      Directory('${repoRoot.path}/lib'),
-    );
+    final Map<String, Set<String>> used = _scanFrontendApiPaths(uiRoot);
     final Set<String> accountPaths = <String>{
       for (final MapEntry<String, Set<String>> entry in used.entries)
         if (entry.key.contains('/api/auth')) ...entry.value,
@@ -133,7 +131,7 @@ void main() {
     final List<String> hardcoded = <String>[];
     final RegExp literal = RegExp(r"'(frame_begin|frame_chunk|frame_end)'");
     for (final String tree in <String>[
-      'lib',
+      uiRel,
       'packages/tree_core/lib',
       'packages/tree_local_exec/lib',
       'packages/tree_core_cli/bin',
@@ -166,8 +164,8 @@ void main() {
     // 用同一个字段名与同一套"缺字段 = 未知"口径。任一侧改成别的写法（'seq' /
     // 'sequence' / 直接索引），去重会**静默失效**（退回 id 级判据、重复渲染正文），
     // 所以这里按文件登记"非流式帧的 seq 用法"，其余一律必须走 WsStreamSeq。
-    const Map<String, String> registered = <String, String>{
-      'lib/io/websocket_service.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
+    final Map<String, String> registered = <String, String>{
+      '$uiRel/io/websocket_service.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
       'packages/tree_core/lib/src/ws/ws_hub.dart':
           '大帧分片 frame_chunk 的分片序号（传输层）',
       'packages/tree_core/lib/src/ws/inbound_frames.dart': '核心侧重组成大帧时读分片序号',
@@ -176,7 +174,7 @@ void main() {
     };
     final RegExp literal = RegExp(r'''['"]seq['"]''');
     final List<String> offenders = <String>[];
-    for (final String tree in <String>['lib', 'packages/tree_core/lib']) {
+    for (final String tree in <String>[uiRel, 'packages/tree_core/lib']) {
       final Directory dir = Directory('${repoRoot.path}/$tree');
       if (!dir.existsSync()) continue;
       for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
@@ -296,12 +294,33 @@ void main() {
   });
 }
 
+/// UI 源码根。迁移前住在桌面仓根 `lib/`，迁移后在插件仓
+/// `plugins/tree.ui.default/lib/`（见 docs/pluginization/ui-source-migration-recon.md D7）。
+///
+/// 新路径存在就优先新路径（S2 起源码只在插件仓那份可改）；两处都没有就**直接失败**，
+/// 不允许像旧写法那样静默跳过——「门禁变绿但没扫到界面」是最坏的失败方式。
+/// **S3 删源时删掉回落分支，只留新路径。**
+Directory _uiSourceRoot(Directory repoRoot) {
+  final Directory migrated =
+      Directory('${repoRoot.path}/plugins/tree.ui.default/lib');
+  final Directory legacy = Directory('${repoRoot.path}/lib');
+  final Directory root = migrated.existsSync() ? migrated : legacy;
+  if (!root.existsSync()) {
+    fail(
+      'UI 源码目录不存在（找过 ${migrated.path}、${legacy.path}）：'
+      '迁移没搬完或路径漂了——门禁不许静默降级',
+    );
+  }
+  return root;
+}
+
 /// 扫描本仓库源码（前端 + 各包）里的 `'type': 'x'` 字面量。
 Set<String> _scanTypeLiterals(Directory repoRoot) {
+  final String uiRel = _relativeTo(repoRoot, _uiSourceRoot(repoRoot).path);
   final RegExp literal = RegExp(r"'type'\s*:\s*'([a-z_][a-z0-9_]*)'");
   final Set<String> found = <String>{};
   for (final String tree in <String>[
-    'lib',
+    uiRel,
     'packages/tree_core/lib',
     'packages/tree_local_exec/lib',
     'packages/tree_protocol/lib',

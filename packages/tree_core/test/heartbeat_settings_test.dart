@@ -145,7 +145,9 @@ void main() {
       // 前端这一侧固定在 10s（lib/io/websocket_service.dart，本次不动），
       // CoreSettings.minLivenessWindowSeconds 就是照它定的——哪一侧改了这里都会红，
       // 逼着两侧一起改，避免"核心判活窗口比前端心跳还短"重新出现。
-      final File source = File('../../lib/io/websocket_service.dart');
+      final File source = File(
+        '${_uiSourceRoot().path}/io/websocket_service.dart',
+      );
       expect(source.existsSync(), isTrue, reason: '找不到前端 WS 服务源码（仓库布局变了？）');
       final String src = source.readAsStringSync();
       final int timer = src.indexOf('_heartbeatTimer = Timer.periodic(');
@@ -497,6 +499,27 @@ void main() {
       );
     });
   });
+}
+
+/// UI 源码根（cwd = `packages/tree_core`）。迁移前是桌面仓根 `lib/`，迁移后是
+/// 插件仓 `plugins/tree.ui.default/lib/`（ui-source-migration-recon.md D7）。
+///
+/// 两处都不存在就**直接失败**：静默跳过会让「前端心跳仍是 10s」这条跨仓前提
+/// 无声失效。**S3 删源时删掉回落分支，只留新路径。**
+Directory _uiSourceRoot() {
+  final Directory repoRoot = Directory('../..');
+  final Directory migrated = Directory(
+    '${repoRoot.path}/plugins/tree.ui.default/lib',
+  );
+  final Directory legacy = Directory('${repoRoot.path}/lib');
+  final Directory root = migrated.existsSync() ? migrated : legacy;
+  if (!root.existsSync()) {
+    fail(
+      'UI 源码目录不存在（找过 ${migrated.path}、${legacy.path}）：'
+      '迁移没搬完或路径漂了——门禁不许静默降级',
+    );
+  }
+  return root;
 }
 
 /// 记录落盘调用的假 sink（照 settings_test.dart 的写法，保持本文件自足）。
