@@ -6,6 +6,8 @@
 
 | 日期 | 事项 | 结论 / 关键数字 | 提交 | 原文档 |
 | --- | --- | --- | --- | --- |
+| 2026-11-08 | UI 移仓 S5 文档与开发回路 | README/CONTRIBUTING/development/handover 全部改到 `plugins/tree.ui.default`（目录、flutter 命令、门禁顺序、打包链）；CHANGELOG 记零依赖契约与 `ui_contract` 断言；dev_run 修 dart.bat 解析与 stderr 事件回调两处真问题，实测「核心就绪 → UI 附着 → 经核心刷新发布索引 → 关 UI 核心优雅退出且 core.json 清理」 | `ab5d97c` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
+| 2026-11-08 | UI 移仓 S4 CI 与发布链收口 | 桌面仓 `app` job 改检出 tree-plugins → `plugins/tree.ui.default` 下跑 analyze/test；等价闸门本地全绿（analyze 0、UI 908 通过/1 跳过、contract 通过）；发布索引 UI 条目为 archive 1.0.5；installFromZip / install-local 13 条用例全绿（发布源实装留 S6 真机） | `abcc405` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | Agent loop AC-1 信封 + 台账 + 实例骨架 | `CoreMessage`/`CoreMessageRef` 加 7 个加法键（老 JSON 不多键）；`inbox.jsonl` 追加/状态合并/崩溃恢复；`AgentInstance`/Registry 懒建与 flush/dispose；analyze 0、tree.agent 396 全绿（新增 16） | 插件仓 `8794b3f` | [agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) §5 |
 | 2026-11-08 | Agent loop AC-2 消息机改造 | 统一入站 `acceptMessage`（`type/subtype/inject_mode` 校验 + 特殊来源/保留坐标约束）；`tip` 只补上下文不唤醒、`task` 唤醒；direct/queue 双队列（direct 优先、queue 逐条）与 `inbox.jsonl` 全状态记账；Agent 状态机驱动 `agent.state` 广播；去掉「到达即打断」；analyze 0、tree.agent 408 全绿（新增 12） | 插件仓 `fcbab04` | [agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) §5 |
 | 2026-11-08 | Agent loop 剩余语义拍板（C6-b/C8~C11） | 工具表按会话快照并按四类信号失效；stop 作废可运行 task、tip 保留；中转站仅显式 error fail-closed；状态保持 idle/working 两态、asking 为附加标记；direct 优先、queue 逐条排空；C1~C12 全部定稿 | — | [agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) §4 |
