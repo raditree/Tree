@@ -31,14 +31,18 @@
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | P0 文档归一化：DN-1 落档完成（本质=包功能收束；图谱定 GraphRAG），待拍板 D1~D26 | 待开始 | DN-2 适配层 → DN-3 契约侦查 + 规则源 → DN-7 收束产物 → 解锁 P1；**DN-9/DN-10（GraphRAG 索引 + 检索/边检查）须在 P3 准备阶段前完成** | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8 |
+| **H 标准开发流生产线** | P0 文档归一化：DN-1 定稿（D1~D34 + P1~P8）；`J MP-1` 已就位，DN-2 可开工；DN-4 等 `I ST-1~3` | 待开始 | DN-2 六族适配器（含 Node/TS+Vue3+HTTP）→ DN-3 → DN-6 → 解锁 P1；**DN-4 前需 I ST-3，DN-9 前需 J MP-5，P3 前需 J MP-6 与 P8 golden set**；DN-11（状态/日志维护）可与 DN-4 并行 | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8/§9 |
+| **I 存储插件 tree.storage** | ST-2 分页 + CAS + tx | 进行中 | ST-3 导出导入 → ST-4 隔离白名单 → ST-6 docnorm 接入 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
+| **J 模型池 kind/protocol** | MP-2 API 校验 | 进行中 | MP-3 设置页 → MP-4 消费方过滤 → MP-5 embedding / MP-6 JEV 客户端 | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
 `B`、`E`、`G` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
 `G` 只改 UI 插件仓，不动核心/协议；D1~D6 已有默认口径（见方案 §8），可直接开工。
 `H` 必须先完成 P0 文档归一化（产线的项目资产与索引依赖它），之后按 P1→P8 顺序推进；
-P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8（通用工具，不绑定本仓语言与门禁；本质=包功能收束，供产线免做全面侦查）；
-`H` 只新增 `tree.production.line` 插件与 UI 面，不改核心面 35 条基线。
+P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8（TREE 内插件，对目标仓库零侵入；本质=包功能收束，供产线免做全面侦查）；
+`H` 的 P0 前置拆成两条独立车道：`I`（存储）与 `J`（模型池）。`DN-2` 只需 `J MP-1`（schema 兼容）即可开工；
+`DN-4` 前需 `I ST-1~ST-3`；`DN-9` 前需 `J MP-5`（embedding）；`P3` 前需 `J MP-6`（JEV，可选）与 P8 golden set。
+`H` 只新增 `tree.production.line` 插件与 UI 面，不改核心面 35 条基线；`I`/`J` 同样不新增核心点位。
 
 ## 并行规则
 

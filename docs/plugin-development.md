@@ -105,7 +105,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `station/command` | 请求 | `{command, arguments, team_id?, agent_id?, session_id?, mode_key?}` | `{command, ok, mount_id, payload, error}` |
 | `station/subscribe` | 请求 | `{station, point?, scope?, replace?, station_id?}` | `{ok, station_id, station_ids, kind, scope, replaced, error, subscriptions}` |
 | `station/unsubscribe` | 请求 | 同上（`station` / `point` / `station_id`） | `{ok, station_id, station_ids, kind, removed, error}` |
-| `station/register` | 请求 | `{kind, name, readme, description?, schema?, max_subscriptions?, shared?, allowed_plugins?, config?}`（**`readme` 必填**，见 §3.3） | `{ok, station_id, kind, error}` |
+| `station/register` | 请求 | `{kind, name, readme, description?, schema?, commands?, max_subscriptions?, shared?, allowed_plugins?, config?}`（**`readme` 必填；`execute` 必须带非空 `commands`**，见 §3.3） | `{ok, station_id, kind, error}` |
 | `station/unregister` | 请求 | `{station_id}` | `{ok, removed, error}` |
 | `station/trigger` | 请求 | `{station_id, topic?, scope?, payload?, meta?}`（**必须带确定的 `mode_key`**，见 §3.3） | `{ok, station_id, kind, result, error}`；`result` 含 `summary` / `delivered` / `skipped` / `deliveries[]` |
 | `station/stream` | **通知** | `{request_id, delta?}` / `{request_id, done:true, …}` / `{request_id, error:{…}}` | 不等应答（见 §5.4） |
@@ -223,7 +223,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 ```jsonc
 // 插件 → 核心
 {"jsonrpc":"2.0","id":3,"method":"station/register","params":{
-  "kind": "relay",                  // broadcast | relay | collect（execute 不可自建）
+  "kind": "relay",                  // broadcast | relay | collect | execute（execute 必须带 commands）
   "name": "audit",                  // 只允许字母数字与 _ -，**不能带点号**
   "readme": "收到工具公告后按 team 单向改写再投递；订阅者回 null = 不改动。",
   "description": "审计转发站",       // 可选；卡片上那一行短说明
@@ -238,7 +238,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 **id 由核心拼**（`plugin.{你的 id}.{kind}.{name}`）：插件不能自选 id，也不能冒用内置 id
 或别人的命名空间——"我的站点只能是我的"就是在这一条上强制的。
 
-三条硬规矩（都在 `station/register` 里，业务拒绝一律回 `ok:false` + 可读 `error`，
+四条硬规矩（都在 `station/register` 里，业务拒绝一律回 `ok:false` + 可读 `error`，
 **不会建出半个站点**）：
 
 | 规矩 | 为什么 | 被拒时说的话 |
@@ -246,6 +246,11 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | **`readme` 必填**（非空且不全空白） | 站是你建的，"它干什么、什么时候被触发、订阅者该怎么回"只有你说得清；共享给别人时，这份 readme 是对方唯一能读到的说明书 | `station/register 需要 readme（站点介绍，必填）：这个站干什么、什么时候被触发、订阅者该怎么回。内置站点的介绍来自核心的点位表。` |
 | `name` 里不能有点号 | 会与归属前缀判定撞车（插件 `a` 建 `b.relay.x` 能顶掉 `a.b` 的站） | 点名「只允许」的字符集 |
 | 收集站必须带非空 `schema` | 输入格式由站点定义，订阅者要按它产出 | `收集站必须定义 schema（输入格式：fields 非空），当前为空` |
+| **执行站必须带非空 `commands`**（≤32 条，命令名 `[A-Za-z][A-Za-z0-9_.-]*`，不得占用核心内置命令与 `plugin.` / `station.` 前缀，也不得被别的执行站占用） | 执行站的价值就是按命令名路由；空命令无法路由，重名会让下命令的人拿到别人的实现 | `自建执行站需要非空 commands 列表（插件能执行哪些命令）` / `命令 X 已被其它插件执行站占用` |
+
+**执行站与可订阅站点不同**：`shared` / `allowed_plugins` 只作用于可订阅站点（广播 / 中转 / 收集）；
+执行站按命令名路由，不接受订阅或触发。要限制谁能下这些命令，由执行站在 `station/command`
+入口按 `meta.source_plugin_id` 自查（核心只透传身份，不替它鉴权）。
 
 **内置站点的介绍来自点位表**（[station_points.dart](../packages/tree_core/lib/src/plugin/station_points.dart)），
 插件与界面都**不能**改写；界面上改内置站只能改「可订阅插件数量」。

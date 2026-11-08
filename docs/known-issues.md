@@ -2639,3 +2639,70 @@ compact 四条（`llm.call` / `fs.read` / `tool.call` / `agent.compact`）与 sa
 2. 真机：编辑器打开某文件 → agent 改同一文件 → UI 能感知并提示，不出现"保存即覆盖"；
 3. 门禁：核心侧除读取 agent 元数据外，不再有直接写工作空间的 `File(...)` 路径。
 
+---
+
+## #45 docnorm 复用识别暂不做向量化：跨包语义重复会漏报
+
+**状态**：未处理（2026-11-08 拍板：P4 先不上，记录于此）
+**影响**：`reuse` 类建议召回率有上限；只漏报，不产生错误建议，不阻塞门禁。
+
+### 现象
+
+docnorm 的 `reuse` 建议目前只做**符号级候选 + LLM 核实**（同名/同签名/高相似声明）。
+跨包"不同名但同语义"的重复实现——复制粘贴后改名、同一算法多份实现、同一协议多种封装——
+不会被召回，也不会进 `suggestions`。
+
+### 根因
+
+向量化召回需要 embedding 模型与向量索引；本期 P4 明确不上（[doc-normalization-recon.md](doc-normalization-recon.md) D8/P4）。
+模型池本期方案已定新增 `kind: embedding`（D33；实现属车道 J / MP-5），但复用向量层排在 DN-10 检索之后，尚无 golden 样例与阈值。
+
+### 后续方向（不在本期）
+
+1. embedding 与 `graph_vectors` 就绪后，在 `reuse` 前加一层**向量召回**（函数/类级签名 + 注释做 embedding）；
+2. 与检索共用同一个 embeddings 开关（P3/P4 同一开关），不另造模型配置；
+3. 用一组已知重复样例测召回（至少覆盖：改名复制、同算法不同语言、同协议多实现），再决定是否开默认。
+
+### 关联
+
+- [doc-normalization-recon.md](doc-normalization-recon.md) D8 / P4 / P8 / D33
+- 建议 schema 与执行链：同文档 §4.4
+
+---
+
+## #46 插件开发文档写“执行站不可自建”，与核心实现和内置插件实践相反
+
+**状态**：**已修复（2026-11-08，文档修正：`docs/plugin-development.md` §2.2 / §3.3）**
+**影响**：按文档写插件的人会误以为不能自建执行站；`tree.storage` 这类“命令族型”插件会被判成不可实现。
+
+### 现象
+
+- §3.3 的 `station/register` 示例注释写 `broadcast | relay | collect（execute 不可自建）`；
+- §2.2 的 `station/register` 参数表没有 `commands` 字段；
+- 但 `local_executor` 实际以 `kind: "execute"` + `commands: kExecutorCommands` 注册成功
+  （`plugins/local_executor/local_executor_plugin.dart:47-66`）。
+
+### 根因
+
+- 早期 M9 设计确实规定“执行站不可自建”（`docs/archive/m9-plan.md:178`、`:437`）；
+- A5 / known-issues #43 把 20 条领域命令让给插件自建执行站，核心实现已支持 execute 注册
+  （`packages/tree_core/lib/src/plugin/plugin_bus.dart:4163-4190`），但插件开发文档的示例与参数表没同步。
+
+### 修复
+
+1. §2.2 参数表补 `commands?`，注明 `execute` 必须带非空列表；
+2. §3.3 示例注释改为允许 `execute`；
+3. “三条硬规矩”改为“四条”，补执行站 `commands` 校验（非空、≤32、命名合法、不得占用核心内置命令与
+   `plugin.` / `station.` 前缀、不得被别的执行站占用）；
+4. 补一段“执行站与可订阅站点不同”：`shared` / `allowed_plugins` 只作用于广播 / 中转 / 收集，
+   命令调用方由执行站在 `station/command` 入口按 `meta.source_plugin_id` 自查。
+
+### 验证
+
+- 对照实现：`plugin_bus.dart:4163-4190`、`local_executor_plugin.dart:47-66`；
+- 文档契约门禁 `docs_contract_test` 7/7 通过。
+
+### 遗留
+
+- `docs/archive/m9-plan.md` 是历史文档，**不改写**；与现行文档冲突时以现行文档为准。
+
