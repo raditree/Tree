@@ -459,6 +459,34 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
   full 降档、按文件分块、单文件丢弃、stage_budget 停止）、插件自检 42/0、
   `build_plugins --only tree.docnorm` 产物自检通过；协议仓 docs/plugin 契约 14/14。
 
+**DN-7 实施记录（2026-11-09）**：`tree.docnorm` 新增只读命令 `docnorm.audit
+[--commit]`，实现在 `plugins/tree.docnorm/lib/src/audit.dart`，收束事实解析在
+`lib/src/summary.dart`；全程确定性、**不调 LLM**。
+
+- **阈值配置化（D31）**：`DocPolicy` 新增 `thresholds`，从仓库策略文件
+  `thresholds:` 读取并覆盖内置默认（`package_lines 5000` / `file_lines 1000` /
+  `api_count 20` / `declaration_count 60` / `subpackage_count 12` /
+  `one_liner_chars 60` / `min_one_liner_chars 8`）；未知键进 `warnings`，非法值
+  fail-closed。
+- **包功能收束（D19）**：从 README 确定性解析「职责 / 入口 / 边界」三节 →
+  `one_liner` / `entry` / `boundaries`；`quality = empty | thin | suspect | ok`
+  （缺职责或空 → empty；一句话过短 / 缺入口或边界 → thin；一句话超长 → suspect）。
+  体积只算源码追踪文件，**排除测试与清单 / 配置**（D13）。只报告，不改写 README。
+- **`pkg_index` 补全**：`baseline` / `reanalyze` 写入的包记录新增
+  `summary` / `quality` / `stale`；`audit` 合并既有记录后补写同一批字段，
+  `stale = doc_state.codeFingerprint != 当前代码指纹`（指纹与 baseline 同口径）。
+- **四类建议（D8/§4.4）**：`split_size`（包行数或单文件超阈值）、
+  `split_function`（公开声明数或子包数超阈值）、`api_boundary`（API 端点超阈值）、
+  `reuse`（跨包同名导出，符号级、不走向量，P4 只报线索）。每条含
+  `kind/detail/package/targets/evidence/confidence/risk/plan/acceptance/lastTaskId`，
+  id 为稳定 FNV 短哈希；只写 `suggestions` 集合，**不建任务、不执行改造**（D20）。
+- **安全与幂等**：默认 dry-run，`commit` 才写 `suggestions` / `pkg_index`；同一事实
+  重复运行 **0 写**；保留已有 `lastTaskId`，删掉本次不再生成的建议；缺基线时
+  `baseline_required: true` 但仍可出建议。
+- 验证：analyze 0、单测 32/32（audit 4 条：收束事实与 quality、四类建议、commit
+  幂等、stale）、插件自检 48/0、`build_plugins --only tree.docnorm` 产物自检通过；
+  协议仓 docs/plugin 契约 14/14。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
