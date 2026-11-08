@@ -409,6 +409,26 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
   `build_plugins --only tree.docnorm` 产物自检通过；`tree.storage` 29/29、
   协议仓 docs/plugin 契约 14/14。
 
+**DN-4 实施记录（2026-11-09）**：`tree.docnorm` 新增只读命令 `docnorm.plan`，
+实现在 `plugins/tree.docnorm/lib/src/plan.dart`：
+
+- **变更归集**：`git diff --numstat --no-renames HEAD` + `git ls-files --others
+  --exclude-standard`，只认内容差异；`0 0`（stat-dirty / mode-only）不产计划。
+  `docnorm.reanalyze` 复用同一归集，不再用 `--name-only`。
+- **注入单元**：按「最具体包 + 子包」归并；README 存在时默认 `readme` 模式，
+  否则 `declarations`；测试文件走 `assertions`；显式 `full` 仅在
+  `full <= full_code_limit` 时使用，否则降级并写 `reasons`。
+- **两额度**：`context_cap = min(配置, model_max_seqlen × 70%)`（模型未配用兜底
+  128k），`stage_budget` 默认 400k；配置优先级 `.docnorm/config.json` <
+  `TREE_DOCNORM_*` 环境变量 < 调用方 `config` 覆盖。输出 `planned_tokens` /
+  `batches` / `requires_chunking` / `within_context_cap` / `within_stage_budget`，
+  两个额度分别报错，不静默裁剪。
+- **估计口径**：字符数 / `token_scale`（默认 4）的启发式值；同一单元同时给
+  full / readme / declarations / assertions 四种估计，接入模型池后再按真实 token
+  校准。
+- 验证：analyze 0、单测 19/19（plan 4 条）、插件自检 38/0、
+  `build_plugins --only tree.docnorm` 产物自检通过；协议仓 docs/plugin 契约 14/14。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
