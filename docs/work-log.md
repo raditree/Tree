@@ -6,6 +6,7 @@
 
 | 日期 | 事项 | 结论 / 关键数字 | 提交 | 原文档 |
 | --- | --- | --- | --- | --- |
+| 2026-11-08 | UI 移仓 S1 门禁先行 | 三条跨仓扫描改 `_uiSourceRoot()`（优先插件仓 UI 目录、回落根 `lib`、两处皆无即 fail）；legacy 扫描补 UI 目录、仓库根判据改根 pubspec；protocol 68 + core 657 全绿 | `09475a0` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | 核心面收窄 S7（43 → 35） | 删 store 4 / logs 3 / data-collection 1；基线改 coreOwned 35 / delegated 55 / contract 90 / kept 70；protocol 68 + core 657 全绿 | `223e9b9` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §2.5 |
 | 2026-11-08 | 过程文档拆分 | status 只管阶段与当前事项；work-log 记过去式；完成即迁出 | `ba0e1ef` | [project-status.md](project-status.md) |
 | 2026-11-08 | 项目状态入口上线 | 阶段模型（快速/稳定性/发版/维护/大版本）、待办总表、维护规则生效 | `4dc823b`、`9d1174d` | [project-status.md](project-status.md) |
