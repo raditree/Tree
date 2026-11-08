@@ -82,6 +82,16 @@ abstract final class ApiPaths {
   static const String terminalLocalSessions = '/api/terminal/local/sessions';
   static const String terminalSshSessions = '/api/terminal/ssh/sessions';
 
+  // ── 插件设置服务承接（非 delegated 契约集，仅登记前端调用面）─────────────
+  /// 插件设置 REST（K 系列）：由 `tree.settings` 经 `system.collect.api.routes`
+  /// 申报，核心**不实现**；UI 设置页只消费这三条。它们不属于 [delegated] 的
+  /// 55 条委派契约，登记在这里只是为了满足「前端用到的 /api 路径必须已声明」。
+  ///
+  /// 与核心既有的 `/api/settings/*`（传输 / 判活设置）是两套面，不能撞车。
+  static const String pluginSettingsSchema = '/api/plugin-settings/schema';
+  static const String pluginSettingsValues = '/api/plugin-settings/values';
+  static const String pluginSettingsReset = '/api/plugin-settings/reset';
+
   // ── 提问 ──────────────────────────────────────────────────────────────
   static const String questions = '/api/questions';
   static const String questionAnswer = '/api/questions/{qid}/answer';
@@ -609,6 +619,9 @@ abstract final class ApiPaths {
     pluginWindowsOfPlugin,
     terminalLocalSessions,
     terminalSshSessions,
+    pluginSettingsSchema,
+    pluginSettingsValues,
+    pluginSettingsReset,
     mcpServices,
     mcpService,
     toolsRunning,

@@ -201,14 +201,35 @@ void main() {
   });
 
   test('委派契约：coreOwned 35 / delegated 55 / pendingHandoffRoutes 0', () {
-    expect(ApiPaths.coreOwned.length, 35, reason: '核心永久面 35 条（平台 20 + 传输设置 11 + 引导壳 3 + 发现面 1）');
-    expect(ApiPaths.delegated.length, 55, reason: '插件面 55 条（git 3 已删除；消息详情端点 +1）');
+    expect(
+      ApiPaths.coreOwned.length,
+      35,
+      reason: '核心永久面 35 条（平台 20 + 传输设置 11 + 引导壳 3 + 发现面 1）',
+    );
+    expect(
+      ApiPaths.delegated.length,
+      55,
+      reason: '插件面 55 条（git 3 已删除；消息详情端点 +1）',
+    );
     expect(ApiPaths.pendingHandoffRoutes, isEmpty, reason: 'A5 已清空迁移债台账');
     expect(ApiPaths.contractRoutes.length, 90);
-    expect(ApiPaths.kept.length, 70, reason: 'git 3 已删；UI 多窗口 +2；终端 REST +2；本地安装 +1；消息详情 +1；发布源设置 +2；store/logs/data-collection 8 条方法路由（5 条路径）已删');
-    expect(ApiPaths.contractRoutes.length, ApiPaths.coreOwned.length + ApiPaths.delegated.length);
+    expect(
+      ApiPaths.kept.length,
+      73,
+      reason:
+          'git 3 已删；UI 多窗口 +2；终端 REST +2；本地安装 +1；消息详情 +1；发布源设置 +2；'
+          '插件设置 REST +3（K 系列，非 delegated）；store/logs/data-collection 8 条方法路由'
+          '（5 条路径）已删',
+    );
+    expect(
+      ApiPaths.contractRoutes.length,
+      ApiPaths.coreOwned.length + ApiPaths.delegated.length,
+    );
     expect(ApiPaths.coreOwned.intersection(ApiPaths.delegated), isEmpty);
-    expect(ApiPaths.pendingHandoffRoutes.difference(ApiPaths.delegated), isEmpty);
+    expect(
+      ApiPaths.pendingHandoffRoutes.difference(ApiPaths.delegated),
+      isEmpty,
+    );
 
     final RegExp keyShape = RegExp(r'^(GET|POST|PUT|PATCH|DELETE) /');
     for (final String route in ApiPaths.contractRoutes) {
