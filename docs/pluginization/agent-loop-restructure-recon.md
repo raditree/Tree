@@ -427,6 +427,9 @@ UI 对 `role=system` 的显示口径也要确认（当前可能按未知 role �
 > **AC-3 已完成**：每跳插入点注入（tip / system_message，只追加不改前缀）+ 工具批
 > 原子（只认硬取消）+ `direct task` 迭代边界终止 + 工具表按会话快照与失效；
 > analyze 0、tree.agent 414 全绿（新增 6 条）。
+> **AC-4 已完成**：`llm_pre` / `llm_repair` / `llm_post` 三个自建中转站 + `error/error_reason`
+> 契约（显式 error 终止、其余 fail-open）+ 超时/非法回包/无订阅者兜底；
+> analyze 0、tree.agent 422 全绿（新增 8 条）。
 
 | 切片 | 内容 | 证明点 / 门禁 |
 | --- | --- | --- |
