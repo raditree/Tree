@@ -25,7 +25,7 @@
 
 | 车道 | 当前一步 | 状态 | 下一步 | 方案 |
 | --- | --- | --- | --- | --- |
-| **A UI 移仓** | MIG-UI-3 插件仓落源（S2） | 进行中 | MIG-UI-4 桌面仓删源 + 构建改道（S3） | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
+| **A UI 移仓** | MIG-UI-4 桌面仓删源 + 构建改道（S3） | 进行中 | MIG-UI-5 CI 与发布链收口（S4） | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | **B 核心收窄** | — | 空闲（S7 已完成） | 待新任务（S9 归车道 C） | 同上 §2.5 |
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |

@@ -6,6 +6,7 @@
 
 | 日期 | 事项 | 结论 / 关键数字 | 提交 | 原文档 |
 | --- | --- | --- | --- | --- |
+| 2026-11-08 | UI 移仓 S2 插件仓落源 | 242 文件迁入 `plugins/tree.ui.default/`；pubspec 零 path 依赖、自持 `protocol_contract.dart`（UI 实调 25 条路径）；插件仓 CI 增 ui job；analyze 0 问题、flutter test 908 通过/1 跳过、contract 门禁通过 | 插件仓 `9275cb9`；桌面仓 `38310b1` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | UI 移仓 S8 契约冻结 + 黑盒 | `/api/meta.ui_contract = 1.0`（只增不改）；新增 6 条黑盒用例（流式/工具卡/终端/站点重连/插件面板 + 套件自检），真核心 + 真插件进程、全程字面量；protocol 68 + core 663 全绿 | `ac58897` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | UI 移仓 S1 门禁先行 | 三条跨仓扫描改 `_uiSourceRoot()`（优先插件仓 UI 目录、回落根 `lib`、两处皆无即 fail）；legacy 扫描补 UI 目录、仓库根判据改根 pubspec；protocol 68 + core 657 全绿 | `09475a0` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | 核心面收窄 S7（43 → 35） | 删 store 4 / logs 3 / data-collection 1；基线改 coreOwned 35 / delegated 55 / contract 90 / kept 70；protocol 68 + core 657 全绿 | `223e9b9` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §2.5 |
