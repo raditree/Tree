@@ -131,21 +131,34 @@ void main() {
           ? manifest['files'] as List<dynamic>
           : <dynamic>[];
       expect(files, isNotEmpty, reason: '$id 的 files 至少要有一个');
-      for (final Object? entry in files) {
-        final String name = _str(entry);
+      // UI 插件是整包 zip（含 data/ 与 dll），源清单用 `["**"]` 表达"整个目录"。
+      // 装机端走 `archive` 形态，不按 files[] 逐项列表，所以这里放行这一种写法。
+      final bool wholeArchive = files.length == 1 && _str(files.first) == '**';
+      if (wholeArchive) {
         expect(
-          name.contains('/') || name.contains(r'\') || name.contains('..'),
-          isFalse,
-          reason: '$id 的 files 里「$name」必须是纯文件名（防路径穿越）',
+          runtime,
+          'ui',
+          reason: '$id 用了 files:["**"]，但 runtime 不是 ui（只有 UI 走整包 archive）',
         );
+      } else {
+        for (final Object? entry in files) {
+          final String name = _str(entry);
+          expect(
+            name.contains('/') || name.contains(r'\') || name.contains('..'),
+            isFalse,
+            reason: '$id 的 files 里「$name」必须是纯文件名（防路径穿越）',
+          );
+        }
       }
       final String command = _str(manifest['command']);
       expect(command, isNotEmpty, reason: '$id 缺 command（装完不知道拉哪个）');
-      expect(
-        files.map((Object? e) => _str(e)),
-        contains(command),
-        reason: '$id 的 command（$command）必须出现在 files 里',
-      );
+      if (!wholeArchive) {
+        expect(
+          files.map((Object? e) => _str(e)),
+          contains(command),
+          reason: '$id 的 command（$command）必须出现在 files 里',
+        );
+      }
       final String suspension = _str(manifest['suspension']);
       expect(
         suspension.isEmpty || suspension == 'keep',
@@ -175,7 +188,10 @@ void main() {
     for (final Map<String, dynamic> manifest in manifests) {
       final String id = _str(manifest['id']);
       final String runtime = _str(manifest['runtime'], fallback: 'binary');
-      // headless / ui / 历史 binary 都要编成可执行体；python 是脚本，不在此列。
+      // UI 插件是 Flutter 工程：没有 `<id>_plugin.dart`，由 package_ui_plugin 构建
+      // （`dart compile exe` 编不了 Flutter），`build_plugins.dart` 显式跳过它。
+      if (runtime == 'ui') continue;
+      // headless / 历史 binary 都要编成可执行体；python 是脚本，不在此列。
       if (runtime == 'python') continue;
       final File entry = File('${pluginRepo.path}/$id/${id}_plugin.dart');
       if (!entry.existsSync()) missing.add('$id → ${entry.path}');

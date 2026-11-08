@@ -140,6 +140,9 @@ void main() {
       if (!dir.existsSync()) continue;
       for (final FileSystemEntity entity in dir.listSync(recursive: true)) {
         if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        // UI 自持契约（零依赖 D2）本身就是这些常量的定义处，不是"重复定义"；
+        // 它和核心的漂移由黑盒一致性套件 + `/api/meta.ui_contract` 兜住。
+        if (_isUiContract(entity.path)) continue;
         final String src = entity.readAsStringSync();
         if (redefinition.hasMatch(src)) offenders.add(entity.path);
         if (literal.hasMatch(src)) hardcoded.add(entity.path);
@@ -166,6 +169,8 @@ void main() {
     // 所以这里按文件登记"非流式帧的 seq 用法"，其余一律必须走 WsStreamSeq。
     final Map<String, String> registered = <String, String>{
       '$uiRel/io/websocket_service.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
+      '$uiRel/io/protocol_contract.dart':
+          'UI 自持契约：WsStreamSeq.field 的 `seq` 字面量在这里定义（零依赖 D2）',
       'packages/tree_core/lib/src/ws/ws_hub.dart':
           '大帧分片 frame_chunk 的分片序号（传输层）',
       'packages/tree_core/lib/src/ws/inbound_frames.dart': '核心侧重组成大帧时读分片序号',
@@ -313,6 +318,11 @@ Directory _uiSourceRoot(Directory repoRoot) {
   }
   return root;
 }
+
+/// UI 自持契约文件（零依赖 D2）。它就是协议常量的**定义处**（手抄子集），
+/// 因此不参与「前后端都不得重复定义」那两条扫描；漂移由黑盒套件兜住。
+bool _isUiContract(String path) =>
+    path.replaceAll('\\', '/').endsWith('/io/protocol_contract.dart');
 
 /// 扫描本仓库源码（前端 + 各包）里的 `'type': 'x'` 字面量。
 Set<String> _scanTypeLiterals(Directory repoRoot) {
