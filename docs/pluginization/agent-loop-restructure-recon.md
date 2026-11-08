@@ -430,6 +430,10 @@ UI 对 `role=system` 的显示口径也要确认（当前可能按未知 role �
 > **AC-4 已完成**：`llm_pre` / `llm_repair` / `llm_post` 三个自建中转站 + `error/error_reason`
 > 契约（显式 error 终止、其余 fail-open）+ 超时/非法回包/无订阅者兜底；
 > analyze 0、tree.agent 422 全绿（新增 8 条）。
+> **AC-5 已完成**：`agent_loop` 执行站（`agent.message.send` / `agent.state.list` / `get`）
+> + 来源身份强制（只认核心 `meta.triggered_by`）+ scope fail-closed + 状态快照
+> （working/idle、queue_depth、own_running、subagent_running）；
+> analyze 0、tree.agent 427 全绿（新增 5 条）。
 
 | 切片 | 内容 | 证明点 / 门禁 |
 | --- | --- | --- |
