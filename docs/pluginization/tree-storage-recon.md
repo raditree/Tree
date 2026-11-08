@@ -195,8 +195,13 @@
 - 偏离：`compact` 未用 Sembast 独立 compact（无此 API），改为关闭/重开缓存库；
   `storage.import` 的 `collection` 可覆盖 manifest 里的集合名（目标须为空或 replace）；
   `purge` 删除库文件后只清理空目录，非空 `export/` 快照保留。
-- **ST-6 留待 DN-6**：`tree.docnorm` 在 baseline / reanalyze 落地时以 `requires` 依赖
-  `tree.storage` 并做缺存储 fail-closed。
+- **ST-6 实施记录（2026-11-08，随 DN-6）**：`tree.docnorm` 的 `plugin.json` 已声明
+  `requires.plugins = [{id: tree.storage, version: >=0.1.0}]`；
+  `docnorm.baseline` / `docnorm.reanalyze --changed` 经自建存储站写入
+  `doc_contract` / `pkg_index` / `doc_state`；存储不可用、缺 `source_plugin_id`
+  或缺 `team_id` ⇒ `storage_unavailable` fail-closed（TC-ST-10），且发生在写任何
+  目标仓库文件之前。验证：docnorm 单测 15/15、自检 35/0、产物自检通过；
+  tree.storage 29/29。
 
 
 门禁沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →

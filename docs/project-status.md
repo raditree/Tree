@@ -31,8 +31,8 @@
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | P0 文档归一化：DN-6 基线（DN-3 契约侦查已完成） | 进行中 | 解锁 P1；**P3 前需 P8 golden set（I ST-1~ST-5、J MP-1~MP-7 已就绪）**；DN-11（状态/日志维护）可与 DN-4 并行 | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8/§9 |
-| **I 存储插件 tree.storage** | ST-6 docnorm 接入（ST-1~ST-5 已完成） | 进行中 | 随 DN-6 接入；缺存储 fail-closed | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
+| **H 标准开发流生产线** | P0 文档归一化：DN-6 基线已完成（默认 dry-run + `--commit`） | 进行中 | DN-4 变更归集与计划 → DN-5 注入与生成；**P3 前需 P8 golden set（I ST-1~ST-6、J MP-1~MP-7 已就绪）**；DN-11（状态/日志维护）可与 DN-4 并行 | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8/§9 |
+| **I 存储插件 tree.storage** | — | 已完成（ST-1~ST-6；docnorm 已接入） | 待新任务 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；docnorm embedding/JEV 消费随 DN-9） | 待 DN-9 接入 | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
 

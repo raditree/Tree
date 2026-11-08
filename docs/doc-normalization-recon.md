@@ -378,6 +378,37 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
   tree.docnorm` 产物自检通过；本仓契约 0 违规。`commit_style` 仍标 `unknown`
   （DN-8 才执行 git 探测）；`git ls-files` 收敛仍留 DN-4（当前按目录扫描 + 忽略构建产物）。
 
+**DN-6 实施记录（2026-11-08）**：`tree.docnorm` 新增两条执行站命令
+`docnorm.baseline [--commit]` 与 `docnorm.reanalyze --changed`，实现在
+`plugins/tree.docnorm/lib/src/baseline.dart`：
+
+- **默认 dry-run**：只出 `plan`（逐文件 diff / `skipped` / `rejected` /
+  `rewrite_allowlist`）、缺口与 L0 状态；`--commit` 才写目标仓库并写入
+  `tree.storage`。`written` 只记真实写盘，`would_write` 记计划。
+- **只追加**：章节按 `sections: [{doc, heading, body}]` 追加到文末，已存在即
+  `skipped`；索引按 `indexes: [{index, line, group?}]` 追加，`group` 命中时插到
+  该分组末尾，既有行内容与顺序不变；整篇改写必须进 `rewrite_allowlist`，
+  否则进 `rejected` 且不写盘（D29）。
+- **`doc_state`**：`{addedSections[], codeFingerprint, updatedAt, stale}`，按文档
+  （`#doc:<path>`）与包（`#pkg:<id>`）两条 key 落库；指纹用
+  `git hash-object --stdin-paths` 取 blob id，再对有序 `path\tblob` 清单哈希（D4）。
+- **`reanalyze --changed`**：变更用 `git diff --name-only HEAD` +
+  `git ls-files --others --exclude-standard`（不读 `git status`），映射到最具体的
+  已索引包并只重算这些包；没有 `pkg_index` 时 `baseline_required`（D24）；
+  `changed=false` 时 `changed_required`，不做隐式全仓重扫。
+- **ST-6 存储接入**：`plugin.json` 声明 `requires.plugins = [tree.storage]`；
+  `doc_contract` / `pkg_index` / `doc_state` 经自建存储站 `storage.*` 读写；
+  存储不可用、缺 `source_plugin_id` 或缺 `team_id` ⇒ `storage_unavailable`
+  fail-closed，且发生在写任何目标仓库文件之前（TC-ST-10）。
+- **幂等**：同一指纹 + 同一提案重复运行 **0 文件写 / 0 存储写**（`doc_state`
+  比较忽略 `updatedAt`；`doc_contract` 在落盘后重算再入库，避免"新增标题导致
+  下次重复写库"）。
+- **边界**：L1 正文生成仍属 DN-5，本命令只接收提案并执行"只追加"落盘，不凭空
+  写占位章节；提交批次与门禁执行仍属 DN-8。
+- 验证：analyze 0、单测 15/15（baseline 6 条）、插件自检 35/0、
+  `build_plugins --only tree.docnorm` 产物自检通过；`tree.storage` 29/29、
+  协议仓 docs/plugin 契约 14/14。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
