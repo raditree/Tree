@@ -424,6 +424,9 @@ UI 对 `role=system` 的显示口径也要确认（当前可能按未知 role �
 > **AC-2 已完成**：信封校验 + 特殊来源规则 + direct/queue 双队列 + tip 不唤醒 /
 > task 唤醒 + `agent.state` 状态广播 + 去掉「到达即打断」；
 > analyze 0、tree.agent 408 全绿（新增 12 条）。
+> **AC-3 已完成**：每跳插入点注入（tip / system_message，只追加不改前缀）+ 工具批
+> 原子（只认硬取消）+ `direct task` 迭代边界终止 + 工具表按会话快照与失效；
+> analyze 0、tree.agent 414 全绿（新增 6 条）。
 
 | 切片 | 内容 | 证明点 / 门禁 |
 | --- | --- | --- |
