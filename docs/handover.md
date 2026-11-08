@@ -99,9 +99,9 @@ UI 插件（WebSocket 客户端）
 
 | 套件 | 结果 |
 | --- | --- |
-| `packages/tree_core` | analyze 干净；`dart test` **644 passed / 2 skipped**（2026-11-01 实测，含本地安装 13 条；#42 两轮修复的 30 轮连绿记录仍有效） |
-| `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁；`coreOwned 40 / contract 95 / kept 73`） |
-| 根仓 | `flutter analyze lib` 干净；`flutter analyze lib test` 仅既有 7 issues（`thinking_window_test`，与插件化无关）；`flutter test` **886 passed**（2026-10-31 实测，此后未动 UI） |
+| `packages/tree_core` | analyze 干净；`dart test` **663 passed / 2 skipped**（2026-11-08 实测） |
+| `packages/tree_protocol` | **68 passed**（含路由完备性与文档门禁；`coreOwned 35 / delegated 55 / contract 90 / kept 70`） |
+| UI 插件（插件仓 `plugins/tree.ui.default`） | `flutter analyze lib` 干净；`flutter analyze lib test` 仅既有 7 issues（`thinking_window_test`）；`flutter test` **908 passed / 1 skipped**（2026-11-08 实测） |
 | `plugins/tree.agent` | **373 passed**（2026-11-01 实测，含接管/回滚 7 条） |
 | `plugins/ssh_executor` | **188 passed**（2026-11-01 实测） |
 | `plugins/files` | **10 passed**（2026-11-01 实测） |
@@ -135,12 +135,13 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 # 4) 插件仓零核心依赖检查（从根目录跑）
 <flutter-sdk>/bin/dart.bat run tool/check_plugin_repo_contract.dart
 #    （插件仓内用 --plugin-root . 跑同一份脚本）
-# 5) 只有动了 UI 才跑（根目录）
-<flutter-sdk>/bin/flutter.bat analyze lib test
+# 5) 只有动了 UI 才跑（UI 源码在插件仓的 tree.ui.default）
+cd plugins/tree.ui.default; <flutter-sdk>/bin/flutter.bat analyze lib
 <flutter-sdk>/bin/flutter.bat test
 ```
 
-插件仓各自跑自己的测试（`cd plugins/<name> && dart test`）。
+插件仓各自跑自己的测试（`cd plugins/<name> && dart test`）。桌面仓根**不再有 Flutter 工程**：
+根目录只留工具脚本，`dart run tool/*.dart` 用的根 pubspec 只声明 `tree_protocol`。
 
 ### 5.3 常见坑（都已踩过）
 
@@ -175,7 +176,7 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 | 桌面仓分支 | `desktop`（`main` 是旧的服务端 Python 形态，不合并） |
 | 插件仓分支 | `master`（`plugins/` 内） |
 | 推送 | **已同步**：桌面仓 `origin/desktop` = `gitee/desktop` = `cab3582`；插件仓 `origin/master` = `gitee/master` = `f4ca29c` |
-| 版本号 | `pubspec.yaml` → **`1.0.5+1`**（`lib/app_version.dart` 同步，`test/version_info_test.dart` 18 条绿） |
+| 版本号 | 界面插件版本 `plugins/tree.ui.default/pubspec.yaml` → **`1.0.5+1`**（`lib/app_version.dart` 同步，`test/version_info_test.dart` 18 条绿）；桌面仓根 `pubspec.yaml` 同为 **`1.0.5+1`**（安装包 / 核心 / loader 用） |
 | Tag | 桌面仓 **`v1.0.5+1`**（→ `cab3582`）、插件仓 **`v1.0.5`**（→ `f4ca29c`），两仓两个远端都已推 |
 | 发布资产 | **GitHub 已挂**：`Tree` release 2 个（`tree-desktop-1.0.5-windows-x64.zip` 30.7 MB / `...-setup.exe` 24.0 MB）；`tree-plugins` release **13 个**（`plugin-index.json` + 12 个 `tree_*.exe`）。**Gitee release 已建但资产未传**（`v1.0.5+1` id 1261447、`v1.0.5` id 1261449）——gitee CLI 的 token 是回退兜底，没有可用的 access token；插件端会因 Gitee 索引缺失自动回退 GitHub |
 | 构建环境 | Inno Setup **装在 `D:\app\Inno Setup 6`**（6.7.3，`package_windows.dart` 会自动探测到）；`iscc` 不在 PATH 属正常 |
@@ -211,7 +212,7 @@ cd packages/tree_protocol; <flutter-sdk>/bin/dart.bat test
 | **本地 zip 安装** | **已完成（2026-11-01，桌面仓 `145f565`）**：`POST /api/plugin/install/local` + `PluginDownloader.installFromZip` + 前端面板「本地安装」按钮（`file_picker`）；`test/plugin_install_local_test.dart` 13 条 | 补 `POST /api/plugin/install/local`，或明确本期不做并改文案 | L-10；known-issues #38 |
 | **compact 命令面失效** | A5 撤了领域实现、没撤点位表 ⇒ 20 条内置命令「申报了、路由得到、执行必失败」，随包插件 compact 的 `llm.call` / `fs.read` / `tool.call` / `agent.compact` 四条全踩在上面。**已收口（2026-10-31，片 1 / 片 3（桌面）+ 片 2 / 片 4 / Q-7 (a)（插件））**：点位表领域族清零（36 → 28 点位、29 → 9 命令）、撤 `tool.` / `agent.` 前缀禁令、落盘空壳读侧对账、两处门禁；两执行器改名成对称的 `local.*` / `ssh.*` 各 10 条 + 租约统一到插件侧 + tree.agent 换口 + 核心撤 `workspace/register` 与租约簿记 ⇒ **文件与终端两族真机已能打通**；让名的另一半由 tree.agent 在 `agent_tools` 站认领 `llm.call` / `fs.read` / `tool.call` / `agent.compact` / `session.rename`（插件仓 `b21e946`），compact / sample **命令名零改动**即恢复 | 真机复核 compact 的三条功能（总结调用 / 必读文件 / todo 快照） | **L-25 Q-5 / Q-7**；known-issues **#43**；契约 §8.4 落地状态 |
 | **执行站契约登记** | 契约文档已落（[exec_station_contract.md](exec_station_contract.md)：信封 / 命令表 / 码来源 / 幂等逐条对照 + 目标口径 + §8 已拍板统一口径）；**片 1 / 2 / 3 / 4 / 5 均已合**（2026-10-31，片 5 = 桌面仓 `8876254` + 插件仓 `f578894`）；`code` 八环链路、`tree_protocol` 码表、§5 门禁五条断言全部落地，门禁六条用例与 tree_core 全量 627 条跑绿（`ssh_lease_unknown` / `local_lease_unknown` 已归并为 `lease_unknown`） | 文档 §8.4 全部落地，门禁跑绿 | L-25 |
-| **插件仓 CI** | **已完成（2026-11-01）**：插件仓 `.github/workflows/ci.yml`（`f4ca29c`：检出桌面仓拿同一份门禁脚本，跑 `--selftest` + 全仓扫描，再按矩阵对 7 个 Dart 插件跑 `dart pub get / analyze / test`；`local_executor` 无 test 目录只守 analyze）；桌面仓 `.github/workflows/ci.yml`（`4fcedef`：协议 / 核心 / 插件契约 / UI 四段）。两仓均为公开仓，跨仓检出无需 PAT；runner 与 SDK 都钉在维护版本 | 插件仓流水线跑同一脚本 | L-21 |
+| **插件仓 CI** | **已完成（2026-11-01）**：插件仓 `.github/workflows/ci.yml`（`f4ca29c`：检出桌面仓拿同一份门禁脚本，跑 `--selftest` + 全仓扫描，再按矩阵对 7 个 Dart 插件跑 `dart pub get / analyze / test`；`local_executor` 无 test 目录只守 analyze）；**2026-11-08 增 `ui` job**（`9275cb9`：Flutter 3.47.5、`working-directory: tree.ui.default`、**不检出桌面仓**，验零依赖）；桌面仓 `.github/workflows/ci.yml`（协议 / 核心 / 插件契约 / UI 四段，UI job 于 `abcc405` 改为检出插件仓到 `plugins/`）。两仓均为公开仓，跨仓检出无需 PAT；runner 与 SDK 都钉在维护版本 | 插件仓流水线跑同一脚本 | L-21 |
 | **发版工程** | **已完成（2026-11-01）**：构建链全绿（core → agents → plugins → windows 包 → UI 插件包 → Inno setup），两仓 push + tag（桌面 `v1.0.5+1` / 插件 `v1.0.5`），GitHub 资产已挂（桌面 2 个、插件 13 个）；**Gitee 资产待传**（缺可用 access token，插件端会自动回退 GitHub） | Gitee 资产镜像（需 token）；compact 真机复核 | §6 |
 
 ### P1 · 真机验收（必须在有环境的机器上做）
@@ -328,10 +329,11 @@ L-20 stdio 多实例、L-23 scope 去领域化（协议破坏性变更，单独�
 | UI 进程与窗口号 | `packages/tree_core/lib/src/plugin/ui_host.dart` |
 | UI WS 订阅桥 | `packages/tree_core/lib/src/plugin/station_ws_bridge.dart` |
 | 协议真源 | `packages/tree_protocol/lib/src/api_paths.dart`（`coreOwned` / `delegated` / `kept`） |
-| UI 附着核心 | `lib/io/core_attachment.dart`、`lib/io/ui_identity.dart` |
-| 托盘与退群 | `lib/io/tray_service.dart` |
-| 503 提示 | `lib/io/service_availability.dart` + `lib/ui/...` 顶部横幅 |
-| 终端传输面 | `lib/ui/services/terminal_transport.dart` |
+| UI 附着核心 | `plugins/tree.ui.default/lib/io/core_attachment.dart`、`lib/io/ui_identity.dart` |
+| 托盘与退群 | `plugins/tree.ui.default/lib/io/tray_service.dart` |
+| 503 提示 | `plugins/tree.ui.default/lib/io/service_availability.dart` + `lib/ui/...` 顶部横幅 |
+| 终端传输面 | `plugins/tree.ui.default/lib/ui/services/terminal_transport.dart` |
+| UI 自持契约 | `plugins/tree.ui.default/lib/io/protocol_contract.dart`（零依赖；只增不改） |
 | agent 插件委派 | `plugins/tree.agent/lib/src/delegate.dart` |
 | agent 执行器激活 | `plugins/tree.agent/lib/src/station/agent_executor.dart`、`runtime/agent_runtime.dart` |
 | 文件插件 | `plugins/files/lib/` |

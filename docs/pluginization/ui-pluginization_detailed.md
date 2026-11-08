@@ -19,7 +19,7 @@
 | UI 插件可执行体 | `tree-plugins` 仓 release 资产：`tree-ui-default-<ver>.zip` |
 | 插件清单 | 包内 `plugin.json` |
 | 索引条目 | `plugin-index.json` 的 `plugins[]` 中新增一项 |
-| 本仓代码改造 | `lib/`（attach 化、站点订阅）、`tool/`（打包脚本）、`pubspec.yaml`（如引入新依赖） |
+| 本仓代码改造 | **已迁出**：UI 源码现在插件仓 `plugins/tree.ui.default/`（`lib/` attach 化与站点订阅、`pubspec.yaml`）；本仓只剩 `tool/`（打包脚本）与核心侧点位 |
 
 **不做**：不改核心的 `runtime: headless | ui` 分类机制（那是批次 D 的事）；不在本阶段实现悬浮球或多窗口（属于后续 UI 插件，见 §8）。
 
@@ -90,7 +90,10 @@ plugin.json
 
 ---
 
-## 4. 代码改造清单（本仓）
+## 4. 代码改造清单（插件仓 `plugins/tree.ui.default/`）
+
+> 2026-11-08：本清单里的 UI 文件已整体迁入插件仓（S2/S3），下表的 `lib/...` 均指
+> `plugins/tree.ui.default/lib/...`。桌面仓根不再有 Flutter 工程。
 
 | 文件 | 改动 | 理由 |
 | --- | --- | --- |

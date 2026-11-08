@@ -15,6 +15,24 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
+## [未发布] — 2026-11-08
+
+### 断言变化（新增 / 修改的 README 不变量）
+
+- **UI 是零依赖的 `runtime: ui` 插件：契约自持、只增不改，发现面发布 `ui_contract`**
+  （**新增** `plugins/tree.ui.default/lib/io/protocol_contract.dart` 的 `uiContractVersion`、
+  `plugins/tree.ui.default/lib/README.md` 不变量 4；
+  [docs/pluginization/ui-pluginization.md](docs/pluginization/ui-pluginization.md) §4.1 路径表）：
+  - UI 不 import 核心包：路径 / 帧名 / 终端与站点模型由它自己手写一份，
+    `/api/meta.ui_contract`（`1.0`）是两侧唯一的版本握手；改名或改语义 = 换契约，
+    必须换新路径或新帧名并升这个版本；
+  - 一致性由 [ui_contract_blackbox_test.dart](packages/tree_core/test/ui_contract_blackbox_test.dart)
+    钉住：流式 / 工具卡 / 终端 / 站点重连 / 插件面板五条链路，**全程字面量**驱动真核心 +
+    真插件进程，且套件自检不得引用协议包常量；
+  - 桌面仓根不再有 Flutter 工程：`flutter analyze / test / build` 一律在
+    `plugins/tree.ui.default/` 执行；`tool/package_windows.dart` 用 `--ui-dir`
+    （默认该目录）取界面源码与界面版本，安装包 / 核心 / loader 版本仍取桌面仓根 pubspec。
+
 ## [1.0.5+1] — 2026-11-02
 
 ### 断言变化（新增 / 修改的 README 不变量）

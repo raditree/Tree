@@ -24,7 +24,6 @@ dart --version             # 确认 3.13.4
 
 ```
 desktop/
-├── lib/                       # Flutter 前端（ui 三栏界面；io 只做进程附着与传输）
 ├── packages/
 │   ├── tree_protocol/         # 协议单一真源（WS 帧 / REST 路径 / 握手）+ 完备性门禁
 │   ├── tree_local_exec/       # 本机与 SSH 工作空间 IO（dartssh2 与中转站两条后端）
@@ -32,15 +31,20 @@ desktop/
 │   ├── tree_agent/             # 目标机（Linux）执行体：tree_agent 二进制
 │   ├── tree_core/               # 核心：服务 / LLM / 工具 / 团队 / Spec / MCP / 插件
 │   └── tree_core_cli/           # tree_core.exe 入口 + 真进程端到端测试
-├── test/                        # 前端测试（flutter test）
-├── tool/                        # 构建与打包脚本（build_core / build_agent / build_plugins / package_windows / installer）
+├── tool/                        # 构建与打包脚本（build_core / build_agent / build_plugins / package_windows / package_ui_plugin / installer）
 ├── docs/                        # 文档（入口 docs/README.md）
 └── plugins/                     # **插件仓（raditree/tree-plugins）的本地 clone**（独立 git 仓、对桌面仓已 gitignore）：
-                                 #   七个插件的 Dart 源码 + 公共骨架 `_kit` + 每个目录一份 `plugin.json`。
-                                 #   其中 `ssh_executor` / `self_updater` 是 package 型（自带 pubspec，
+                                 #   七个功能插件源码 + 公共骨架 `_kit` + 每个目录一份 `plugin.json`；
+                                 #   **`tree.ui.default/` 是 Flutter UI 工程**（lib/test/windows/assets，
+                                 #   runtime: ui、零依赖、自持 protocol_contract.dart）。
+                                 #   `ssh_executor` / `self_updater` 是 package 型（自带 pubspec，
                                  #   path 依赖本仓的 tree_tunnel_protocol）⇒ **本仓必须 clone 在桌面仓的
-                                 #   plugins/ 下才能编出这两条**（其余五条零依赖，单文件即可）。
+                                 #   plugins/ 下才能编出这两条**（其余插件零依赖）。
 ```
+
+> 桌面仓**不再含 Flutter 工程**：界面源码、`flutter analyze/test`、`flutter build` 都在
+> `plugins/tree.ui.default/` 里（插件仓）。集中改道的原因是"该在哪个目录跑 flutter build"
+> 只能有一个答案。
 
 ## 3. 构建与运行
 
@@ -49,7 +53,8 @@ desktop/
 dart compile exe packages/tree_core_cli/bin/tree_core.dart `
     -o build/windows/x64/runner/Debug/tree_core.exe
 
-# 2) 运行应用（自动定位并拉起核心）
+# 2) 运行应用（自动定位并拉起核心）——工作目录必须是 UI 插件工程
+cd plugins/tree.ui.default
 flutter run -d windows
 ```
 
@@ -121,7 +126,9 @@ dart run tool/build_plugins.dart --out <目录> --index <文件>   # 改产物�
 
 - `--only` **不会**把索引重写成那一条（与旧索引按 id 合并）——全量构建才不合并（仓里删掉的
   插件必须从索引消失，留着就是幽灵条目）；
-- 插件仓没 clone 时本命令直接退 2 并告诉你该 clone 到哪，不静默产出空索引。
+- 插件仓没 clone 时本命令直接退 2 并告诉你该 clone 到哪，不静默产出空索引；
+- `runtime: ui`（`tree.ui.default`）会被**显式跳过**并指路 `tool/package_ui_plugin.dart`：
+  `dart compile exe` 编不了 Flutter，静默跳过又会让面板只剩"没得上"。
 
 开发态不必先构建也能跑：真进程用例（`compact_plugin_e2e_test` / `compact_panel_ui_test` /
 `sample_plugin_layout_e2e_test` / `plugin_self_station_e2e_test`）跑的是 `dart <插件仓里那个
@@ -139,9 +146,9 @@ dart run tool/build_plugins.dart --out <目录> --index <文件>   # 改产物�
 | **自迭代插件** | `cd plugins/self_updater && dart test` | 三世时序、工具申报、转储/取回、拒绝生命周期原语（同上，也在插件仓） |
 | 核心 | `cd packages/tree_core && dart test` | 存储 / LLM 循环 / 工具 / 团队 / Spec / MCP / 插件 / REST+WS 端到端 |
 | 核心真进程 | `cd packages/tree_core_cli && dart test` | 编译产物能起、握手、鉴权、优雅退出（需 `TREE_CORE_EXE`） |
-| 前端 | `flutter test`（仓库根） | 组件与 API 客户端 |
-| 托盘与关窗 | `flutter run -d windows` 手动一次 | 点关闭按钮应**只隐藏窗口**（托盘图标出现、核心进程仍在），双击托盘图标恢复窗口；退出走托盘菜单 |
-| 静态检查 | `dart analyze`（每个包）+ `flutter analyze lib test` | **必须零告警**才能提交 |
+| 前端（UI 插件） | `cd plugins/tree.ui.default && flutter test` | 组件、API 客户端、帧路由；源码在插件仓 |
+| 托盘与关窗 | `cd plugins/tree.ui.default && flutter run -d windows` 手动一次 | 点关闭按钮应**只隐藏窗口**（托盘图标出现、核心进程仍在），双击托盘图标恢复窗口；退出走托盘菜单 |
+| 静态检查 | `dart analyze`（每个包）+ `cd plugins/tree.ui.default && flutter analyze lib` | **必须零告警**才能提交 |
 
 **门控真机测试**（本机没有 sshd / 没有编译产物时自动跳过，设了才跑）：
 
@@ -230,9 +237,14 @@ ssh -i .self/e2e/id_e2e -p 2222 -o StrictHostKeyChecking=no -o BatchMode=yes `
 ## 5. 打包与安装包
 
 ```powershell
-# 便携 zip（构建应用 + 编译核心 + 拷 pdfium.dll + 写使用说明 + 自检 + 压缩）
+# 便携 zip（在 UI 插件目录构建 + 编译核心 + 拷 pdfium.dll + 写使用说明 + 自检 + 压缩）
+# --ui-dir 默认 plugins/tree.ui.default；UI 源码在插件仓，桌面仓不再有根 Flutter 工程
 dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 # 产物：dist/tree-desktop-<版本>-windows-x64.zip
+
+# UI 插件包（面板「安装 / 更新」用的那一份）+ 合并发布索引
+dart run tool/package_ui_plugin.dart --build
+# 产物：dist/tree-ui-default-<版本>.zip + build/plugins/plugin-index.json 的 tree.ui.default 条目
 
 # 只要核心单文件
 dart run tool/build_core.dart            # → dist/tree_core.exe（约 10 MB）
@@ -256,12 +268,12 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 
 脚本替你做的、**必须由脚本做**的事（漏一个用户就会踩坑）：
 
-1. `flutter build windows --release --no-tree-shake-icons`：**不做图标字体子集化**。子集化会静默丢掉
+1. 在 `plugins/tree.ui.default/` 里跑 `flutter build windows --release --no-tree-shake-icons`：**不做图标字体子集化**。子集化会静默丢掉
    一批明明在用的图标（实测 2026-10-04：`badge_outlined` / `chat_bubble` / `folder` / `visibility(_off)` /
    `keyboard_double_arrow_left/right` 都不在子集里），后果是**按钮一片空白**——而且只有发布版会犯（Debug 不子集化）；
-   脚本随后还会**逐个人 `lib/` 里用到的 `Icons.*` 对一遍字体 cmap**，缺一个直接打包失败并点名，
+   脚本随后还会**逐个把 `plugins/tree.ui.default/lib/` 里用到的 `Icons.*` 对一遍字体 cmap**，缺一个直接打包失败并点名，
    不把空白按钮发给用户（代价：字体 18 KB → 1.6 MB，安装包约 +0.5 MB）；
-2. 用**同一个 SDK** 编译 `tree_core.exe` 并放进 Release 目录——发行版要求核心与 `Tree.exe` 同目录；
+2. 用**同一个 SDK** 编译 `tree_core.exe` 并放进 Release 目录——发行版要求核心与界面 `tree_ui.exe` 同目录；
 3. 拷 `build/native_assets/windows/*.dll`（pdfrx 的 `pdfium.dll`）到 exe 旁边（native assets 不会自动进发行目录）；
 4. 拷**插件成品与开发指南** → 发行目录 `plugins/`（核心按**自身可执行文件同级**的
    `plugins/<name>[.exe]` 解析内置插件）：成品按 `build/plugins/plugin-index.json` 里的

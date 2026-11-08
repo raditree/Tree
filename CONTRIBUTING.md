@@ -16,17 +16,21 @@
 - 格式：**Conventional Commits** —— `type(scope): 摘要`，正文用中文写清"为什么"。
   常用 type：`feat` / `fix` / `refactor` / `perf` / `docs` / `test` / `chore` / `build`。
   scope 用模块名：`core` / `plugin` / `protocol` / `ui` / `agent` / `files` / `executor` / `storage` / `packaging`。
-  领域 scope（`agent` / `files` / `executor`）在**插件仓**使用；桌面仓只改内核与 UI 时用前四个。
+  领域 scope（`agent` / `files` / `executor`）在**插件仓**使用；桌面仓只改内核与发布工程时用前四个
+  （UI 改动也在插件仓，scope 用 `ui`）。
 - **一次提交一件事**：重构与行为变更分开；格式化 / 重命名单独一次提交，别夹在大改动里。
 - 分支：桌面线在 `desktop`，服务端线在 `main`；两条线各自独立 worktree，**不互相 merge 代码**。
   `plugins/` 是**独立 git 仓**的本地 clone，桌面仓的提交不会带上插件改动——两侧要分别提交。
+  **UI 源码也在插件仓**（`plugins/tree.ui.default/`）：界面改动在插件仓提交、在插件仓评审；
+  桌面仓只提交内核 / 引导壳 / 发布工程 / 文档。
 - 提交前必须本地跑过（按此顺序）：
   1. `dart analyze`（改动的包，**无新增 error / warning**）；
   2. `dart test`（改动的包，全量）；
   3. `dart test` `packages/tree_protocol`（契约 / 文档门禁，路由或帧有变动时必跑）；
   4. 插件仓改动跑 `dart run tool/check_plugin_repo_contract.dart`（桌面仓根，默认扫 `plugins/`；
      插件仓内用 `--plugin-root .` 跑同一份脚本）；
-  5. 只有**动了 UI** 才跑 `flutter analyze lib test` + `flutter test`。
+  5. 只有**动了 UI** 才跑界面门禁——UI 源码在插件仓，先 `cd plugins/tree.ui.default`，
+     再 `flutter analyze lib` + `flutter test`（插件仓 CI 的 `ui` job 跑同一组命令）。
 - 提交信息里**不要**写机器绝对路径 / 个人目录 / 密钥。
 
 ## 2. 测试要求
@@ -51,7 +55,7 @@
 | `README.md` | 能力亮点 / 快速开始 / 文档索引变了 |
 | `docs/architecture.md` | 进程模型、模块职责、并发与缓存策略、存储布局、安全边界变了 |
 | `docs/development.md` | 环境、构建、测试、打包、发布流程变了 |
-| 各模块 `README.md` | **该模块的任何行为改动**（职责 / 入口 / 不变量 / 测试） |
+| 各模块 `README.md` | **该模块的任何行为改动**（职责 / 入口 / 不变量 / 测试）；UI 模块的 README 在插件仓 `plugins/tree.ui.default/lib/README.md`，桌面仓门禁跨仓校验它 |
 | 插件仓各插件 `README.md` | 该插件的行为、承接路由、执行站命令、已解缺口变了（在插件仓提交里同批改） |
 | `docs/pluginization/*.md` | 路由点位数、核心与插件的归属、执行站 / 终端 / UI 多窗口口径、验收台账状态变了——**设计文档与验收清单同批改** |
 | 提示词与规范文案（系统提示词 / 内置 Spec / 工具描述） | **模型可见行为变了**——先看 [docs/architecture.md §8.1](docs/architecture.md) 的「提示词资产」表定位文件；改内置 Spec 模板要同时 bump `version:` 并写 `changelog:` |

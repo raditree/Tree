@@ -52,6 +52,7 @@
 
 | 插件 | 角色 | 承接 / 能力 |
 | --- | --- | --- |
+| `tree.ui.default` | **ui** | 默认图形界面（Flutter，源码在插件仓 `plugins/tree.ui.default/`）；零依赖，自持 `lib/io/protocol_contract.dart` |
 | `tree.agent` | headless | agent 与会话、工具循环、压缩、团队、提问、用量、Spec（含原生 `spec` 工具）、自建事件广播站、执行器激活站 |
 | `files` | headless | 文件面板 13 条 REST（本机与 SSH 同形：列表 / 内容 / 读写 / PDF / 上传 / 同步 / 打包 / 结构改动） |
 | `local_executor` | headless | 本机执行站：`file.*` / `exec.command` / 终端会话（PTY + 广播站输出） |
@@ -63,24 +64,32 @@
 
 `plugins/` 下的 `minimal` / `sample` / `suspendable` / `terminal_probe` 是测试与示例插件，`_kit` 是插件仓公共骨架。插件源码独立成仓，本仓 `plugins/` 是它的本地 clone。
 
+**UI 源码也在插件仓**（`plugins/tree.ui.default/`，Flutter 工程）：桌面仓只留内核、引导壳、发布工程与文档。界面门禁与 `flutter` 命令都要先进那个目录（见下）。
+
 ## 快速开始（从源码）
 
 ```powershell
 # 开发回路：脚本起核心（stdout 握手），再把 URL / token 注入 flutter run
+# （脚本会在 plugins/tree.ui.default 里跑 flutter run）
 .\tool\dev_run.ps1
 
 # 单独编译内核
 dart run tool/build_core.dart --out dist/tree_core.exe
 
-# 编译插件仓全部插件（逐个 --selftest，并写发布索引）
+# 编译插件仓全部插件（逐个 --selftest，并写发布索引；runtime: ui 会显式跳过）
 dart run tool/build_plugins.dart
 
-# 出便携包（构建 + 编译核心 + 自检 + 压 zip）
+# 出便携包（在 UI 目录构建 + 编译核心 + 自检 + 压 zip）
+# --ui-dir 默认 plugins/tree.ui.default
 dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 # 产物：dist/tree-desktop-<版本>-windows-x64.zip
 
-# 把 Flutter 发行目录打成 UI 插件包（tree-ui-default-<版本>.zip）
+# 把 UI 发行目录打成 UI 插件包（tree-ui-default-<版本>.zip）+ 合并发布索引
 dart run tool/package_ui_plugin.dart --build
+
+# 界面自己的门禁（在插件仓的 UI 工程里跑）
+cd plugins/tree.ui.default
+flutter pub get; flutter analyze lib; flutter test
 ```
 
 完整环境要求、测试矩阵、打包与安装包流程、调试技巧（附着模式 / 只跑核心 / 真机 SSH 门控测试）：[开发文档](docs/development.md)。
