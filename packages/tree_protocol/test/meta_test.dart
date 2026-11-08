@@ -7,6 +7,7 @@ void main() {
       final Map<String, dynamic> json = <String, dynamic>{
         'core_version': '1.0.4',
         'api_version': '1.0',
+        'ui_contract': treeUiContractVersion,
         'ui': <Map<String, dynamic>>[
           <String, dynamic>{
             'plugin_id': 'tree_ui_default',
@@ -39,6 +40,7 @@ void main() {
       final ApiMeta meta = ApiMeta.fromJson(json);
       expect(meta.coreVersion, '1.0.4');
       expect(meta.apiVersion, '1.0');
+      expect(meta.uiContract, treeUiContractVersion);
       expect(meta.ui, hasLength(1));
       expect(meta.ui.single.pluginId, 'tree_ui_default');
       expect(meta.ui.single.version, '1.0.0');
@@ -61,6 +63,7 @@ void main() {
       final ApiMeta meta = ApiMeta.fromJson(<String, dynamic>{});
       expect(meta.coreVersion, '');
       expect(meta.apiVersion, '');
+      expect(meta.uiContract, '', reason: '老核心没给 ui_contract 时留空串');
       expect(meta.ui, isEmpty);
       expect(meta.canManagePlugins, isFalse);
       expect(meta.routes, isEmpty);
@@ -70,6 +73,7 @@ void main() {
       expect(meta.toJson(), <String, dynamic>{
         'core_version': '',
         'api_version': '',
+        'ui_contract': '',
         'ui': <Map<String, dynamic>>[],
         'can_manage_plugins': false,
         'routes': <Map<String, dynamic>>[],

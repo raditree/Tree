@@ -10,6 +10,7 @@
 /// {
 ///   "core_version": "1.0.4",
 ///   "api_version": "1.0",
+///   "ui_contract": "1.0",
 ///   "ui": [
 ///     { "plugin_id": "tree_ui_default", "version": "1.0.0",
 ///       "capabilities": ["plugin.manage"], "connections": 2 }
@@ -30,11 +31,24 @@
 /// 任何一侧多带一个字段都不应让另一侧报错。
 library;
 
+/// **UI ⇄ 核心/插件契约版本**（`/api/meta.ui_contract`）。
+///
+/// UI 迁入插件仓后零依赖：自己在
+/// `plugins/tree.ui.default/lib/io/protocol_contract.dart` 手写同名常量，不 import
+/// 本包。两侧一致性只靠两件事（见
+/// `docs/pluginization/ui-source-migration-recon.md` D2/D12）：
+/// 1. **只增不改**：UI 用到的平台面（路径 / 帧名 / 字段）不得改名或改变语义；
+///    破坏性变更换新路径或新帧名，并升这个版本号；
+/// 2. **黑盒一致性套件**：`packages/tree_core/test/ui_contract_blackbox_test.dart`
+///    用字面量把五条链路钉住（流式 / 工具卡 / 终端 / 站点重连 / 插件面板）。
+const String treeUiContractVersion = '1.0';
+
 /// `/api/meta` 回包。
 class ApiMeta {
   const ApiMeta({
     this.coreVersion = '',
     this.apiVersion = '',
+    this.uiContract = '',
     this.ui = const <ApiMetaUi>[],
     this.canManagePlugins = false,
     this.routes = const <ApiMetaRoute>[],
@@ -48,6 +62,12 @@ class ApiMeta {
 
   /// 协议 API 版本（插件用 `requires.api` 与它比对）。
   final String apiVersion;
+
+  /// **UI ⇄ 核心/插件契约版本**（[treeUiContractVersion]）。
+  ///
+  /// UI 迁入插件仓后自持一份手写契约（不 import 本包），两侧靠这个版本号 +
+  /// 黑盒一致性套件对齐：**只增不改**，破坏性变更换新路径/新帧名并升版本。
+  final String uiContract;
 
   /// 当前存活的 UI 连接（按连接聚合；同一插件多窗口 ⇒ 多条记录）。
   final List<ApiMetaUi> ui;
@@ -73,6 +93,7 @@ class ApiMeta {
   factory ApiMeta.fromJson(Map<String, dynamic> json) => ApiMeta(
     coreVersion: _asString(json['core_version']),
     apiVersion: _asString(json['api_version']),
+    uiContract: _asString(json['ui_contract']),
     ui: _asMaps(json['ui']).map(ApiMetaUi.fromJson).toList(growable: false),
     canManagePlugins: json['can_manage_plugins'] == true,
     routes: _asMaps(json['routes'])
@@ -91,6 +112,7 @@ class ApiMeta {
   Map<String, dynamic> toJson() => <String, dynamic>{
     'core_version': coreVersion,
     'api_version': apiVersion,
+    'ui_contract': uiContract,
     'ui': ui.map((ApiMetaUi item) => item.toJson()).toList(),
     'can_manage_plugins': canManagePlugins,
     'routes': routes.map((ApiMetaRoute item) => item.toJson()).toList(),

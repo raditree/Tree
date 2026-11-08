@@ -181,7 +181,11 @@ class StationWsBridge {
   ///
   /// `routes` 片 B 一律为空：路由声明由片 C 的收集站提供，这里**不维护第二份
   /// 静态清单**（不变量 13）。
-  ApiMeta buildMeta({required String coreVersion, required String apiVersion}) {
+  ApiMeta buildMeta({
+    required String coreVersion,
+    required String apiVersion,
+    required String uiContract,
+  }) {
     final Map<String, List<_UiBond>> byPlugin = <String, List<_UiBond>>{};
     for (final _UiConnectionState state in _connections.values) {
       final _UiBond? bond = state.bond;
@@ -235,6 +239,7 @@ class StationWsBridge {
     return ApiMeta(
       coreVersion: coreVersion,
       apiVersion: apiVersion,
+      uiContract: uiContract,
       ui: ui,
       canManagePlugins: canManage,
       // 片 B 没有委派路由；保持空数组让 UI 能区分「空」与「老核心没给」。

@@ -1651,10 +1651,15 @@ class CoreServer {
   Future<void> _apiMeta(HttpRequest request, Map<String, String> _) async {
     final StationWsBridge? bridge = _stationWsBridge;
     final ApiMeta meta =
-        bridge?.buildMeta(coreVersion: version, apiVersion: apiVersion) ??
+        bridge?.buildMeta(
+          coreVersion: version,
+          apiVersion: apiVersion,
+          uiContract: treeUiContractVersion,
+        ) ??
         ApiMeta(
           coreVersion: version,
           apiVersion: apiVersion,
+          uiContract: treeUiContractVersion,
           routes: delegatedRouter.metaRoutes(),
         );
     await writeJson(request, 200, meta.toJson());

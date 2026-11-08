@@ -562,6 +562,11 @@ plugins:
       expect(before.status, 200);
       expect(before.json['core_version'], server.version);
       expect(before.json['api_version'], CoreServer.apiVersion);
+      expect(
+        before.json['ui_contract'],
+        treeUiContractVersion,
+        reason: '零依赖 UI 自持契约：版本号必须随发现面发布',
+      );
       expect(before.json['routes'], isEmpty, reason: '片 B 没有委派路由，不得编造静态清单');
       expect(before.json['can_manage_plugins'], isFalse);
       expect(before.json['ui'], isEmpty);

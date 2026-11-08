@@ -83,7 +83,7 @@
 
 | 路径                       | 方法                 | 用途                                                                                                                                   |
 | ------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `/api/meta`              | GET                | 发现面聚合：`core_version`、`api_version`、`ui[]`、`can_manage_plugins`、`routes[]`（委派）、`stations[]`（**仅可订阅的广播站**）、`capabilities[]`（插件申报，原样透传） |
+| `/api/meta`              | GET                | 发现面聚合：`core_version`、`api_version`、`ui_contract`（UI 自持契约版本，只增不改）、`ui[]`、`can_manage_plugins`、`routes[]`（委派）、`stations[]`（**仅可订阅的广播站**）、`capabilities[]`（插件申报，原样透传） |
 | `/bootstrap`             | GET                | 送磁盘上的引导页 HTML（内容不冻结，可独立更新）                                                                                                           |
 | `/api/bootstrap/session` | POST               | 一次性票据兑换短时会话 token                                                                                                                    |
 | `/api/bootstrap/ticket`  | POST               | 主 token 申请引导票据（loader 用；会话 token 不可申请）                                                                                              |
@@ -206,7 +206,7 @@
 
 **引导壳（3）** — `GET /bootstrap`、`POST /api/bootstrap/session`、`POST /api/bootstrap/ticket`。
 
-**发现面（1，新增）** — `GET /api/meta`：核心版本、`api_version`、可用路由、站点、capability、UI 连接、`can_manage_plugins`。
+**发现面（1，新增）** — `GET /api/meta`：核心版本、`api_version`、`ui_contract`（UI 自持契约版本）、可用路由、站点、capability、UI 连接、`can_manage_plugins`。
 
 **日志 API（0，2026-11-08 删除）** — 原 3 条读接口（源枚举 / 尾部读 / 清空）随核心面收窄删除，UI 与插件仓源码零调用。
 
