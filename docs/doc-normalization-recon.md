@@ -487,6 +487,36 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
   幂等、stale）、插件自检 48/0、`build_plugins --only tree.docnorm` 产物自检通过；
   协议仓 docs/plugin 契约 14/14。
 
+**DN-8 实施记录（2026-11-09）**：`tree.docnorm` 新增 `docnorm.commit
+[--commit] [--run-gates]` 与 `docnorm.graph.build [--commit]`，实现在
+`plugins/tree.docnorm/lib/src/commit.dart` / `graph.dart`；两者全程确定性、
+**不调 LLM**。
+
+- **提交风格探测**：`git log -n 20 --pretty=%s`，全 conventional ⇒
+  `conventional`（统计高频 `type`）、全非 conventional ⇒ `plain`、空历史或混合 ⇒
+  `unknown`（不猜）；只作事实输出，不阻断提交。
+- **分批（D8）**：变更沿用 `git diff --numstat` + untracked；文档（`.md` /
+  `docs/`）优先入 `docs` 域，其余按**最具体包 root** 归组，包外文件入
+  `unmatched`；空 diff 不产批次（不产生空提交）；每批给
+  `name/kind/root/files/message/gates`，按名称排序。
+- **消息**：按探测风格生成——conventional 用 `docs:` / `chore(<scope>):`，
+  plain 用「更新 <目标>（N 个文件）」，unknown 用 `docnorm:` 前缀；不伪造类型。
+- **门禁（D30）**：从 `DocContract.gates` 取静态命令，默认只列
+  `command + cwd + source`；`--run-gates` 才执行（Windows `cmd /c`、其它
+  `sh -lc`），回显 `command_line` 与 `workdir`；失败整批 `failed` 且不提交。
+- **提交**：`commit=true` 才 `git add -- <files>` + `git commit -m … -- <files>`，
+  **只提交本批文件**；失败只 `git reset -- <files>` 撤暂存（不碰工作树）；
+  不 push、不 amend、不跳过钩子。
+- **基础链接图（§4.6 前置）**：`graph_nodes` / `graph_edges` 只建三类确定性边——
+  `belongs_to`（文档 → 最具体包）、`references`（文档 → 文档，仅仓内可解析相对
+  链接，复用 `resolveLinkPath` 与 `link_fallbacks`）、`mentions`（策略点名 + 包
+  公开声明名按标识符边界命中，每篇文档最多 50 条）；节点 kind
+  `doc/package/subpackage/symbol`，id 稳定、无向量、无社区。
+- **幂等与清理**：默认 dry-run，`commit` 才写；同一事实重复运行 **0 写**；文档
+  删除后只删本仓 `#node:` / `#edge:` 前缀内不再生成的记录。
+- 验证：analyze 0、单测 39/39（commit 4 条、graph 3 条）、插件自检 59/0、
+  `build_plugins --only tree.docnorm` 产物自检通过；协议仓 docs/plugin 契约 14/14。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
