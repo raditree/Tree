@@ -169,6 +169,36 @@
 | **ST-5 版本与维护** | `schema_version`、compact、purge 二次确认 | 迁移演练；purge 只删自己的库 |
 | **ST-6 docnorm 接入** | `tree.docnorm` 以 `requires` 依赖并跑通 DN-4/DN-6 | 重启后数据在；缺存储时 fail-closed |
 
+**ST-2~ST-5 实施记录（2026-11-08）**：`plugins/tree.storage` 已从 ST-1 推进到 ST-5。
+
+- **ST-2**：`storage.put` 支持 `if_rev`（不存在按 rev=0；不匹配 `rev_conflict`，不覆盖）；
+  `storage.query` 支持不透明 cursor（base64url `{offset, fingerprint}`，fingerprint 覆盖
+  collection/filter/sort/descending；非法 `invalid_cursor`、错配 `cursor_mismatch`）；
+  `storage.tx` 单次 ≤200 ops、单条 value ≤1 MiB、整批 ≤8 MiB，超限整批拒绝；所有 ops 在一个
+  Sembast 事务里，任一失败 `tx_failed` 带第几项并整批回滚（TC-ST-03/04/11）。
+- **ST-3**：`storage.export` 写 NDJSON（`key/rev/value`）+ `manifest.json`
+  （format/version/team/namespace/collection/schema_version/count/sha256/created_at）到
+  `<data_root>/storage/<team>/<namespace>/export/<collection>/<UTC>/`，tmp+rename 原子写；
+  `storage.import` 校验 manifest 与 sha256、行数，目标集合必须为空或 `replace:true`，
+  单事务导入，校验失败不落半截（TC-ST-05）。
+- **ST-4**：跨 namespace 只允许 `TREE_STORAGE_ALLOWED_PLUGINS`（逗号分隔）里的调用方，
+  自己的 namespace 永远允许（TC-ST-01/08/12）；每条写命令留结构化审计
+  `audit caller=… namespace=… collection=… op=… key=… bytes=… at=…`。
+- **ST-5**：`storage.stats`（每集合条目数 / schema_version / 库文件字节 / 路径）；
+  `storage.compact` 关闭缓存库再重开触发检查点；`storage.purge` 必须 `confirm:true` 且只
+  允许自己的 namespace（TC-ST-07/09）。
+- **命令表对齐**：补 `storage.scan`（key 升序 + 前缀过滤 + limit ≤5000）与
+  `storage.count`（与 query 同一套等值过滤），方案 §5.2 的 13 条命令全部可路由。
+- 验证：`dart analyze` 0、单测 **29/29**（原 16 条不回归，新增 13 条覆盖
+  TC-ST-02/03/04/05/07/09/11 + scan/count）、`--selftest` 53/0、`build_plugins --only tree.storage`
+  产物自检通过、插件仓契约 7/7。
+- 偏离：`compact` 未用 Sembast 独立 compact（无此 API），改为关闭/重开缓存库；
+  `storage.import` 的 `collection` 可覆盖 manifest 里的集合名（目标须为空或 replace）；
+  `purge` 删除库文件后只清理空目录，非空 `export/` 快照保留。
+- **ST-6 留待 DN-6**：`tree.docnorm` 在 baseline / reanalyze 落地时以 `requires` 依赖
+  `tree.storage` 并做缺存储 fail-closed。
+
+
 门禁沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才 `flutter`。
 

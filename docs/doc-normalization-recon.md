@@ -34,7 +34,7 @@
 15. **存储独立成插件**（D27）：`tree.storage`（Sembast、纯 Dart）统一集合存储；**DB 为真源，JSONL 只是 `export` 快照**。
 16. **安全默认收紧**（D30）：门禁命令默认**只列不跑**，`--run-gates` 才执行；规则包必须 pin commit + 校验和且默认禁网；`baseline` 默认 dry-run，`--commit` 才落盘提交。
 17. **阈值不硬编码**（D31）：5 000 / 1 000 行、API > 20、一句话 ≤ 60 字等全部进 `policy.json` 默认值，引擎只读配置。
-18. **插件可带设置项**（D28）：`plugin.json.settings` 声明式 schema → 设置页动态分区、热生效；优先级 设置页 > 环境变量 > `.docnorm/config.json` > 默认。
+18. **插件可带设置项**（D28）：由独立 `tree.settings` 插件承载（车道 K）；插件声明 schema，服务存用户覆盖值并广播变更，任意 UI 插件通用渲染；核心不存值、不聚合。优先级 设置服务 > 环境变量 > 插件 config > 默认；secret 只回 `has_value`。**K 未落地前 docnorm 用 `.docnorm/config.json` + 环境变量**。
 19. **模型池按用途分类**（D33）：`kind: chat | embedding | decision`；embedding 供 docnorm 检索，decision（JEV）供产线路由/重试/询问与 docnorm 冲突分级；JEV 输入 state + typed questions（noul/choice/score），输出概率与置信度，**不当 chat 模型用**。
 
 ---
@@ -143,7 +143,7 @@ reanalyze  = 只重算受影响包的 L0（包内文件全量），标 stale，�
 | **D25** | 产线怎么用图谱 | 只经 `docnorm.query` / `docnorm.check` 执行站命令；前端按钮走委派端点；不新增核心 REST。**产线 `requires` 需含 `tree.docnorm`，缺失即 fail-closed** | 执行站是插件间唯一通道 |
 | **D26** | embeddings 与降级 | **本期默认上 embeddings**（模型池 `kind: embedding`），检索默认 `hybrid`（BM25 + 向量）；没有可用 embedding 时退 `entity linking + BM25 + 1~2 跳扩展`，结果显式标 `mode: lexical\|hybrid`，**不假装完整** | 用户拍板：上 embedding；但缺模型时不能被整块卡死 |
 | **D27** | 存储 | 独立插件 `tree.storage`（Sembast、纯 Dart）；`requires` 关系；DB 真源 + `export` 快照 | 用户拍板；避免插件各造格式 |
-| **D28** | 插件设置项 | `plugin.json.settings` schema（type/default/enum/min/max/secret/description）→ 设置页动态分区、热生效；优先级 设置页 > env > config > 默认；密钥只回 `*_set` | 预算/模型/开关要能改 |
+| **D28** | 插件设置项 | **独立插件 `tree.settings`**（车道 K）：schema 注册 + 用户覆盖值存取 + `settings.changed` 广播；UI 通用渲染，核心不存值、不聚合；优先级 设置服务 > env > 插件 config > 默认；secret 只回 `has_value`；K 未落地前 docnorm 用 `.docnorm/config.json` + env | 预算/模型/开关要能改；用户拍板 D 方案“更干净” |
 | **D29** | 索引与"字节不变"冲突 | 索引维护**只允许追加式插入**（新行插到末尾或对应分组末尾，不重排）；必须重排的文件列入 `rewrite_allowlist`，在报告里给完整 diff 并单独成一次提交 | DN-6 的"字节不变"与自动维护索引本来冲突，必须显式开例外 |
 | **D30** | 安全边界 | 门禁命令默认只列不跑（`--run-gates`）；规则包 pin commit + sha256；默认禁网；`baseline` 默认 dry-run；不执行目标仓脚本、不跟随出仓链接、不读密钥 | 任意仓 = 不可信代码 / 供应链输入 |
 | **D31** | 阈值配置化 | 体积/单文件/API 数/收束字数/检索 k/边检查阈值全部落 `policy.json`；引擎无硬编码 | 与"规则可换"一致 |
@@ -351,7 +351,34 @@ DN-11 验收判据：
 | TC-DN-05 | 既有结构无法识别：不改写，文末追加 `## docnorm` 段并标 `unknown` |
 | TC-DN-06 | `commit` 只回填该 run 的提交号，不新增行；`audit` 不写项目文档 |
 
-**外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架 + 设置页设置贡献（DN-9 前）；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
+**DN-2 实施记录（2026-11-08）**：`plugins/tree.docnorm` 已落地 headless 插件与执行站命令
+`docnorm.scan`；六族适配器（Dart / Python / Go / Rust / Node-TS 含 Vue 3 SFC / Web-HTTP）
++ fallback 全部可跑；输出包图（包 id/root/行数/子包/公开声明/API 面/依赖/`depends_on`）
+与 `degraded`。验证：插件自检 14/14、扫描单测 4/4、`build_plugins` 产物自检通过；
+fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一起补齐。
+
+**DN-3 实施记录（2026-11-08）**：`tree.docnorm` 新增两条执行站命令——`docnorm.contract`
+（契约侦查：文档集合、章节、索引、链接、CHANGELOG 风格、静态门禁命令，门禁**只列不跑**）
+与 `docnorm.check`（只回检查面）。实现：
+
+- 三层规则源：内置空仓默认 → 仓库自述（`docnorm.yaml` / `docnorm.yml` /
+  `.docnorm/policy.yaml|yml`，也允许用一层 `rules:` 包裹）→ 规则包；**规则包按 D30
+  fail-closed**（pin+sha256 未实现，拒绝且不联网），输出里记 `unsupported`。
+- 规则逐键合并并记来源：`rules.layers` / `rules.origins` / `rules.overridden` / `rules.repo_files`；
+  未知键进 `warnings`，解析失败进 `warnings` 并标 `degraded`。
+- `DocPolicy` 四条核心检查：`required_docs` / `required_sections`（原文子串匹配）/
+  `index_complete`（目录直接子文件必须进索引）/ `links_resolvable`（跳过代码围栏与
+  外部链接，支持 `link_fallbacks` 认迁移前的家）。仓库扩展两条：`module_readme`
+  （模块 README + 模块地图）与 `mentions`（点名的真实符号）。
+- 新增根 `docnorm.yaml`，把 `packages/tree_protocol/test/docs_contract_test.dart` 的判据
+  落成声明式规则；两者同口径（该门禁现有 **7 条** test：入口文档 / 模块 README /
+  docs 索引 / 归档索引 / tree_core 模块 / 提示词资产 / 相对链接；§7 原写"6 条"按实际
+  测试数为准）。
+- 验证：analyze 0、contract+scan 单测 9/9、插件自检 20/20、`build_plugins --only
+  tree.docnorm` 产物自检通过；本仓契约 0 违规。`commit_style` 仍标 `unknown`
+  （DN-8 才执行 git 探测）；`git ls-files` 收敛仍留 DN-4（当前按目录扫描 + 忽略构建产物）。
+
+**外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
 

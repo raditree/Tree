@@ -1,0 +1,80 @@
+# docnorm.yaml —— 本仓的文档契约（三层规则源的第二层：仓库自述）
+#
+# 规则来源优先级（低 → 高）：内置空仓默认 → 本文件 → 规则包（pin+sha256，本期未实现）。
+# 本文件只描述"这个仓库自己的文档规矩"，不写实现细节；`docnorm.contract` 只读它。
+# 与 packages/tree_protocol/test/docs_contract_test.dart 同口径：改一边必须同步另一边。
+version: 1
+
+# 入口与开发者文档：缺一个就红。
+required_docs:
+  - README.md
+  - CONTRIBUTING.md
+  - CHANGELOG.md
+  - LICENSE
+  - docs/README.md
+  - docs/architecture.md
+  - docs/development.md
+  - docs/team.md
+  - docs/plugin-development.md
+  - docs/known-issues.md
+
+# 模块 README：必须写清不变量与怎么跑测试（原文匹配，大小写敏感）。
+required_sections:
+  - glob: "packages/*/README.md"
+    sections:
+      - "不变量（assertions）"
+      - "## 测试"
+  - glob: "plugins/tree.ui.default/lib/README.md"
+    sections:
+      - "不变量（assertions）"
+      - "## 测试"
+
+# 索引必须诚实：目录下的文档都要在索引里出现。
+indexes:
+  - dir: docs
+    index: docs/README.md
+  - dir: docs/archive
+    index: docs/archive/README.md
+
+# tree_core 的内部业务模块同样算模块：各自 README + 模块地图各一行。
+module_readmes:
+  - src: packages/tree_core/lib/src
+    index: packages/tree_core/README.md
+    index_key: "lib/src/{name}/"
+    sections:
+      - "不变量（assertions）"
+      - "## 测试"
+
+# 提示词资产索引必须点名真实符号（改提示词要能一眼定位，CONTRIBUTING §3）。
+mentions:
+  - doc: docs/architecture.md
+    symbols:
+      - defaultSystemPromptSeed
+      - systemPromptWithWorkspace
+      - kBuiltinSpecs
+      - builtin_spec_assets.dart
+      - status_text.dart
+      - llm_summarizer.dart
+
+# 参与链接侦查的文档集合：根入口 + docs 全量 + 各包 README。
+doc_set:
+  entries:
+    - README.md
+    - CONTRIBUTING.md
+    - CHANGELOG.md
+  roots:
+    - docs
+    - lib
+    - packages
+    - examples
+  readme_only: true
+
+# UI 源码已迁入插件仓：历史文档里的 lib/test/windows/assets 链接只要插件仓那份还在，
+# 就认可它有出处；不强求改写历史记录。
+link_fallbacks:
+  - prefixes:
+      - lib/
+      - test/
+      - windows/
+      - assets/
+    root: plugins/tree.ui.default

@@ -205,6 +205,42 @@ UI 落点：
 | **MP-6 JEV 客户端** | `DecisionClient`：noul/choice/score、置信度、超时、回退 | 低置信度不执行；网关字段差异有契约测试 |
 | **MP-7 兼容性探测** | 模型能力探测（工具调用 / embedding 维度 / JEV 可用性） | 不支持时给可读降级，不空转 |
 
+**MP-2~MP-7 实施记录（2026-11-08）**：`plugins/tree.agent` 已落地后端校验、两个客户端与 API 绑定约束。
+
+- **MP-2**：`DomainSettings.validateModelKindFields` / `validateNewModel` / `validateModelChange`
+  / `modelKindError` 成为唯一判据：`chat`/`embedding` 只能 `openai`、`decision` 只能 `jev`；
+  embedding 必须 `dimensions>0`，decision 必须 `confidence_threshold∈(0,1)`；
+  `POST /api/models` 按此校验，`PATCH /api/models/{id}` 拒绝改 `kind` / `protocol`（400）。
+- **MP-4（后端）**：`POST /api/agents`、`PATCH /api/agents/{id}` 与团队成员 `assignModel`
+  只接受 `kind=chat`，非 chat 一律 400 并说明"该模型是 embedding/decision，不能作为对话模型"；
+  前端过滤不再承担安全职责。
+- **MP-5**：`EmbeddingClient`（`lib/src/llm/embedding_client.dart`）走 OpenAI 兼容
+  `/embeddings`：单批 ≤64 自动分批；单条超过 `max_input_tokens` 估算直接拒绝；
+  向量长度必须等于配置 `dimensions`，不符整批失败（不返回半截）；HTTP/超时可读。
+- **MP-6**：`DecisionClient`（`lib/src/llm/decision_client.dart`）走 JEV typed questions
+  （`noul` / `choice` / `score`）：问题数 ≤16、空名/重名/选项不足被拒；回包解析概率与置信度
+  （网关没给 confidence 时按概率推导）；低于模型阈值由 `DecisionResult.lowConfidence()` 标出，
+  调用方据此回退 chat / 提问。
+- **MP-7**：两个客户端都提供 `probe()`，返回 `{ok, dimensions|confidence}` 或
+  `{ok:false, code, error}`，不支持时给可读降级。
+- **MP-3（前端）**：设置页模型编辑器增加 `kind` 下拉、协议只读推导、条件字段
+  （embedding：dimensions / max_input_tokens；decision：confidence_threshold /
+  max_input_tokens）与列表 kind 徽标；编辑模式禁止改 kind/protocol。
+- **MP-4（前端）**：创建 Agent、右栏模型信息、团队成员模型分配只列 `kind=chat`
+  （旧数据缺 kind 视为 chat）。
+- **自检遗留修正**：`models` / `models-info` 快照补 MP-1 新键；`conversations` 提问卡片补
+  `preview` / `seq`；agents 列表在 `updatedAt` 同刻时按 id 升序（消除 Windows 扫描顺序导致的
+  偶发换序，自检不再抖动）。
+- 验证：tree.agent analyze 0、全量 **451/451**、`--selftest` **186/0**；
+  `domain_settings_test` 9/9、`delegate_test`（含新增 3 条）、`team_service_test` 20/20、
+  `embedding_client_test` 6/6、`decision_client_test` 6/6；UI `flutter analyze` 仅 7 条既有
+  `thinking_window_test` 告警、`model_pool_test` 13/13、受影响组件 45/45；全量 UI 938 条中
+  937 通过，唯一失败是既有版本常量 1.0.5 / pubspec 1.0.6 漂移（与本切片无关）。
+- 集成预留：embedding/decision 目前是插件库能力；docnorm 的消费随 **DN-9** 的站点契约接入，
+  MP 切片不伪接线。JEV 的真实网关录制回包 fixture 留到接入时补（当前用同契约 fake 端点测试）。
+
+
+
 门禁沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才 `flutter`。
 

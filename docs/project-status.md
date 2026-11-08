@@ -31,9 +31,10 @@
 | **D 发版** | REL-1.0.5 push/tag/资产 | 排队（等发版窗口） | 覆盖安装验证 | [handover.md](handover.md) §6 |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | P0 文档归一化：DN-1 定稿（D1~D34 + P1~P8）；`J MP-1` 已就位，DN-2 可开工；DN-4 等 `I ST-1~3` | 待开始 | DN-2 六族适配器（含 Node/TS+Vue3+HTTP）→ DN-3 → DN-6 → 解锁 P1；**DN-4 前需 I ST-3，DN-9 前需 J MP-5，P3 前需 J MP-6 与 P8 golden set**；DN-11（状态/日志维护）可与 DN-4 并行 | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8/§9 |
-| **I 存储插件 tree.storage** | ST-2 分页 + CAS + tx | 进行中 | ST-3 导出导入 → ST-4 隔离白名单 → ST-6 docnorm 接入 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
-| **J 模型池 kind/protocol** | MP-2 API 校验 | 进行中 | MP-3 设置页 → MP-4 消费方过滤 → MP-5 embedding / MP-6 JEV 客户端 | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
+| **H 标准开发流生产线** | P0 文档归一化：DN-6 基线（DN-3 契约侦查已完成） | 进行中 | 解锁 P1；**P3 前需 P8 golden set（I ST-1~ST-5、J MP-1~MP-7 已就绪）**；DN-11（状态/日志维护）可与 DN-4 并行 | [production-line-recon.md](pluginization/production-line-recon.md) §11 ＋ [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8/§9 |
+| **I 存储插件 tree.storage** | ST-6 docnorm 接入（ST-1~ST-5 已完成） | 进行中 | 随 DN-6 接入；缺存储 fail-closed | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
+| **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；docnorm embedding/JEV 消费随 DN-9） | 待 DN-9 接入 | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
+| **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
 `B`、`E`、`G` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
@@ -41,8 +42,9 @@
 `H` 必须先完成 P0 文档归一化（产线的项目资产与索引依赖它），之后按 P1→P8 顺序推进；
 P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalization-recon.md) §7/§8（TREE 内插件，对目标仓库零侵入；本质=包功能收束，供产线免做全面侦查）；
 `H` 的 P0 前置拆成两条独立车道：`I`（存储）与 `J`（模型池）。`DN-2` 只需 `J MP-1`（schema 兼容）即可开工；
-`DN-4` 前需 `I ST-1~ST-3`；`DN-9` 前需 `J MP-5`（embedding）；`P3` 前需 `J MP-6`（JEV，可选）与 P8 golden set。
+`DN-4` 前需 `I ST-1~ST-3`（已完成）；`DN-9` 前需 `J MP-5`（已完成）；`P3` 前需 `J MP-6`（已完成）与 P8 golden set。
 `H` 只新增 `tree.production.line` 插件与 UI 面，不改核心面 35 条基线；`I`/`J` 同样不新增核心点位。
+`K`（`tree.settings`）与 `I`/`J` 无依赖，可并行；`H` 的设置项在 K 落地前用 `.docnorm/config.json` + env，不阻塞。
 
 ## 并行规则
 
