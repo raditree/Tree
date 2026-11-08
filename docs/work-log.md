@@ -6,6 +6,7 @@
 
 | 日期 | 事项 | 结论 / 关键数字 | 提交 | 原文档 |
 | --- | --- | --- | --- | --- |
+| 2026-11-08 | UI 移仓 S8 契约冻结 + 黑盒 | `/api/meta.ui_contract = 1.0`（只增不改）；新增 6 条黑盒用例（流式/工具卡/终端/站点重连/插件面板 + 套件自检），真核心 + 真插件进程、全程字面量；protocol 68 + core 663 全绿 | `ac58897` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | UI 移仓 S1 门禁先行 | 三条跨仓扫描改 `_uiSourceRoot()`（优先插件仓 UI 目录、回落根 `lib`、两处皆无即 fail）；legacy 扫描补 UI 目录、仓库根判据改根 pubspec；protocol 68 + core 657 全绿 | `09475a0` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | 2026-11-08 | 核心面收窄 S7（43 → 35） | 删 store 4 / logs 3 / data-collection 1；基线改 coreOwned 35 / delegated 55 / contract 90 / kept 70；protocol 68 + core 657 全绿 | `223e9b9` | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §2.5 |
 | 2026-11-08 | 过程文档拆分 | status 只管阶段与当前事项；work-log 记过去式；完成即迁出 | `ba0e1ef` | [project-status.md](project-status.md) |
