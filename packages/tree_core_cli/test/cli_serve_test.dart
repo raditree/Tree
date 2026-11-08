@@ -22,11 +22,13 @@ void main() {
   test('CLI 启动核心：单行握手 + 鉴权 HTTP 可用 + shutdown 命令优雅退出', () async {
     // 显式隔离数据目录：绝不写真实用户的 %APPDATA%\Tree
     final Directory tempData = Directory.systemTemp.createTempSync('tree_cli_');
-    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
-    addTearDown(core.dispose);
+    // teardown 是 **LIFO**：先登记删除、后登记 dispose，退出时才会先杀进程再删目录
+    // （反过来 Windows 会因目录仍被核心占用而删不掉）。
     addTearDown(() {
       if (tempData.existsSync()) tempData.deleteSync(recursive: true);
     });
+    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
+    addTearDown(core.dispose);
 
     final CoreHandshake handshake = core.handshake;
     expect(handshake.port, greaterThan(0));
@@ -34,13 +36,19 @@ void main() {
     expect(handshake.version, isNotEmpty);
     expect(handshake.token.length, greaterThanOrEqualTo(42));
 
-    // 端口必须真的在监听：带 token 200、不带 token 401
-    final (int, String) authorized = await core.get('/api/agents');
+    // 端口必须真的在监听：带 token 200、不带 token 401。
+    // 探的是**核心永久面**（`GET /api/meta`，发现面）：`/api/agents` 在 A5 之后
+    // 归属 tree.agent 插件，核心单跑时只会回 404，拿它探活会把"插件没装"误判成
+    // "HTTP 不可用"。
+    final (int, String) authorized = await core.get('/api/meta');
     expect(authorized.$1, 200, reason: authorized.$2);
-    expect(jsonDecode(authorized.$2), <String, dynamic>{'agents': <dynamic>[]});
+    expect(
+      (jsonDecode(authorized.$2) as Map<String, dynamic>)['core_version'],
+      handshake.version,
+    );
 
     final (int, String) unauthorized = await core.get(
-      '/api/agents',
+      '/api/meta',
       withToken: false,
     );
     expect(unauthorized.$1, 401, reason: unauthorized.$2);
@@ -49,6 +57,17 @@ void main() {
     // 显式登记未实现路径，避免前端"点了没反应"。桩机制仍在，只是当前集合为空）。
     final (int, String) unknown = await core.get('/api/nope');
     expect(unknown.$1, 404, reason: unknown.$2);
+
+    // 核心自己负责的目录骨架：设置（config）、日志（logs）、实例发现（runtime）。
+    // `agents/` / `data/` / `config/models/` 在 A5 之后归 tree.agent 插件所有，
+    // 核心单跑时不该替它们建目录（这里若还断言，等于把插件职责写回核心）。
+    //
+    // 骨架是**异步**建的（不拖启动），所以这里轮询等它落地，而不是握手刚回来就
+    // 立刻断言；也必须在 shutdown 之前等，进程退出后不会再补建。
+    final String sep = Platform.pathSeparator;
+    for (final String sub in <String>['config', 'logs', 'runtime']) {
+      await _waitForDir('${tempData.path}$sep$sub', sub);
+    }
 
     // 控制通道：写一行 shutdown => 优雅退出（退出码 0）
     core.process.stdin.writeln('shutdown');
@@ -73,30 +92,17 @@ void main() {
     final String stderrText = core.stderrLines.join('\n');
     expect(stderrText, contains('listening on'));
     expect(stderrText, contains('数据目录'));
-
-    // 启动即建好 ~/.tree 目录骨架，方便用户直接打开查看/手改
-    final String sep = Platform.pathSeparator;
-    for (final String sub in <String>[
-      'config',
-      'config${sep}models',
-      'agents',
-      'data',
-    ]) {
-      expect(
-        Directory('${tempData.path}$sep$sub').existsSync(),
-        isTrue,
-        reason: '缺少目录：$sub',
-      );
-    }
   }, timeout: const Timeout(Duration(minutes: 3)));
 
   test('stdin 关闭（无控制通道）不会终止核心进程', () async {
     final Directory tempData = Directory.systemTemp.createTempSync('tree_cli_');
-    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
-    addTearDown(core.dispose);
+    // teardown 是 **LIFO**：先登记删除、后登记 dispose，退出时才会先杀进程再删目录
+    // （反过来 Windows 会因目录仍被核心占用而删不掉）。
     addTearDown(() {
       if (tempData.existsSync()) tempData.deleteSync(recursive: true);
     });
+    final _CoreProcess core = await _CoreProcess.start(dataDir: tempData.path);
+    addTearDown(core.dispose);
     // 模拟 Start-Process / 任务计划 / 双击：父进程不提供 stdin
     await core.process.stdin.close();
     // 给足退出时机：若 EOF 被当成退出信号，进程会在此窗口内消失
@@ -106,7 +112,7 @@ void main() {
       isNull,
       reason: '核心不应因 stdin EOF 退出\nstderr：${core.stderrLines.join('\n')}',
     );
-    final (int, String) res = await core.get('/api/agents');
+    final (int, String) res = await core.get('/api/meta');
     expect(res.$1, 200, reason: '控制通道关闭后仍须继续服务：${res.$2}');
   }, timeout: const Timeout(Duration(minutes: 3)));
 
@@ -177,7 +183,7 @@ void main() {
       reason: '缺少启动分段耗时日志：${core.stderrLines.join('\n')}',
     );
     // 握手之后核心立刻可用
-    final (int, String) served = await core.get('/api/agents');
+    final (int, String) served = await core.get('/api/meta');
     expect(served.$1, 200, reason: served.$2);
     // 挂住的插件/MCP 不该拦住优雅退出
     core.process.stdin.writeln('shutdown');
@@ -187,6 +193,20 @@ void main() {
     );
     expect(exitCode, 0);
   }, timeout: const Timeout(Duration(minutes: 3)));
+}
+
+/// 轮询等待目录出现（骨架是异步建的，握手不等它）。
+Future<void> _waitForDir(
+  String path,
+  String label, {
+  Duration timeout = const Duration(seconds: 10),
+}) async {
+  final DateTime deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    if (Directory(path).existsSync()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
+  fail('缺少目录：$label（$path 在 ${timeout.inSeconds}s 内没有建出来）');
 }
 
 /// 轮询等待 stderr 出现某段文本（两条管道无顺序保证）。
@@ -204,10 +224,18 @@ Future<void> _waitForStderr(
 
 /// 已启动并完成握手的核心子进程。
 class _CoreProcess {
-  _CoreProcess._(this.process, this.handshake, this.dataDir);
+  _CoreProcess._(this.process, this.dataDir);
 
   final Process process;
-  final CoreHandshake handshake;
+
+  /// 握手前为 null；[start] 收到握手后才赋值。
+  ///
+  /// **同一个实例**贯穿前后：以前这里返回的是一个新对象、把已收到的行 `addAll`
+  /// 过去，但订阅仍往旧对象的列表里追加 —— 握手之后打印的 `listening on` /
+  /// `数据目录` 永远拿不到（那两条恰好都在握手之后打）。
+  CoreHandshake? _handshake;
+
+  CoreHandshake get handshake => _handshake!;
 
   /// 传入的数据根目录（null = 平台默认，测试始终显式传入以避免写到真实用户目录）。
   final String? dataDir;
@@ -230,12 +258,7 @@ class _CoreProcess {
       ],
       workingDirectory: Directory.current.path,
     );
-    final _CoreProcess core = _CoreProcess._(
-      process,
-      // 占位，随后被真实握手替换
-      const CoreHandshake(port: 0, token: '', pid: 0, version: ''),
-      dataDir,
-    );
+    final _CoreProcess core = _CoreProcess._(process, dataDir);
     core._outSub = process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
@@ -245,13 +268,8 @@ class _CoreProcess {
         .transform(const LineSplitter())
         .listen(core.stderrLines.add);
     core._client = HttpClient();
-    final CoreHandshake handshake = await _waitForHandshake(core);
-    return _CoreProcess._(process, handshake, dataDir)
-      ..stdoutLines.addAll(core.stdoutLines)
-      ..stderrLines.addAll(core.stderrLines)
-      .._outSub = core._outSub
-      .._errSub = core._errSub
-      .._client = core._client;
+    core._handshake = await _waitForHandshake(core);
+    return core;
   }
 
   Future<(int, String)> get(String path, {bool withToken = true}) => _get(
@@ -262,9 +280,15 @@ class _CoreProcess {
 
   Future<void> dispose() async {
     process.kill(ProcessSignal.sigkill);
+    // 等进程真的退出再返回：teardown 紧接着要删临时目录，Windows 上核心还活着
+    // 就会报 "另一个程序正在使用此文件"。
+    await process.exitCode.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () => -1,
+    );
+    _client.close(force: true);
     await _outSub.cancel();
     await _errSub.cancel();
-    _client.close(force: true);
   }
 }
 
