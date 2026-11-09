@@ -129,7 +129,7 @@
 | --- | --- |
 | 顶部 | 产线名 / 阶段（准备/执行/空闲）/ 今日预算用量 / 「暂停产线」 |
 | 队列 | 按 `priority → created_at`；每行：`T3 标题`、状态 chip、依赖、写域、阻塞原因 |
-| 决策收件箱 | 待拍板问题卡片（每轮最多 3 条，带默认选项与「全部按推荐」）；未答问题跨窗口保留，不做默认推进 |
+| 决策收件箱 | 待拍板问题卡片（每轮新问题上限读设置 `questions.max_per_round`，默认 3；带默认选项与「全部按推荐」）；未答问题跨窗口保留、不占下一轮新额度，不做默认推进 |
 | 任务详情 | 点击展开：意图 / 常规与特殊要求 / 范围 / 验收 / 产物链接 / 运行记录 |
 
 **产线没有聊天流**：用户与产线的全部交互就是「任务 + 决策卡片 + 结论」，避免回到 Agent 的对话形态。
@@ -241,6 +241,7 @@ limits:
   max_tokens_per_task: 0      # 0 = 不设
   max_minutes_per_task: 0
   retries: 2
+  max_questions_per_round: 3  # 设置项 questions.max_per_round 优先
 policy:
   allow_spawn: false          # 临时员工再召（Q3）
   allow_git_write: false
@@ -310,6 +311,30 @@ draft ──侦查──▶ recon ──提问──▶ aligning ──拍板─
 }
 ```
 
+### 7.5 P1 实施记录（2026-11-09）
+
+插件 `plugins/tree.production.line`（v0.1.0，headless / team）已落地 P1 数据模型 + 队列：
+
+- 数据根：`<data_root>/production_lines/<team_id>/<line_id>/`（多团队不撞目录；`team_id` 只认核心 `scope`）；
+  布局 = `line.yaml` / `tasks/<task_id>/task.yaml` / `runs/<run_id>.json` / `inbox.jsonl` / `state.json`。
+- 命令（执行站 `production`）：`production.line.create|list|get`、`production.task.create|list|get|transition`、
+  `production.queue.next|rebuild|recover`、`production.run.list`；缺 `data_dir` / `team_id` 一律 fail-closed。
+- 状态机按 §7.3 落表：`done` 只由 `gating` 进入；`blocked` 必须带 `blocked_reason`；`cancelled`
+  可从任意非终态进入并保留在列表里。
+- 队列：`priority` 降序 → `created_at` 升序 → `id` 升序；`depends_on` 未 `done`（含缺依赖）不派发，
+  `production.queue.next` 同时返回 `skipped[].waiting_on`。
+- 索引与恢复：`state.json` 只含 `tasks / queue / dispatchable` 快照，内容未变时 0 写；`recover` 把
+  `packing / packed / running / gating` 回 `queued`，按阶段补一条 `status=interrupted` 的 run
+  （packing/packed=packer，running/gating=executor），重复调用 0 写。
+- 写入用“临时文件 + 改名”；`task.yaml` 保留未知键（状态迁移写回不丢字段）。
+- 验证：`dart analyze` 0；单测 26/26；`--selftest` 29/0；`build_plugins --only tree.production.line`
+  产物自检通过；协议仓 `docs_contract_test` + `plugin_repo_contract_test` 14/14。
+
+P1 出口 = 数据模型、状态机、队列、索引重建与崩溃恢复可用；REST 路由与 UI 面按 §10.2/§10.4
+随 P2/P3 接入。DN-10 review 无阻塞项，记录三条非阻塞观察：`query` 的 cosine 未除查询范数
+（后续按最大值归一，排序不受影响）；`check --edges` 的断链 findings 可能与契约违规重复计数；
+`auto` 模式下无 embedding 时降级原因少一条 `reasons`。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -356,7 +381,7 @@ draft ──侦查──▶ recon ──提问──▶ aligning ──拍板─
 
 1. **常规要求**：能用成熟技术栈/既有实现直接解决的（逐条编号 `R1…`，每条给落点文件）；
 2. **特殊要求**：传统方案做不到或代价异常的（逐条 `S1…`，必须写清「为什么常规做不到」）；
-3. **疑惑与待拍板**：`Q1…`（最多 3 条，每条含默认选项、推荐、不选后果）；
+3. **疑惑与待拍板**：`Q1…`（最多 N 条，N 读设置 `questions.max_per_round`，默认 3；每条含默认选项、推荐、不选后果）；
 4. **回退选项与注意事项**：`F1…`（特殊要求失败时走哪条常规路）+ `N1…`（风险/兼容/数据）。
 
 **语义对齐靠文档**：每一轮只改这四节，不在聊天里飘；用户拍板后**冻结**该节
@@ -364,7 +389,7 @@ draft ──侦查──▶ recon ──提问──▶ aligning ──拍板─
 
 ### 8.4 追问协议（硬规则）
 
-1. 一次最多 **3 个问题**；每题 ≤ 60 字，总长 ≤ 400 字。
+1. 一次最多 **N 个新问题**（N = 设置项 `questions.max_per_round`，默认 3，范围 1–10；上一轮未答问题保留展示、不占新额度）；每题 ≤ 60 字，总长 ≤ 400 字。
 2. 每题必须给：编号、默认选项、推荐项、不选后果（一句话）。
 3. 只问「影响范围 / 不可逆 / 成本数量级」，**不问实现细节**（实现由产线自己定）。
 4. 提供「全部按推荐」一键拍板——**必须用户点击**才生效，系统不自动应用；拍板后不再重复问同类问题。
@@ -372,6 +397,14 @@ draft ──侦查──▶ recon ──提问──▶ aligning ──拍板─
 6. 未答问题**绝不按默认实施**；下一窗口重提时保留原编号与原选项，只允许追加新信息。
 7. 用户回答与原需求冲突时，**以最新回答为准**，并在 `decisions.md` 记录覆盖关系。
 8. 不允许用问题清单替代方案：先给「我的理解」再给问题。
+
+> **设置项（用户可配）**：`tree.production.line` 启动时向 `tree.settings` 注册
+> `{"key":"questions.max_per_round","group":"questions","type":"int",
+> "title":"每轮最多追问数","default":3,"min":1,"max":10}`
+> （group `questions` 标题「追问」）；设置页「插件 → 生产线」渲染。每轮开始读取，
+> **下一轮生效**（已提出的问题不改）。合并顺序：`tree.settings` 覆盖值 >
+> `line.yaml.limits.max_questions_per_round` > 默认 3；`tree.settings` 缺失时按后两者
+> 运行，不阻断产线启动。
 
 ### 8.5 定范围与拆任务
 
@@ -470,8 +503,9 @@ packer ──pack.json──▶ executor
 - 新插件 `plugins/tree.production.line/`（目录名 = id），`runtime: headless`，
   `granularity: team`，`scope: {}`；
 - `requires.plugins` 声明依赖 `tree.agent`（员工执行边界）、`tree.docnorm`（准备阶段的
-  `docnorm.query` / `docnorm.check`）与 `local_executor`（命令）；**缺 `tree.docnorm` 时准备阶段
-  fail-closed**，不得降级为“凭空侦查”；
+  `docnorm.query` / `docnorm.check`）、`tree.settings`（追问上限等用户设置，可选）与
+  `local_executor`（命令）；**缺 `tree.docnorm` 时准备阶段 fail-closed**，不得降级为
+  “凭空侦查”；缺 `tree.settings` 时退回 `line.yaml` + 默认值，不阻断启动；
 - **不 import** `tree_core` / `tree_protocol`（插件纪律）；跨插件只走站点与委派；
 - 启动经 `system.collect.api.routes` 申报自己的路由，核心只做归属转发与形状校验。
 
@@ -536,7 +570,7 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 | **P0 文档规范化**（前置，独立车道） | 资产目录规范、模板（recon/scope/plan/acceptance/decisions）、索引自动维护、断链与过期基线检查；对接 [doc-normalization-recon.md](../doc-normalization-recon.md) 的 DN-3 + DN-6，把 `docs/production_lines/` 纳入索引维护 | — | 文档契约门禁扩展；全仓断链 0；现有文档迁移演练 |
 | **P1 数据模型 + 队列** | 插件骨架、`line.yaml` / `task.yaml` / `runs`、状态机、索引重建、崩溃恢复 | P0 | 单测：状态迁移合法/非法、`inflight→queued` 重放、不重复执行 |
 | **P2 模型配置页 + 工具白名单** | Agent `tool_policy` 加法键、工具目录、`specsFor` 过滤、UI 共用页面 | P1 | 现有 agent 全量绿；未选工具不出现且运行被拒 |
-| **P3 准备阶段** | 侦查四块、追问协议、活跃窗口、`awaiting_user` 跨日续答、决策落档；消费 `pkg_index` 与图谱 | P2 + DN-7 + DN-9 + DN-10 | 固定样例输出结构稳定；3 问上限；未答不实施、次日可续答；`flags` 点状读取 ≤ 8 文件/会话 |
+| **P3 准备阶段** | 侦查四块、追问协议、活跃窗口、`awaiting_user` 跨日续答、决策落档；消费 `pkg_index` 与图谱 | P2 + DN-7 + DN-9 + DN-10 | 固定样例输出结构稳定；追问上限读设置（默认 3，可配 1–10）；未答不实施、次日可续答；`flags` 点状读取 ≤ 8 文件/会话 |
 | **P4 打包 + 执行** | `agent.worker.run`、`pack.json`、`runs`、`message` 线程、门控与重试 | P3 | 假 LLM 端到端；写域越界被拒；门控失败不进 `done` |
 | **P5 专家工具** | `ask_expert`、专家角色、次数/工具上限、台账 | P4 | 默认不能召员工；超限拒绝；专家不写文件 |
 | **P6 项目整理** | 文档审计、TODO 台账、死代码/冗余候选、只读报告 | P0/P3 | 报告 schema 稳定；不写产物目录之外 |
@@ -557,7 +591,7 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 | --- | --- |
 | TC-PL-01 | 队列在 `inflight` 时被杀，重启后回到 `queued` 且只执行一次 |
 | TC-PL-02 | `task.yaml` 与 `state.json` 冲突时，以 `task.yaml` 为准并自动重建索引 |
-| TC-PL-03 | 一轮追问 > 3 条被截断；窗口到点未答 ⇒ 转 `awaiting_user`、草稿保留、次日可续答；**不按默认实施** |
+| TC-PL-03 | 一轮新问题 > 设置上限（默认 3，可配 1–10）被截断，改设置下一轮生效；窗口到点未答 ⇒ 转 `awaiting_user`、草稿保留、次日可续答；**不按默认实施** |
 | TC-PL-04 | 打包模型调用 `write/edit` 被拒（工具表里也没有） |
 | TC-PL-05 | 执行模型越出 `write_scope` 写文件被拒，任务转 `blocked` |
 | TC-PL-06 | 专家默认无写权限、不能召员工；勾选后才允许且受层级上限约束 |
@@ -596,15 +630,16 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 
 ---
 
-## 14. 拍板记录（2026-11-08 全部定稿）
+## 14. 拍板记录（2026-11-08 定稿；2026-11-09 追加 D11）
 
 > 用户 2026-11-08 追加拍板：**20 分钟 = 用户活跃窗口**（单题不设时限、未答次日续答、未答不实施，
 > 见 §8.1）；项目资产目录定为 **`docs/production_lines/`**；「模型信息」窗口**并入**「模型配置」；
 > 其余待拍板项**按推荐默认执行**。
+> 2026-11-09 追加：**每轮追问上限改由用户设置决定**（D11），不再硬编码 3。
 
 | # | 结论 | 影响 |
 | --- | --- | --- |
-| D1 | **独立插件** `tree.production.line`，`requires [tree.agent, tree.docnorm, local_executor]`；缺 `tree.docnorm` 时准备阶段 fail-closed | 边界清晰；多两个插件依赖要发布/装 |
+| D1 | **独立插件** `tree.production.line`，`requires [tree.agent, tree.docnorm, tree.settings(可选), local_executor]`；缺 `tree.docnorm` 时准备阶段 fail-closed，缺 `tree.settings` 时退回 `line.yaml` | 边界清晰；多两到三个插件依赖要发布/装 |
 | D2 | **复用** `tree.agent` 的临时员工，新增 `agent.worker.run` 执行站 | 不复制 LLM/工具循环；需扩展 `tree.agent` |
 | D3 | 执行隔离默认用 **git 任务分支**，可关 | 回退干净；要求工作空间是 git 仓 |
 | D4 | 项目资产目录 **`docs/production_lines/`**，由文档规范化（DN-3/DN-6）自动维护索引 | 人可见、可评审；需索引门禁配合 |
@@ -614,6 +649,7 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 | D8 | 默认并行任务数 **1** | 单写者；需要时按写域放开 |
 | D9 | **默认不允许**自动 `commit/push`，只给 diff 与提交信息 | 用户 20 分钟只决策，不处理事故 |
 | D10 | 「模型信息」窗口**合并**进「模型配置」页，旧入口指向新页 | 避免两处改模型 |
+| D11 | 每轮追问上限**由用户配置**：`questions.max_per_round`（int，默认 3，范围 1–10，team 作用域）进设置页，下一轮生效；`line.yaml` 保留兜底 | 用户可调；需接 `tree.settings` |
 
 ---
 
