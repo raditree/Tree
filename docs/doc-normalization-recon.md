@@ -546,6 +546,28 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
   `build_plugins --only tree.docnorm` 产物自检通过；tree.agent analyze 0、全量 453/453
   （新增 `llm.embed` 2 条）；插件仓零核心依赖门禁通过（490 个 Dart 文件）。
 
+**DN-10 实施记录（2026-11-09）**：`tree.docnorm` 0.8.0 落地检索与关联边检查，并通过 P8 golden set。
+
+- **P8 基线**：`test/golden/retrieval_golden.json` 固定 18 条问题（分层 6 / 影响面 6 / 引用未同步 6）
+  与 5 条边检查期望；夹具由 `golden_eval_test.dart` 确定性生成（不联网、不调 LLM）。
+  实测 **recall@5 = 0.972、recall@10 = 1.000、edge precision = 1.000（5/5）**，
+  阈值 `0.85 / 0.95 / 0.99`，未达即不得接入产线准备阶段。
+- **BM25 自写**：中英混排分词（拉丁词 + CJK 单字/相邻双字），k1=1.2 / b=0.75；
+  无三方依赖，供 lexical 与各模式的基础分。
+- **`docnorm.query`**：`--mode auto|hybrid|local|global|basic|lexical`；
+  basic=BM25+cosine；local=实体链接（label 包含 / 词重叠）→ 1~2 跳扩展 → 候选文档内排序；
+  global=BM25 选社区报告（默认 8）→ 报告成员文档 reduce；hybrid=三者加权合并；
+  无查询向量/向量索引时显式降级 `mode: lexical`，并保留 `requested_mode` 与降级原因。
+  只读：不写存储，embedding 只发一条查询向量（lexical 模式完全不发）。
+- **`docnorm.check --edges`**：六类确定性边检查——`broken_link`（契约 links_resolvable +
+  图内指向已消失文档）、`orphan`、`stale_reference`（`doc_state.stale` / 来源文档已不在契约）、
+  `unresolved_mention`、`cross_package_reference`、`term_conflict`（同名实体多 kind /
+  `conflicts_with`）；`ok=false` 只表示存在 error 级（断链）。
+- **阈值配置化（D31）**：`query_k=10` / `query_local_hop=2` / `query_global_reports=8`
+  进入 `DocPolicy.thresholds`，可被仓库策略覆盖，引擎无硬编码 k。
+- **验证**：docnorm analyze 0、单测 68/68（新增 bm25 3、query 8、edge 2、golden 1）、
+  自检 81/0、`build_plugins --only tree.docnorm` 产物自检通过；插件仓零核心依赖门禁通过（497 个 Dart 文件）。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
