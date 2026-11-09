@@ -517,6 +517,35 @@ fixture 当前由测试内联临时目录生成，外部 fixture 仓随 DN-3 一
 - 验证：analyze 0、单测 39/39（commit 4 条、graph 3 条）、插件自检 59/0、
   `build_plugins --only tree.docnorm` 产物自检通过；协议仓 docs/plugin 契约 14/14。
 
+**DN-9 实施记录（2026-11-09）**：`tree.docnorm` 0.7.0 落地 GraphRAG 索引与 JSONL 快照。
+
+- **依赖核实（P8 项）**：`yograph` 0.5.1（MIT、Dart SDK `^3.12.0`、纯 Dart），用其
+  `Leiden.detect(graph, seed:)`（`SimpleGraph<String,double>.undirected()`）；不新增原生或向量库依赖。
+- **分块**：标题（1~6 级）切 section，段落按空行合并到 600~1 200 字符；代码围栏内的
+  `#` 与空行不切；超长块按行再按字符硬切；chunk id = `doc + 标题路径 + 正文哈希`
+  内容寻址，同内容重复出现追加序号。
+- **抽取**：每 chunk 一次 `llm.call` 严格 JSON（实体 `package/module/route/point/config/
+  concept/decision`，关系 `belongs_to/references/implements/supersedes/conflicts_with/
+  documents`）；按 `chunkHash` 缓存（跨文档复用）；端点按 chunk 实体名或图节点 label
+  解析；文档 → 实体自动补 `documents` 边。
+- **社区/报告**：Leiden（seed 42）在「确定性边 + LLM 边」的合并图上检测；社区 id =
+  成员集合哈希；报告按社区 id 缓存，`size>=2` 才生成、单次上限 40，受 `stage_budget` 闸。
+- **向量**：`tree.agent` 新增宿主命令 `llm.embed`（模型池 `kind=embedding`；空 inputs
+  不发 HTTP，只回模型与维度）；flat cosine，写入前归一化；模型/维度/哈希三者都命中才复用；
+  无 embedding 模型 ⇒ 跳过向量、`mode: lexical` 并清理旧向量。
+- **dry-run 口径**：默认仍不发新 LLM/embedding 请求（只复用缓存 + 统计 `pending`），
+  `commit` 才付费并写盘；`rag=true` 显式开启（默认仍只做 DN-8 确定性边，避免误烧 token）。
+- **幂等/增量**：重复运行 0 写、0 LLM 调用；只对变化 chunk 重新抽取（内容寻址命中其余
+  缓存）；删除的文档/chunk 按仓前缀清理社区、报告、向量。
+- **export**：`docnorm.export [--commit]` 把集合导成 `.docnorm/export/<collection>.jsonl`；
+  记录按 key 排序、Map 键排序 ⇒ 同内容重复导出字节相同，可直接 diff；空集合不落文件。
+- **存储**：新增 `graph_chunks` / `graph_communities` / `graph_reports` / `graph_vectors`
+  四个集合；`DocStore.listAll` 在 `storage.scan` 命中 5000 上限时改用
+  `query(sort:id)+cursor` 分页，避免“没扫到”被误判成“该删除”。
+- **验证**：docnorm analyze 0、单测 54/54（chunk 6、rag 6、export 3）、插件自检 77/0、
+  `build_plugins --only tree.docnorm` 产物自检通过；tree.agent analyze 0、全量 453/453
+  （新增 `llm.embed` 2 条）；插件仓零核心依赖门禁通过（490 个 Dart 文件）。
+
 **外部前置（不属切片）**：`tree.storage` 插件（DN-4 前）；`tree.docnorm` 插件骨架（DN-9 前）；**`tree.settings` 插件（车道 K，可选：没有它时 docnorm 用 `.docnorm/config.json` + env）**；**模型池扩展**（`kind` / `protocol` / `dimensions`，含 embedding 与 JEV，D33；DN-9 前）；产线 `requires` 补 `tree.docnorm`（D25/D32）。
 
 ---
