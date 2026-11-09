@@ -335,6 +335,39 @@ P1 出口 = 数据模型、状态机、队列、索引重建与崩溃恢复可�
 （后续按最大值归一，排序不受影响）；`check --edges` 的断链 findings 可能与契约违规重复计数；
 `auto` 模式下无 embedding 时降级原因少一条 `reasons`。
 
+### 7.6 P2 实施记录（2026-11-09）
+
+Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
+
+- 持久化：`CoreAgent.toolPolicy`（YAML 键 `tool_policy`）。**加法键**：null = 未配置
+  （旧文件缺键 = 全量默认，`toJson` 不落盘）；空数组 = 显式全关。`fromJson` 对非 List
+  的脏值按"未配置"处理（坏值只回退到旧语义，不放大权限）。
+- 策略对象：`lib/src/tool/tool_policy.dart` —— `ToolPolicy{allowed, blocked}` +
+  `allows(name)`（核心名与 `plugin__<插件>__<原生名>` 的原生名都命中）；分组
+  `read / write / command / collab / workflow / plugin`；`kSubagentBlockedTools =
+  {subagent, team, message}`。
+- 工具表：`StationToolRunner.specsFor` 先组装（内置 + spec / tool_runs + 插件贡献）
+  再按策略过滤；`catalogFor` 返回**不过滤**的目录（`{name, description, group,
+  enabled}`）供 UI 勾选；`run()` 入口二次兜底——目录里存在但未勾选的工具直接回可读
+  错误，不触达执行站；不存在的工具仍走原"未知工具"分支。
+- 身份解析：`AgentRuntime.toolPolicyFor` —— 真实 agent 读 `agents/<id>.yaml`；临时员工
+  继承会话主人策略再剔除协作类工具（名册未装载时按 `sub_` 前缀兜底，只收紧不放宽）。
+- REST：新增 `GET /api/agents/{agentId}/tool-policy`（返回
+  `{agent_id, tool_policy, tool_catalog, tool_groups}`）；`PATCH /api/agents/{agentId}`
+  接受 `tool_policy`（数组 = 清单、`[]` = 全关、`null` = 恢复默认；未知工具名 400，
+  存量清单里的名字放行以免插件离线时无法原样保存）；`models-info` 同步补这三键。
+  改策略后调 `LlmAgentEngine.invalidateToolSnapshots(agentId)`（工具表是请求前缀的
+  一部分，不能带旧表继续跑）。
+- UI（`tree.ui.default`）：「模型信息」面板新增「工具（本 Agent）」分组勾选（每
+  组显示"已选/总数"）；未改动勾选**不下发** `tool_policy`（保持"未配置 = 全量默认"，
+  将来新增工具对老 agent 仍默认可用）；「恢复默认（全开）」下发 `null`。
+  `ApiService.updateAgent` 增 `toolPolicy` / `clearToolPolicy`。
+- 验证：`tree.agent` `dart analyze` 0；单测 **471/471**；`--selftest` **192/0**；
+  `build_plugins --only tree.agent` 产物自检通过；协议仓契约 **14/14**；插件仓
+  `check_plugin_repo_contract` 通过；UI `flutter analyze lib` 0；`flutter test`
+  **938/939**（唯一失败是 `version_info_test` 的既有版本号漂移：pubspec `1.0.6+1`
+  vs `kAppVersion='1.0.5'`，与本次改动无关）。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -579,6 +612,9 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 
 **P0 出口 = DN-3 + DN-6**，完成即解锁 P1（数据模型/队列，**不依赖 `pkg_index`**）；
 **DN-7（收束产物）与 DN-9/DN-10（图谱）是 P3 前置**，不阻塞 P1/P2。
+
+> **进度（2026-11-09）**：P1 已完成（§7.5）、P2 已完成（§7.6），P3 的前置
+> DN-7/DN-9/DN-10 均已就绪 ⇒ 下一片是 **P3 准备阶段**。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
