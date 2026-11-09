@@ -368,6 +368,45 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   **938/939**（唯一失败是 `version_info_test` 的既有版本号漂移：pubspec `1.0.6+1`
   vs `kAppVersion='1.0.5'`，与本次改动无关）。
 
+### 7.7 P3 实施记录（2026-11-09）
+
+`tree.production.line` 0.2.0（headless / team）落地准备阶段，仍不新增核心点位：
+
+- 命令（同执行站 `production`）：`production.prepare.intake|recon|questions|answer|
+  all_recommended|window.open|window.close|read|finalize|status`。P1 的同步门面不动，
+  P3 单独一条 async 门面（要 await `docnorm.query` / `llm.call` / `settings.get`）。
+- 需求模板（§8.2）：五栏 `goal/current/acceptance/forbidden/deadline` 落
+  `task.yaml.intake`；目标/验收为空阻断（`intake_incomplete`），空泛词只提示并给改写
+  建议（优化/重构/差不多/尽快/你懂的/好用了就行）。
+- 侦查（§8.3）：`docnorm.query`（repo = `line.workspace_dir`，mode=hybrid）取文档上下文，
+  `llm.call` 出四块 JSON；**缺 docnorm / 缺 llm 一律 fail-closed**（`docnorm_unavailable`
+  / `llm_unavailable`），不降级为凭空侦查。四节顺序固定，编号按行序重排为 R/S/Q/F/N；
+  `flags` 截到 8 个并写进 `recon.md` 的元信息块。
+- 追问（§8.4）：上限 = `tree.settings` 覆盖值 > `line.limits.max_questions_per_round` >
+  默认 3，统一夹到 1–10；设置键受 `tree.settings` 的 key 规则限制落成
+  `questions_max_per_round`（分组 `questions`，标题「追问」），首次用到时惰性
+  `settings.define`，设置服务不可用则回退 line.yaml。**未答问题不占新额度**：重跑侦查时
+  已有 open 问题原样保留（原编号 / 原选项），重复正文不重复登记，超出的新问题截断并
+  以 `dropped` 回给调用方。
+- 台账与状态：问题/回答追加到 `line/inbox.jsonl`（可重放），窗口与读取计数落
+  `line/prepare.json`；每轮重写 `decisions.md`（按窗口分组，open / ✅ 回答 / 覆盖记录）。
+  `window.close` 把有未答题的 aligning 任务转 `awaiting_user`；`window.open` 转回
+  `aligning`（次日续答）；`finalize` 在存在未答问题时回 `questions_open`（**未答不实施**），
+  `scoped` 只由 `finalize` 触发。
+- 点状读取（§8.1）：`production.prepare.read` 统一入口，文件 ≤ 8 / `grep` ≤ 2 轮，按
+  `(line, task)` 计数并落 `prepare.json`；超限回 `budget_exceeded`。`grep` 只扫文本类
+  扩展名、跳过 `.git/.dart_tool/build/node_modules`，最多 300 文件 / 50 条命中。
+- 落档（§8.5/§8.6）：`finalize` 先写 `scope.md` / `plan.md` / `tasks/<id>/acceptance.md`
+  到 `<workspace>/<docs.asset_dir>/<line_id>/`，再以 `queued` 建子任务（`prepared_by`
+  指回准备任务），最后把准备任务转 `scoped` 并返回 ≤10 行的分发摘要；计划校验
+  （重复 id / 缺验收 / 依赖不在本批 / 与既有任务撞 id）都在建任务前报错。
+- 集成注意：`llm.call` 由 `tree.agent` 按 **agent 身份**选模型，所以准备阶段命令的
+  scope 必须带 `agent_id`（UI / 主控 agent 作为发起者）；缺失时模型调用会失败并回
+  `llm_failed`，任务停在原地（可重试，未写任何代码）。
+- 验证：`dart analyze` 0；单测 **49/49**（新增 preparation 22 条 + 门面 7 条）；
+  `--selftest` **38/0**（含完整窗口 → 落档链路）；`build_plugins --only
+  tree.production.line` 产物自检通过；协议仓契约 **14/14**；插件仓零核心依赖门禁通过。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -613,8 +652,8 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 **P0 出口 = DN-3 + DN-6**，完成即解锁 P1（数据模型/队列，**不依赖 `pkg_index`**）；
 **DN-7（收束产物）与 DN-9/DN-10（图谱）是 P3 前置**，不阻塞 P1/P2。
 
-> **进度（2026-11-09）**：P1 已完成（§7.5）、P2 已完成（§7.6），P3 的前置
-> DN-7/DN-9/DN-10 均已就绪 ⇒ 下一片是 **P3 准备阶段**。
+> **进度（2026-11-09）**：P1 已完成（§7.5）、P2 已完成（§7.6）、P3 已完成（§7.7），
+> 其前置 DN-7/DN-9/DN-10 均已就绪 ⇒ 下一片是 **P4 打包 + 执行**。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
