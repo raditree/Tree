@@ -55,7 +55,7 @@ const String kTargetExe = 'tree_ui.exe';
 /// 意味着"agent 没装 ⇒ 界面起不来"，等于把绝大多数人挡在门外。写成可选后：
 /// 核心照常拉起界面，清单 / 详情页会显示这条依赖，安装或更新 UI 时也能一键补全。
 const List<Map<String, dynamic>> kUiPluginDependencies = <Map<String, dynamic>>[
-  <String, dynamic>{'id': 'tree.agent', 'version': '>=0.28.0', 'optional': true},
+  <String, dynamic>{'id': 'tree.agent', 'version': '>=0.32.0', 'optional': true},
 ];
 
 Future<void> _package(List<String> args) async {
