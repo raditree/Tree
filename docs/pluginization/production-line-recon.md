@@ -449,6 +449,50 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   两插件 `build_plugins --only ...` 产物自检通过；协议仓契约 14/14；插件仓零核心依赖
   门禁通过。
 
+### 7.9 P5 实施记录（2026-11-10）
+
+`tree.production.line` 0.4.0 + `tree.agent` 0.31.0 落地专家工具，仍不新增核心点位：
+
+- 工具贡献（`tree.production.line`）：`buildServer` 申报 `tools: [ask_expert]`，启动时
+  订阅 `plugin.tree.agent.collect.tools`，采集请求回 `{tools:[expertToolSpec()]}`。
+  工具名进模型表时由核心加前缀（`plugin__tree.production.line__ask_expert`），执行经
+  `plugin.toolCall` 回到本插件。
+- 工具调用落点：`tools/call` 的 scope 只有身份四元组（没有 `data_dir`），所以工具处理器
+  绕回本插件自己的执行站命令 `production.task.expert`——核心在 `station/request` 的
+  `meta.data_dir` 里带数据根。非产线任务会话（`session_id` 不以 `pl_` 开头）直接回可读
+  错误：`ask_expert` 只对打包 / 执行的员工会话开放。
+- 专家语义（`expert.dart` 纯逻辑 + `ProductionExecutionService._expert`）：
+  - 默认关闭：`roles.expert.enabled` 默认 `false`（老产线缺键同样按关闭）⇒ `expert_disabled`；
+    启用后 `ask_expert` 自动进入打包 / 执行的角色工具表（未启用不出现）；
+  - 次数上限：按 `runs/<run_id>.json` 里 `role=expert` 计数（失败也算一次），
+    `roles.expert.max_per_task` 默认 3，到点回 `expert_limit_exceeded`；
+  - 只读：专家工具表默认 `read/grep`；出现 `write/edit/subagent/team/ask_expert`
+    一律 `expert_tools_invalid`（不靠运行时兜底）；只有打包 / 执行能发起，`role=expert`
+    回 `expert_not_allowed`（专家不能再召专家）；
+  - 输入契约：`{question, context, desired_output}`；`context` > 12 000 字符回
+    `expert_context_too_large`（不截断后硬塞，禁止整库）；
+  - 输出固定四段：专家只回 JSON `{conclusion, evidence[], suggestion, open[]}`，
+    `conclusion` 缺失 ⇒ `expert_bad_answer`；渲染为「结论 / 依据 / 建议 / 未决」文本，
+    回给调用方并附「本任务已用 / 上限 / 剩余」；
+  - 台账：每次调用落 `runs/<run_id>.json`（`role=expert`、`asked_by`、`question`、
+    `answer`、`worker_id`、`tokens` / `tool_calls`）；失败也落（status=failed），
+    因此同样计入次数。
+- Agent 侧（`tree.agent`）：
+  - `tool_policy.dart` 增 `kOptInTools = {ask_expert}` 与 `isOptInTool`；
+    `StationToolRunner.specsFor` 在全量默认（`tool_policy` 未配置）时**不出现**
+    `ask_expert`，`catalogFor` 标 `enabled=false`，`run()` 入口对未显式勾选的调用
+    回可读错误（默认不能召专家）。
+  - `worker_spec.dart`：`role=expert` 的工具表出现 `ask_expert` ⇒ `worker_tools_invalid`
+    （专家不能再召专家）；打包 / 执行带 `ask_expert` 合法。
+- 集成注意：打包 / 执行的提示词里要带上 `line_id` 与 `task_id`（工具参数），
+  `ask_expert` 的上下文只放已打包片段或文件引用；专家调用不改任务状态，只在
+  `runs/` 留痕。
+- 验证：`tree.production.line` analyze 0、单测 **75/75**（新增 expert 纯逻辑 5 条 +
+  门面 5 条）、`--selftest` **67/0**（新增收集站 / 默认关闭 / 次数上限 / 只读 /
+  再召拒绝 / tools/call 两条）；`tree.agent` analyze 0（2 条既有 info）、单测
+  **483/483**（新增 opt-in / 专家再召 3 条）、`--selftest` **193/0**；两插件
+  `build_plugins --only ...` 产物自检通过；协议仓契约 14/14；插件仓零核心依赖门禁通过。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -695,8 +739,8 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 **DN-7（收束产物）与 DN-9/DN-10（图谱）是 P3 前置**，不阻塞 P1/P2。
 
 > **进度（2026-11-10）**：P1 已完成（§7.5）、P2 已完成（§7.6）、P3 已完成（§7.7）、
-> P4 已完成（§7.8）⇒ 下一片是 **P5 专家工具**（`ask_expert`、专家角色、次数/工具上限、
-> 台账）；P6 项目整理与 P7 本地模型可并行准备。
+> P4 已完成（§7.8）、P5 已完成（§7.9）⇒ 下一片是 **P6 项目整理**（文档审计、TODO 台账、
+> 死代码/冗余候选、只读报告）；P7 本地模型 LFM3 与 P8 并行与预算可并行准备。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
