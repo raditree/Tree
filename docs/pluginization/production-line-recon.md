@@ -526,6 +526,64 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   write=false / 只读断言 10 条）；`build_plugins --only tree.production.line`
   产物自检通过；协议仓契约 14/14；插件仓零核心依赖门禁通过。
 
+### 7.11 P8 实施记录（2026-11-10）
+
+**口径修订（用户定稿）**：不做「模型硬绑定」——`line.yaml.roles.*.model_id` 里的
+`lfm3` 只是新建产线的模板默认值，用户随时在模型池自选/替换；P7 的「角色固定绑定 +
+降级阶梯」不再实施。P8 只做并行调度、预算软停与模型元数据发现。
+
+`tree.production.line` 0.6.0：
+
+- 命令（执行站 `production`）：`production.queue.dispatch`（`{line_id, limit?}`）与
+  `production.task.budget`（`{line_id, task_id}`）。
+- DAG 派发（只读计划，不改状态）：按 `priority → created_at → id` 扫描 `queued`，
+  逐个判「`depends_on` 全部 `done`」→「写域与在途任务 / 已入选批次两两不相交」→
+  「并行槽位（`limits.max_parallel_tasks`，在途 = `packing/packed/running/gating`）未满」；
+  返回 `batch / batch_ids / running / skipped[{id,reason,with_task|waiting_on}] /
+  slots_used / slots_free`。真正的状态迁移仍由 `production.task.pack` 做，
+  UI 按 `batch` 并发发起即可。
+- 写域交叠判据（`writeScopesOverlap`）：字面路径按目录语义（`lib/a` 与
+  `lib/a/b.dart` 交叠、`lib/a` 与 `lib/ab` 不交叠）；含 `*` / `?` 的规则用
+  `matchesWriteScope` 互测；两边都是通配时比较第一个通配符前的字面前缀。
+  **宁可少并行也不让两个写者碰同一文件**。
+- 预算：`limits.max_tokens_per_task` 统计输入 + 输出 token 总量；
+  `max_minutes_per_task` 统计该任务所有员工调用的墙钟时长（门控不计）；0 = 不设。
+  每次员工调用（成功/失败都算）把 `tokens.prompt/completion` 与 `elapsed_ms`
+  累加进 `task.yaml.usage`；`production.task.budget` 报告上限、用量、剩余与原因。
+- 软停（硬语义）：调用**前**已到点 ⇒ 不发起员工、直接软停；调用**后**到点 ⇒
+  当前产出照常保留（`pack.json` / `pack.md` / 已改文件 + `changed_files`），
+  但不进 `packed` / 不跑门控 / 不进 `done`；两种情况都写一条
+  `status=budget_exceeded` 的 run（有产出时原 run 标 `budget_exceeded: true`）、
+  任务标 `budget_exceeded: true` 并转 `blocked`（原因含 token / 时长读数）。
+  `blocked` 后再次打包会先被状态机拒绝 ⇒「不静默继续」。
+
+`tree.agent` 0.32.0（模型元数据发现，OpenAI 兼容端点）：
+
+- 新增路由 `GET/POST /api/models/{modelId}/meta`：GET 读缓存；POST 用模型自己的
+  `base_url` + `api_key` 请求 `{base_url}/models`（自动去掉已带的
+  `/chat/completions` 后缀），挑出目标模型条目并解析。
+- 缓存 `<data_root>/config/model_meta.json`（模型池 YAML 仍是用户配置的唯一真值，
+  探测结果只读、可随时重刷）；`PATCH` 改端点/密钥与 `DELETE` 删模型时清掉缓存。
+- 解析口径：价格支持 `pricing.{prompt,completion}`（每 token，OpenRouter 口径）与
+  `*_per_million`，统一折算成「每 1M token、USD」；思考档位取
+  `reasoning_effort_options / reasoning_efforts / supported_reasoning_efforts /
+  reasoning.supported_efforts` 等声明并去重；上下文取 `context_length /
+  max_context_length / top_provider.context_length`；端点只回 id 时按「未声明」处理
+  （不报错，UI 回退 `low/high/max`）。探测失败保留上次成功的价格/档位，只追加
+  `error` 与时间。
+- `GET /api/models` 与 `models-info` 的每条模型在**缓存存在时**附带只读 `meta`
+  （未探测的模型不出现该键，旧契约不变）。
+- UI（`tree.ui.default`）：模型编辑弹窗去掉「可选档位（逗号分隔）」手填，改为
+  显示端点声明档位 + 「从端点探测」按钮 + 价格行；模型池列表行展示
+  `$x / 1M 输入 · $y / 1M 输出`；保存时把当前候选档位写回
+  `reasoning_effort_options`（后端仍按它校验成员覆盖）。
+- 验证：产线 analyze 0 / 单测 **95/95** / 自检 **87/0**（新增并行 5 条 + 预算 5 条）；
+  tree.agent analyze 0（仅存量 info）/ 单测 **489/489** / 自检 **208/0**（新增
+  元数据探测 14 条）；UI `model_pool_test` 15/15（全量套件仅存量的
+  `version_info_test` 因 pubspec `1.0.6+1` 与 `kAppVersion 1.0.5` 历史漂移而红，
+  与本片无关）；两个插件 `build_plugins` 产物自检通过；协议仓契约 14/14；
+  插件仓零核心依赖门禁通过。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -765,15 +823,16 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 | **P4 打包 + 执行** | `agent.worker.run`、`pack.json`、`runs`、`message` 线程、门控与重试 | P3 | 假 LLM 端到端；写域越界被拒；门控失败不进 `done` |
 | **P5 专家工具** | `ask_expert`、专家角色、次数/工具上限、台账 | P4 | 默认不能召员工；超限拒绝；专家不写文件 |
 | **P6 项目整理** | 文档审计、TODO 台账、死代码/冗余候选、只读报告 | P0/P3 | 报告 schema 稳定；不写产物目录之外 |
-| **P7 本地模型 LFM3** | 角色默认绑定、工具调用能力探测、降级阶梯 | P4 | 不支持工具调用的模型给出可读降级；不静默失败 |
-| **P8 并行与预算** | DAG 调度、写域并行判据、token/时长预算、软停 | P4 | 写域交叠拒绝并行；预算到点不静默继续 |
+| **P7 本地模型 LFM3**（已取消） | ~~角色默认绑定、工具调用能力探测、降级阶梯~~；用户口径：**不做模型硬绑定**，模型由用户在模型池自选，`lfm3` 只是新建产线的模板默认值 | — | 不再实施 |
+| **P8 并行与预算** | DAG 调度、写域并行判据、token/时长预算、软停；模型元数据（价格 / 思考档位）发现 | P4 | 写域交叠拒绝并行；预算到点不静默继续 |
 
 **P0 出口 = DN-3 + DN-6**，完成即解锁 P1（数据模型/队列，**不依赖 `pkg_index`**）；
 **DN-7（收束产物）与 DN-9/DN-10（图谱）是 P3 前置**，不阻塞 P1/P2。
 
 > **进度（2026-11-10）**：P1 已完成（§7.5）、P2 已完成（§7.6）、P3 已完成（§7.7）、
-> P4 已完成（§7.8）、P5 已完成（§7.9）、P6 已完成（§7.10）⇒ 下一片是 **P7 本地模型
-> LFM3**（角色默认绑定、工具调用能力探测、降级阶梯）；P8 并行与预算可并行准备。
+> P4 已完成（§7.8）、P5 已完成（§7.9）、P6 已完成（§7.10）、P8 已完成（§7.11）。
+> P7 按用户定稿**取消**（不做模型硬绑定：模型池由用户自选，产线只存用户选中的
+> `model_id`）。规划内切片全部完成；后续按缺陷与用户反馈开增量片。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
