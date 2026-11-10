@@ -407,6 +407,48 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   `--selftest` **38/0**（含完整窗口 → 落档链路）；`build_plugins --only
   tree.production.line` 产物自检通过；协议仓契约 **14/14**；插件仓零核心依赖门禁通过。
 
+### 7.8 P4 实施记录（2026-11-10）
+
+`tree.production.line` 0.3.0 + `tree.agent` 0.30.0 落地打包与执行，仍不新增核心点位：
+
+- 员工通道（`tree.agent` 增量）：新增宿主命令 `agent.worker.run`
+  （`{role, task, tools, model_id, reuse}`）→ `{worker_id, role, status, report,
+  model_id, tools, reused}`。`lib/src/worker/worker_spec.dart` 做纯参数校验：
+  角色只认 `packer / executor / expert`；`packer / expert` 拒绝 `write/edit`
+  （打包只读、专家不落盘）；`executor` 必须至少含 write/edit；`team` 永远禁用，
+  `subagent` 只有显式 `allow_spawn` + 白名单才放行（Q3）。
+- 员工策略：`AgentRuntime.toolPolicyFor` 对 `role ∈ {packer,executor,expert}` 的
+  员工**直接用显式工具表**（不再继承父级全量），只保留 `kWorkerBlockedTools =
+  {subagent, team}`；普通临时员工仍是"继承父策略 + 剔除 subagent/team/message"。
+  员工复用要求**同角色**（id 或显示名），跨角色给可读错误。
+- 打包（§9.1）：`production.task.pack` 要求 `queued / packing` 且 `write_scope`
+  非空；经 `agent.worker.run`（role=packer，默认
+  `read/list/grep/terminal/message`）产出 JSON → `parsePackJson`（files 为空 /
+  绝对路径 / `..` / 空内容一律 `pack_incomplete`）；片段越出 `read_scope` 或命中
+  `policy.deny_globs` 拒绝；落 `tasks/<id>/pack.json`（机读）+ 项目资产
+  `tasks/<id>/pack.md`（人读）+ `runs/<run_id>.json`（role=packer）；
+  失败转 `blocked` 并记 `last_error`。
+- 执行与门控（§9.2）：`production.task.run` 只接受 `packed`；执行前后各跑一次
+  `git status --porcelain`（读不到就 fail-closed，任务仍停 `packed`），差集必须
+  全部落在 `write_scope` 且不命中禁区，否则 `blocked` 并记 `violations`；
+  通过后经 `local.exec.command`（本插件自己的 `local.lease.register` 租约）跑门控
+  （显式 `gate` > `pack.baseline` > `dart analyze`）。门控失败按
+  `limits.retries` 回 `packed`（回包 `status=retry` 带 attempts），超限 `blocked`；
+  **`done` 只由门控通过触发**。
+- 台账与线程（§7.4 / §9.3）：`runs/<run_id>.json` 增 `worker_id / changed_files /
+  gate[{command,ok,exit_code,output}]`；任务内 `message` 落
+  `runs/messages.jsonl`（`production.task.message|messages`），`kind=question` 超过
+  3 条自动 `blocked`（避免无限来回）。
+- 集成注意：`agent.worker.run` 与 `local.exec.command` 都要求命令 scope 带
+  `agent_id`（发起者身份），缺失回 `agent_required`；员工会话按任务分栏
+  （`pl_<line>_<task>`），复用同一条线程。
+- 验证：`tree.agent` analyze 0（2 条既有 info）、单测 **480/480**（新增 worker
+  spec / worker service / worker 策略 3 组）、`--selftest` **193/0**；
+  `tree.production.line` analyze 0、单测 **65/65**（新增 execution 8 条 +
+  execution_service 7 条）、`--selftest` **53/0**（含完整 打包 → 执行 → 门控 → done）；
+  两插件 `build_plugins --only ...` 产物自检通过；协议仓契约 14/14；插件仓零核心依赖
+  门禁通过。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -652,8 +694,9 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 **P0 出口 = DN-3 + DN-6**，完成即解锁 P1（数据模型/队列，**不依赖 `pkg_index`**）；
 **DN-7（收束产物）与 DN-9/DN-10（图谱）是 P3 前置**，不阻塞 P1/P2。
 
-> **进度（2026-11-09）**：P1 已完成（§7.5）、P2 已完成（§7.6）、P3 已完成（§7.7），
-> 其前置 DN-7/DN-9/DN-10 均已就绪 ⇒ 下一片是 **P4 打包 + 执行**。
+> **进度（2026-11-10）**：P1 已完成（§7.5）、P2 已完成（§7.6）、P3 已完成（§7.7）、
+> P4 已完成（§7.8）⇒ 下一片是 **P5 专家工具**（`ask_expert`、专家角色、次数/工具上限、
+> 台账）；P6 项目整理与 P7 本地模型可并行准备。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
