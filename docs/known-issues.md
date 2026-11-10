@@ -2706,3 +2706,66 @@ docnorm 的 `reuse` 建议目前只做**符号级候选 + LLM 核实**（同名/
 
 - `docs/archive/m9-plan.md` 是历史文档，**不改写**；与现行文档冲突时以现行文档为准。
 
+## #47 长会话首屏把整份显示行装进槽位表 ⇒ 贴底顺序布局几千条真消息，打开即 AppHang
+
+**状态**：**已修复（2026-11-10：首屏只热末尾一段 + 淘汰恢复 + 队友窗口定位改 `at=`）**
+**影响**：会话越长越必然触发（现场 7,578 条）。打开该会话的主线程被占住几十秒，Windows 判
+`AppHangB1` 直接把 `tree_ui.exe` 关掉；核心侧表现为心跳连续丢失 → 插件 `ready → stopped → failed`。
+
+### 现象（现场）
+
+- 2026-11-10 21:20:53 三条 UI 连接绑定 `tree.ui.default`（1.0.6，窗口 w2）；21:21:21
+  核心记「心跳丢失（连续 5 次）」+ 插件生命周期 `ready → stopped → failed`。
+- Windows 事件日志同一时刻 `Application Hang`（ID 1002）：`tree_ui.exe 1.0.6.1 停止与 Windows 交互并已关闭`，
+  WER `AppHangB1`（`P1: tree_ui.exe`）。⇒ **是挂死被关，不是 Dart 异常**（插件 stderr 里没有任何栈）。
+- 数据：`data/agt_1790845986535_e7df51_3/ses_1790927742041_b5d93d_72`（契门）迁移前
+  `messages.jsonl` 41 MB / **7,578 行**，`conversation.semdb` 50 MB；显示行合计仅 **6.38 MB**
+  （平均 0.9 KB/条，最大 23.3 KB）——列表数据本身不大，问题在**布局**。
+
+### 根因
+
+1. **F3（2026-11-02）把首屏改成"整段显示行一次拉满（limit=9999）"**（
+   `conversation-sembast-and-collapse-recon.md` §3.1.4 / Q3）。槽位表于是**全是真消息**。
+2. **`RenderSliverList` 首次布局只能从下标 0 逐条往后布局**（第一次没有已布局子项，落点再深也得
+   顺着累加实测高度）。首帧贴底（`_BottomAnchorScrollPosition.firstFrameBottom`）的目标是
+   `maxScrollExtent ≈ 7500 × 平均高`，于是 7,578 条消息在**同一帧**里全部建出来（每条还要
+   Markdown / 工具卡 / 折叠组现算）⇒ 主线程几十秒无响应。
+3. 淘汰被 F3 同时关掉（`_evictFarSlots` 在 `total ≤ kDisplayCacheLimit` 时直接返回），所以
+   "滑到哪补哪"的真消息也永远不会退回 88px 占位槽，同一条路径继续变慢。
+
+### 证据（flutter test 内的实测基准，同一份 7,578 槽位表）
+
+| 槽位表形态 | `pumpWidget` 首帧 |
+| --- | --- |
+| 7,578 条**真消息** | **98,794 ms** |
+| 末尾 200 条真 + 其余 88px 占位 | 3,891 ms |
+| 全部 88px 占位 | 3,519 ms |
+
+⇒ 真消息数量是唯一的量级来源；占位槽那条路径就是修复前的既有形态（快两个数量级）。
+
+### 修复
+
+1. `kInitialDisplayRows = 200`（`ui/services/message_window.dart`）：首屏只拉末尾常量级一段；
+   `ApiService.getConversationDisplayRows` 的补拉循环同样以它为预算（核心回不满一页时仍用
+   `before=<最旧 id>` 补到 200）。
+2. `_evictFarSlots` 恢复**始终淘汰**（删掉"`total ≤ 9999` 就不淘汰"的早退与 `cachedTail` 保留段，
+   `kDisplayCacheLimit` 一并删除）：长会话里滑旧内容补进来的真消息，离视口远了就换回 88px 占位，
+   任何一次"跳到远处"都只过轻量格子。
+3. 队友进度窗口（`teammates_window_page.dart`）同一口径：默认只拉末尾一段；带
+   `scrollToMessageId` 时改拉**含该条的那一段**（`at=`），老提问仍能跳过去。
+
+### 验证
+
+- 新增/改写的钉子：`test/conversation_history_api_test.dart`（首屏 `limit=200`、补拉预算、超长会话
+  `hasMore`）、`test/message_panel_window_work_test.dart`（首屏 200 / 滑到中段补页 / 淘汰生效；
+  A3、漂移、空页三条老钉子照旧）。
+- `flutter analyze lib`：No issues found；`flutter test`（UI 插件全量）见 work-log。
+- `test/tool_row_detail_test.dart` 的 `TabBar` 源钉被 `_buildViewerTabBar` 方法名误判，
+  已改为只钉 Material `TabBar` 组件（插件仓 `31940f8`）。
+
+### 遗留
+
+1. 更彻底的做法是把消息列表改成 `reverse: true`（底部 = offset 0，贴底零遍历），但要重构
+   下标/滑块/折叠/定位的整套坐标系，本轮不做；
+2. 占位槽 88px 是估算值，滑块拖到未加载段时的落点仍靠 `MessageSeekCorrection` 收口（既有口径）。
+
