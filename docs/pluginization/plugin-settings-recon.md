@@ -61,8 +61,8 @@
 
 ```text
 <data_root>/settings/<team_id>/settings.semdb
-  settings_schema   key = "<owner_plugin_id>|<key>"   value = {schema...}
-  settings_values   key = "<owner_plugin_id>|<key>"   value = {value, updated_at}
+  schemas   key = "<owner_plugin_id>"            value = {schema...}
+  values    key = "<owner_plugin_id>|<key>"      value = {value, updated_at}
 ```
 
 - `team_id` 从核心解析的 `scope` 取，不从调用方 payload 取；取不到 ⇒ 拒绝。
@@ -94,6 +94,7 @@
 
 支持的 `type`：`bool` / `int` / `double` / `string` / `enum` / `secret` / `path` / `string_list`。
 `enum` 必须带 `options`；`path` 只做字符串，不做存在性校验（宿主环境可能不同）。
+`owner_plugin_id` 由调用身份（`meta.source_plugin_id`）决定；schema body 里同名字段被忽略。
 
 ---
 
@@ -114,7 +115,7 @@
 | --- | --- | --- |
 | `settings.define` | 注册/升级 schema | 幂等；低版本不覆盖高版本；调用方只能写自己的 owner |
 | `settings.list` | 列出自己的 schema + 当前值 | `secret` 只回 `has_value` |
-| `settings.get` | 取单个 key 的覆盖值 | 不存在 ⇒ `value:null`（插件用默认值） |
+| `settings.get` | 取单个 key 的生效值 | 未覆盖 ⇒ 回 schema 默认值（插件可直接用；`list` 的 `has_value` 区分是否被覆盖） |
 | `settings.set` | 写入覆盖值 | 按 schema 校验；`secret` 不回显 |
 | `settings.reset` | 删除覆盖值（回到默认） | 幂等 |
 | `settings.export` | 导出本插件 schema + 值（脱敏） | 供诊断/迁移，不导入 |
@@ -137,6 +138,12 @@
 | POST | `/api/plugin-settings/reset` | `{plugin_id, keys:[...]}` |
 | POST | `/api/plugin-settings/apply` | 请求插件重新读取并热应用（可选） |
 
+**`team_id` 必须放在 query**：核心只从 query 透传 `scope.team_id`；缺 ⇒ 400
+`team_required`（不落公共库）。UI 卡片必须把当前 Agent / 团队 id 作为 `team_id` 传入。
+
+写入类路由（PATCH / reset）先确认 `plugin_id` 已有 schema，未注册 ⇒ 404
+`unknown_plugin`（不接受给陌生 owner 写覆盖值）。
+
 UI 插件只作为消费者调用；核心只做归属转发与形状校验。
 
 ### 5.3 变更广播
@@ -149,7 +156,9 @@ UI 插件只作为消费者调用；核心只做归属转发与形状校验。
 
 - 订阅方：业务插件（热应用）、UI（刷新表单）；
 - 不携带值，避免 secret 泄露；插件收到后自己 `settings.get`；
-- 广播失败不回滚写入（设置已落库），只在日志记录。
+- 广播失败不回滚写入（设置已落库），只在日志记录；
+- `at` = 广播时刻 epoch ms（排序 / 日志用）；`POST /api/plugin-settings/apply`
+  当前只回 `{ok:true}` 确认，不做重放（变更已由广播下发）。
 
 ---
 
@@ -159,11 +168,13 @@ UI 插件只作为消费者调用；核心只做归属转发与形状校验。
 
 - 左栏按 `owner_plugin_id` 分组；右侧按 schema 的 `groups` 渲染；
 - 字段类型 → 控件：`bool` 开关、`int/double` 数字框、`string` 文本框、`enum` 下拉、
-  `secret` 密码框（只写；显示“已设置/未设置”）、`path` 文本 + 选择按钮、`string_list` 列表；
+  `secret` 密码框（只写；显示“已设置/未设置”）、`path` 文本、`string_list` 列表；
 - 保存：只提交脏字段；逐项错误就地显示；`reset` 回默认；
-- 无 schema 的插件不出现；
-- 插件声明 `restart_required` 类字段时，保存后标注“需重启插件”并给「热重启」入口；
-- **第三方 UI** 用同一份 `/api/settings/*` 契约；UI 能力声明 `settings.manage`（`ui.hello`）。
+- 无 schema 的插件不出现；未选 Agent / 团队时提示先选择，不发请求；
+- **第三方 UI** 用同一份 `/api/plugin-settings/*` 契约；UI 能力声明 `settings.manage`（`ui.hello`）。
+
+**K4 遗留（未实现，发版不阻塞）**：`path` 选择按钮、`restart_required` 的「需重启 /
+热重启」提示、逐字段错误定位；当前错误按插件汇总展示。
 
 **回退**：没有 UI 声明 `settings.manage` 时，设置服务仍可经 REST 读写；是否提供核心托管的最小
 设置页留待 K5 决定（不默认增加核心面）。
@@ -188,8 +199,8 @@ UI 插件只作为消费者调用；核心只做归属转发与形状校验。
 | --- | --- | --- |
 | K1 | `plugins/tree.settings/`：执行站 `settings.define/list`，每团队 `<data_root>/settings/<team_id>/settings.semdb`，owner 只认 `meta.source_plugin_id` | 插件自检 29/29；engine 测试 8/8 |
 | K2 | `settings.get/set/reset/export`；类型/枚举/范围校验；secret 只回 `has_value`；同版本 schema 幂等、异内容/降级拒绝 | 同上；越界/类型/未知 key 均拒 |
-| K3 | 广播站 `plugin.tree.settings.broadcast.settings_changed`；写入后发 `settings.changed {plugin_id, keys, generation}`，不带值 | 自检断言广播带 plugin_id、不带 value |
-| K4 | UI 设置页「插件」分类新增「插件设置」卡片（`plugin_settings_card.dart`）；按 schema 通用渲染、secret 只写、只提交脏字段、恢复默认 | `plugin_settings_card_test` 通过；`settings_nav_test` 通过；全量 UI 925 通过（唯一失败是既有版本常量 1.0.5 vs pubspec 1.0.6 漂移，与本切片无关） |
+| K3 | 广播站 `plugin.tree.settings.broadcast.settings_changed`；写入后发 `settings.changed {plugin_id, keys, generation, at}`，不带值 | 自检断言广播带 plugin_id、不带 value；REST 用例断言 `at > 0` |
+| K4 | UI 设置页「插件」分类新增「插件设置」卡片（`plugin_settings_card.dart`）；按 schema 通用渲染、secret 只写、只提交脏字段、恢复默认；`team_id` 取当前选中 Agent / 团队并经 query 下发 | `plugin_settings_card_test` 通过；`settings_nav_test` 通过；全量 UI 925 通过（唯一失败是既有版本常量 1.0.5 vs pubspec 1.0.6 漂移，与本切片无关） |
 | K5 | 契约冻结（单元/自检层）：schema 版本策略、未知类型拒绝、20 并发写 generation 单调、export 脱敏、secret 默认值禁止非空、无 UI 时 REST 可读写；**真核心黑盒随主线 DN-2 联调** | engine 8/8；插件自检 29/29；REST 读写/secret 脱敏均在自检内 |
 
 实现口径补充：
@@ -197,6 +208,18 @@ UI 插件只作为消费者调用；核心只做归属转发与形状校验。
 - REST 前缀最终用 **`/api/plugin-settings/*`**（核心已有 `/api/settings/*`，不能撞）；
 - UI 首屏一次取 schema，再逐插件取 values（插件数量少，暂不做聚合端点）；
 - `plugins/` 与 `tree.ui.default` 是独立仓库/挂载，K 的实现提交在**插件仓**，桌面仓只记录文档与状态。
+
+**2026-11-10 发版前审查追加**：
+
+- UI 卡片补 `team_id`（当前选中 Agent / 团队）并经 query 下发；修复真机必然 400
+  `team_required` 的问题；未选团队时只提示、不发请求。
+- REST 写入（PATCH / reset）校验 `plugin_id` 已注册 schema，未注册 ⇒ 404
+  `unknown_plugin`；`settings.changed` 补 `at`（epoch ms）。
+- `enum` 收到非字符串改判 `value_type_mismatch`（不再落入 `value_out_of_range`）。
+- 新增 `settings_service_test` 4 条（team 必填 / 未注册插件 / 广播 `at` / enum 类型），
+  engine 8 条不变；`dart test` 合计 **12/12**，自检 29/0。
+- 已知边界：REST 侧不做 UI 身份鉴权（本地单用户信任边界）；越权写防护留待
+  UI 能力校验切片。
 
 ---
 
@@ -228,6 +251,7 @@ UI 插件只作为消费者调用；核心只做归属转发与形状校验。
 | 值存储 | 自有 Sembast 单库 | 不依赖 `tree.storage`，K 不被 I 阻塞 |
 | 设置服务缺失 | 插件 fail-open 到 env/config | 设置不是业务数据，不能因服务缺失阻断启动 |
 | 热应用 | 默认热应用；插件可声明需重启 | UI 标「需重启」并给热重启入口 |
+| REST 写入鉴权 | v1 信任本地单用户 | 只校验目标插件已注册；UI 身份 / `settings.manage` 校验留待后续切片 |
 
 ---
 

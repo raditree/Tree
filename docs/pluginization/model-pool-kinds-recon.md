@@ -72,7 +72,7 @@ base_url: https://api.jev.example/v1   # 或 OpenRouter / AIMLAPI 网关
 api_key: sk-...
 max_input_tokens: 262144   # 官方口径约 262k，接入时以实际为准
 confidence_threshold: 0.7  # 低于阈值回退 chat/人工
-max_questions: 16          # 单次请求问题数上限
+# 单次请求问题数上限暂固定 16（DecisionClient.maxQuestions），配置化延后
 ```
 
 规则：
@@ -147,10 +147,10 @@ JEV 是 **System One 决策模型**，不是 chat / embedding：
 
 | 端点 | 变更 |
 | --- | --- |
-| `GET /api/models` | 每条加 `kind` / `protocol` / `dimensions` / `max_input_tokens` / `confidence_threshold`（后两者可空） |
+| `GET /api/models` | 每条加 `kind` / `protocol` / `dimensions` / `max_input_tokens` / `confidence_threshold`（后两者可空）与 `has_api_key`（布尔，密钥永不出插件） |
 | `POST /api/models` | 校验 `kind/protocol` 组合；embedding 校验 `dimensions`；decision 校验 `confidence_threshold` |
-| `PATCH /api/models/{modelId}` | **`kind` / `protocol` 不可改**（400）；其余字段可改 |
-| `DELETE /api/models/{modelId}` | 仍检查 Agent 绑定；embedding/decision 的消费方不在 `agents/`，返回绑定提示为空不等于安全 |
+| `PATCH /api/models/{modelId}` | **`kind` / `protocol` 不可改**（仅新值 ≠ 旧值才 400；同值视为无变化）；其余字段可改；存量条目被手改成未知类型时 PATCH 也拒绝 |
+| `DELETE /api/models/{modelId}` | 不拦截删除，返回 `bound_agents` 供 UI 提示；embedding/decision 的消费方不在 `agents/`，下次使用 fail-closed |
 | `GET /api/agents/{id}/models-info` | `models[]` 保留全部并带 `kind`，由前端按用途过滤；后端不做隐式过滤 |
 
 **绑定校验（后端，不靠前端）**：`POST /api/agents`、`PATCH /api/agents/{id}`、团队成员创建/改模型
@@ -186,7 +186,7 @@ JEV 是 **System One 决策模型**，不是 chat / embedding：
 UI 落点：
 
 - 设置页模型编辑器：`kind` 下拉 + 条件字段（embedding 显示 `dimensions`/`max_input_tokens`；
-  decision 显示 `confidence_threshold`/`max_questions`）；模型列表加 kind 徽标；
+  decision 显示 `confidence_threshold`/`max_input_tokens`）；模型列表加 kind 徽标；
 - 创建 Agent / 模型信息 / 产线模型配置：下拉只列 `chat`；
 - 产线主控：单独一个「决策模型」下拉，只列 `decision`，允许留空（回退 chat）；
 - docnorm 设置：一个「检索 embedding 模型」下拉，只列 `embedding`，允许留空（lexical）。
@@ -231,13 +231,28 @@ UI 落点：
 - **自检遗留修正**：`models` / `models-info` 快照补 MP-1 新键；`conversations` 提问卡片补
   `preview` / `seq`；agents 列表在 `updatedAt` 同刻时按 id 升序（消除 Windows 扫描顺序导致的
   偶发换序，自检不再抖动）。
-- 验证：tree.agent analyze 0、全量 **451/451**、`--selftest` **186/0**；
+- 验证（截至 2026-11-08，`has_api_key` 与员工 kind 校验见下方追加记录）：tree.agent
+  analyze 0、全量 **451/451**、`--selftest` **186/0**；
   `domain_settings_test` 9/9、`delegate_test`（含新增 3 条）、`team_service_test` 20/20、
   `embedding_client_test` 6/6、`decision_client_test` 6/6；UI `flutter analyze` 仅 7 条既有
   `thinking_window_test` 告警、`model_pool_test` 13/13、受影响组件 45/45；全量 UI 938 条中
   937 通过，唯一失败是既有版本常量 1.0.5 / pubspec 1.0.6 漂移（与本切片无关）。
 - 集成预留：embedding/decision 目前是插件库能力；docnorm 的消费随 **DN-9** 的站点契约接入，
   MP 切片不伪接线。JEV 的真实网关录制回包 fixture 留到接入时补（当前用同契约 fake 端点测试）。
+
+**2026-11-10 发版前审查追加**：
+
+- `CoreModelConfig.toApiJson` 补 `has_api_key`（布尔）：此前前端按它判断“未配置密钥”，
+  字段缺失导致所有模型都误显“未配置 API Key”。密钥原文仍永不出插件。
+- `agent.worker.run` 增加 `kind=chat` 校验（`model_kind_invalid`）：产线打包 / 执行 / 专家
+  不能再绑 embedding / decision；与 Agent、团队成员的后端校验对齐（MP-4）。
+- `PATCH /api/models/{id}`：存量条目被手改成未知 `kind` / `protocol` 时，改其他字段也拒绝
+  （不替用户猜）；`kind` / `protocol` 传同值视为无变化、放行。
+- decision 的 `max_questions` 不做配置项（`DecisionClient` 固定 16）；schema 示例已移除。
+- 新增测试：`has_api_key` 断言、员工 kind 拒绝、存量未知类型 PATCH 拒绝、
+  元数据路由 GET/POST/PATCH/DELETE 错误分支与缓存清理。
+- 当前基线：tree.agent 单测 **497/497**、自检 208/0（截至本次审查；后续变更以
+  `docs/work-log.md` 为准）。
 
 
 

@@ -59,8 +59,8 @@
 ```text
 <data_root>/storage/<team_id>/<plugin_id>/data.semdb   # 运行时真源（每团队 × 每插件一个库）
 <data_root>/storage/<team_id>/<plugin_id>/export/      # 导出快照（可删，可重建）
-  <collection>.ndjson
-  manifest.json                                         # schema / count / sha256 / exported_at
+  <collection>/<UTC>/data.ndjson                        # 单文件全量（当前实现，见 §7 偏离说明）
+  <collection>/<UTC>/manifest.json                      # format/version/team/namespace/schema/count/sha256/created_at
 ```
 
 **实例粒度**：`plugin.json` 用 `granularity: team`（与 `tree.agent` / 执行器同口径）。
@@ -110,10 +110,16 @@
   "ops": [ ... ]                   // 仅 storage.tx
 }
 
-// 回包
+// 回包（成功）
 {"ok": true, "rev": 4, "value": {...}, "values": [...], "count": 0,
- "cursor": "...", "error": "", "error_reason": ""}
+ "cursor": "...", "namespace": "...", "collection": "..."}
+
+// 回包（失败）：执行站 reply 层返回，payload 不出现
+{"error": "人话原因", "code": "stable_code"}
 ```
+
+失败一律抛错并由执行站 reply 的 `{error, code}` 返回，**不伪装成 `ok:true`**；
+唯一例外是 `storage.compact` 的「失败但不影响读」，回 `ok:true, compacted:false, error`。
 
 ### 5.2 命令表
 
@@ -127,15 +133,15 @@
 | `storage.scan` | 顺序扫（可按 key 前缀） | 只给导出/维护；业务读走 query |
 | `storage.count` | 计数 | 与 query 同过滤条件 |
 | `storage.tx` | 批量 ops 原子执行 | 任一失败整批回滚；最多 200 ops，**单次 tx 总字节 ≤ 8 MiB**（单条 value ≤ 1 MiB），超限直接拒绝 |
-| `storage.export` | 导出 NDJSON + manifest | 原子写；不阻塞普通读写超过阈值即分片 |
-| `storage.import` | 导入 NDJSON | 目标集合必须为空或 `replace:true`；校验 sha256 |
+| `storage.export` | 导出 NDJSON + manifest | 原子写；当前单文件全量，大集合分片列为后续优化 |
+| `storage.import` | 导入 NDJSON | 目标集合必须为空或 `replace:true`；校验 sha256；**只允许导入本团队 × 本命名空间的导出物**（manifest 归属不符 ⇒ `import_invalid`） |
 | `storage.stats` | 条目数 / 文件大小 / 版本 | 只读 |
 | `storage.compact` | 压缩库文件 | 维护窗口执行；失败不影响读 |
 | `storage.purge` | 删除本插件库 | 必须二次确认；只允许删自己的 namespace |
 
 ### 5.3 访问控制
 
-- 调用方身份只认核心 `meta.source_plugin_id` / `triggered_by`，**不认 payload 里自报的 plugin_id**；
+- 调用方身份只认核心 `meta.source_plugin_id`，**不认 payload 里自报的 plugin_id**；
 - 执行站命令的身份由核心在 `station/command` 的 `meta` 透传；本插件在入口按**自身配置的
   允许列表**自查（当前只允许 `tree.docnorm`）。**核心未带身份 ⇒ 拒绝**（fail-closed，不猜调用方）；
 - `namespace` 缺省 = 调用方 plugin_id；填别人 namespace 且不在允许列表 ⇒ 403；
@@ -191,10 +197,15 @@
   `storage.count`（与 query 同一套等值过滤），方案 §5.2 的 13 条命令全部可路由。
 - 验证：`dart analyze` 0、单测 **29/29**（原 16 条不回归，新增 13 条覆盖
   TC-ST-02/03/04/05/07/09/11 + scan/count）、`--selftest` 53/0、`build_plugins --only tree.storage`
-  产物自检通过、插件仓契约 7/7。
+  产物自检通过、插件仓契约 7/7（发版前审查后为 **31/31**，见下方隔离补充）。
 - 偏离：`compact` 未用 Sembast 独立 compact（无此 API），改为关闭/重开缓存库；
   `storage.import` 的 `collection` 可覆盖 manifest 里的集合名（目标须为空或 replace）；
   `purge` 删除库文件后只清理空目录，非空 `export/` 快照保留。
+- **发版前审查补充（2026-11-10）**：`storage.import` 增加导出物归属校验——manifest 的
+  `team_id` / `namespace` 与目标不符 ⇒ `import_invalid`，避免被 allowlist 放行的调用方
+  把别人的导出快照复制进自己集合（绕过 namespace 隔离）；新增跨命名空间 / 跨团队拒绝用例。
+  另补「payload 自报身份被忽略」用例（TC-ST-08/12）。单测 **31/31**，自检 53/0，
+  `build_plugins` 产物自检与插件仓零核心依赖门禁通过。
 - **ST-6 实施记录（2026-11-08，随 DN-6）**：`tree.docnorm` 的 `plugin.json` 已声明
   `requires.plugins = [{id: tree.storage, version: >=0.1.0}]`；
   `docnorm.baseline` / `docnorm.reanalyze --changed` 经自建存储站写入

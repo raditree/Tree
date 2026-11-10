@@ -537,11 +537,15 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
 - 命令（执行站 `production`）：`production.queue.dispatch`（`{line_id, limit?}`）与
   `production.task.budget`（`{line_id, task_id}`）。
 - DAG 派发（只读计划，不改状态）：按 `priority → created_at → id` 扫描 `queued`，
-  逐个判「`depends_on` 全部 `done`」→「写域与在途任务 / 已入选批次两两不相交」→
-  「并行槽位（`limits.max_parallel_tasks`，在途 = `packing/packed/running/gating`）未满」；
-  返回 `batch / batch_ids / running / skipped[{id,reason,with_task|waiting_on}] /
-  slots_used / slots_free`。真正的状态迁移仍由 `production.task.pack` 做，
-  UI 按 `batch` 并发发起即可。
+  逐个判「`depends_on` 全部 `done`」→「`write_scope` 非空」→「写域与在途任务 /
+  已入选批次两两不相交」→「并行槽位（`limits.max_parallel_tasks`，在途 =
+  `packing/packed/running/gating`）未满」；返回 `batch / batch_ids / running /
+  skipped[{id,reason}] / slots_used / slots_free / count`。
+  `reason` 取值：`depends_on`（带 `waiting_on`）、`write_scope_missing`、
+  `write_scope_overlap`（带 `with_task` / `scope`）、`max_parallel`、`limit`
+  （调用方传的 `limit` 截断，带 `limit`）。`slots_free` 是**派发前**读数
+  （不扣除本批，本批尚未迁移到 `packing`）；`count = batch.length`。
+  真正的状态迁移仍由 `production.task.pack` 做，UI 按 `batch` 并发发起即可。
 - 写域交叠判据（`writeScopesOverlap`）：字面路径按目录语义（`lib/a` 与
   `lib/a/b.dart` 交叠、`lib/a` 与 `lib/ab` 不交叠）；含 `*` / `?` 的规则用
   `matchesWriteScope` 互测；两边都是通配时比较第一个通配符前的字面前缀。
@@ -556,6 +560,9 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   `status=budget_exceeded` 的 run（有产出时原 run 标 `budget_exceeded: true`）、
   任务标 `budget_exceeded: true` 并转 `blocked`（原因含 token / 时长读数）。
   `blocked` 后再次打包会先被状态机拒绝 ⇒「不静默继续」。
+  `production.task.budget` 的 `budget_exceeded` 是**软停标记**（历史），`exceeded`
+  是按**当前** `limits` 与累计 `usage` 的实时判定；用户加预算后把任务迁回 `queued`
+  会清掉 `budget_exceeded` / `budget` 快照（run 台账仍保留历史），再从队列重新打包。
 
 `tree.agent` 0.32.0（模型元数据发现，OpenAI 兼容端点）：
 
@@ -577,9 +584,10 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   显示端点声明档位 + 「从端点探测」按钮 + 价格行；模型池列表行展示
   `$x / 1M 输入 · $y / 1M 输出`；保存时把当前候选档位写回
   `reasoning_effort_options`（后端仍按它校验成员覆盖）。
-- 验证：产线 analyze 0 / 单测 **95/95** / 自检 **87/0**（新增并行 5 条 + 预算 5 条）；
-  tree.agent analyze 0（仅存量 info）/ 单测 **489/489** / 自检 **208/0**（新增
-  元数据探测 14 条）；UI `model_pool_test` 15/15（全量套件仅存量的
+- 验证：产线 analyze 0 / 单测 **100/100** / 自检 **87/0**（含发版前审查补的
+  派发 `limit` / 缺写域 / 调用前超限 / 执行后软停 / 重新入队清标记用例）；
+  tree.agent analyze 0 / 单测 **497/497** / 自检 **208/0**（新增
+  元数据测试 6 条）；UI `model_pool_test` 15/15（全量套件仅存量的
   `version_info_test` 因 pubspec `1.0.6+1` 与 `kAppVersion 1.0.5` 历史漂移而红，
   与本片无关）；两个插件 `build_plugins` 产物自检通过；协议仓契约 14/14；
   插件仓零核心依赖门禁通过。
