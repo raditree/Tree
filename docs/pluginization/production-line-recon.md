@@ -781,6 +781,13 @@ packer ──pack.json──▶ executor
 | GET | `/api/production/lines/{lineId}/artifacts` | 产物树（只读） |
 | GET | `/api/production/lines/{lineId}/audit` | 项目整理报告 |
 
+> **增量（2026-11-10，只读 REST 切片）**：上表的**读半边**已落地——插件经
+> `system.collect.api.routes` 申报 7 条 GET（lines / line / tasks / task / runs /
+> artifacts / audit），请求由核心转成 `api/delegate`；`audit` 走 `write=false`
+> 只出报告，不落 `audit.md`。写操作（POST/PATCH/DELETE、dispatch / decision /
+> cancel）留到下一片，当前命中即 405（不"收下请求但不做事"）。UI 活动栏第 4 项
+> 「生产线」已接上列表 / 任务队列 / 运行台账 / 产物 / 整理报告与依赖缺失态。
+
 Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 
 | 方法 | 路径 | 说明 |
@@ -841,6 +848,10 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 > P4 已完成（§7.8）、P5 已完成（§7.9）、P6 已完成（§7.10）、P8 已完成（§7.11）。
 > P7 按用户定稿**取消**（不做模型硬绑定：模型池由用户自选，产线只存用户选中的
 > `model_id`）。规划内切片全部完成；后续按缺陷与用户反馈开增量片。
+>
+> **增量片（2026-11-10）**：§10.2 只读 REST + UI 活动栏「生产线」已落地（写操作
+> 留到下一片）；本地 zip 安装验证通过（tree.agent 0.32 / storage 0.1 /
+> docnorm 0.8 / settings 0.1 / production.line 0.6 / ui 1.0.6）。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
