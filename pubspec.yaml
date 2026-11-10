@@ -4,7 +4,7 @@ description: Tree 桌面端发布工程（核心 / 引导壳 / 插件发布）�
 publish_to: 'none'
 
 # 安装包 / 核心 / loader 的版本（界面插件版本独立，取插件自己 pubspec.yaml 的 version）
-version: 1.0.5+1
+version: 1.0.6+1
 
 # desktop 分支：Dart 3（Flutter 3.47.5 / Dart 3.13.4），最低 Windows 10
 environment:
