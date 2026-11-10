@@ -286,6 +286,52 @@ abstract final class ApiPaths {
   static const String mcpServices = '/api/mcp/services';
   static const String mcpService = '/api/mcp/services/{name}';
 
+  // ── 生产线（`tree.production.line` 承接，§10.2）──────────────────────
+  //
+  // 插件经 `system.collect.api.routes` 申报、核心转 `api/delegate`；这里只登记
+  // **前端可调用面**（契约自检用），不是运行期白名单（L-28：归属由命名空间规则
+  // + 归属表冲突检测决定）。`dispatch` 在插件侧后台跑，受理即回 accepted。
+
+  /// 产线列表 / 新建（GET / POST）。
+  static const String productionLines = '/api/production/lines';
+
+  /// 产线详情 / 改配置 / 删除（GET / PATCH / DELETE）。
+  static const String productionLine = '/api/production/lines/{lineId}';
+
+  /// 任务队列 / 建任务（GET / POST）。
+  static const String productionTasks = '/api/production/lines/{lineId}/tasks';
+
+  /// 任务详情 / 改状态（GET / PATCH，有限状态机在插件侧）。
+  static const String productionTask =
+      '/api/production/lines/{lineId}/tasks/{taskId}';
+
+  /// 进入打包 / 执行（POST）。
+  static const String productionTaskDispatch =
+      '/api/production/lines/{lineId}/tasks/{taskId}/dispatch';
+
+  /// 回答 `Q`（POST，逐条 answers 或「全部按推荐」）。
+  static const String productionTaskDecision =
+      '/api/production/lines/{lineId}/tasks/{taskId}/decision';
+
+  /// 取消任务（POST）。
+  static const String productionTaskCancel =
+      '/api/production/lines/{lineId}/tasks/{taskId}/cancel';
+
+  /// 待答 `Q`（GET，决策卡片数据源）。
+  static const String productionTaskQuestions =
+      '/api/production/lines/{lineId}/tasks/{taskId}/questions';
+
+  /// 运行台账（GET）。
+  static const String productionRuns = '/api/production/lines/{lineId}/runs';
+
+  /// 产物树（GET，只读）。
+  static const String productionArtifacts =
+      '/api/production/lines/{lineId}/artifacts';
+
+  /// 项目整理报告（GET，只读；写 `audit.md` 走站命令）。
+  static const String productionAudit =
+      '/api/production/lines/{lineId}/audit';
+
   // ── 运行中工具（"工具卡住"的可见面）────────────────────────────────────
 
   /// 正在执行的工具快照（GET，**只读**）：`{runs:[{handle, agent_id, session_id,
@@ -413,9 +459,10 @@ abstract final class ApiPaths {
   /// 若将来需要登记「无承接方的插件面」，另建语义明确的集合，不要复用本名。
   static const Set<String> pendingHandoffRoutes = <String>{};
 
-  /// **契约中归插件的全部方法路由：55 条。**
+  /// **契约中归插件的全部方法路由：71 条。**
   ///
-  /// agent 37（34 存量 + 2 新增上行改委派 + 1 消息详情）+ spec 2 + mcp 3 + files 13。
+  /// agent 37（34 存量 + 2 新增上行改委派 + 1 消息详情）+ spec 2 + mcp 3 + files 13
+  /// + 生产线 16（§10.2 读 8 / 写 8）。
   /// **git 3 已按用户决定删除**（2026-10-25）。L-28 起它不是运行期白名单：
   /// 放行由 [delegationPatternError] 的命名空间规则 + 归属表冲突检测决定；
   /// 本集合只用于契约自检与 G-1 对照。
@@ -474,6 +521,23 @@ abstract final class ApiPaths {
     'GET $mcpServices',
     'POST $mcpServices',
     'DELETE $mcpService',
+    // 生产线（16）：tree.production.line 承接（§10.2，读 + 写）。
+    'GET $productionLines',
+    'POST $productionLines',
+    'GET $productionLine',
+    'PATCH $productionLine',
+    'DELETE $productionLine',
+    'GET $productionTasks',
+    'POST $productionTasks',
+    'GET $productionTask',
+    'PATCH $productionTask',
+    'POST $productionTaskDispatch',
+    'POST $productionTaskDecision',
+    'POST $productionTaskCancel',
+    'GET $productionTaskQuestions',
+    'GET $productionRuns',
+    'GET $productionArtifacts',
+    'GET $productionAudit',
     // files（13）
     'GET $files',
     'DELETE $fileDelete',
@@ -490,7 +554,7 @@ abstract final class ApiPaths {
     'POST $fileRename',
   };
 
-  /// 契约全集（90 = [coreOwned] 35 + [delegated] 55）。
+  /// 契约全集（106 = [coreOwned] 35 + [delegated] 71）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -624,6 +688,17 @@ abstract final class ApiPaths {
     pluginSettingsReset,
     mcpServices,
     mcpService,
+    productionLines,
+    productionLine,
+    productionTasks,
+    productionTask,
+    productionTaskDispatch,
+    productionTaskDecision,
+    productionTaskCancel,
+    productionTaskQuestions,
+    productionRuns,
+    productionArtifacts,
+    productionAudit,
     toolsRunning,
     toolsRunningClose,
     agentSubagents,

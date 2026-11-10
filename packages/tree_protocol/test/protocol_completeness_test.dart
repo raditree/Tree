@@ -200,7 +200,7 @@ void main() {
     );
   });
 
-  test('委派契约：coreOwned 35 / delegated 55 / pendingHandoffRoutes 0', () {
+  test('委派契约：coreOwned 35 / delegated 71 / pendingHandoffRoutes 0', () {
     expect(
       ApiPaths.coreOwned.length,
       35,
@@ -208,17 +208,19 @@ void main() {
     );
     expect(
       ApiPaths.delegated.length,
-      55,
-      reason: '插件面 55 条（git 3 已删除；消息详情端点 +1）',
+      71,
+      reason:
+          '插件面 71 条（git 3 已删除；消息详情端点 +1；生产线 §10.2 +16）',
     );
     expect(ApiPaths.pendingHandoffRoutes, isEmpty, reason: 'A5 已清空迁移债台账');
-    expect(ApiPaths.contractRoutes.length, 90);
+    expect(ApiPaths.contractRoutes.length, 106);
     expect(
       ApiPaths.kept.length,
-      73,
+      84,
       reason:
           'git 3 已删；UI 多窗口 +2；终端 REST +2；本地安装 +1；消息详情 +1；发布源设置 +2；'
-          '插件设置 REST +3（K 系列，非 delegated）；store/logs/data-collection 8 条方法路由'
+          '插件设置 REST +3（K 系列，非 delegated）；生产线 REST +11 条路径'
+          '（16 条方法路由）；store/logs/data-collection 8 条方法路由'
           '（5 条路径）已删',
     );
     expect(

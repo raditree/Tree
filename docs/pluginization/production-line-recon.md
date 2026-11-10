@@ -777,6 +777,7 @@ packer ──pack.json──▶ executor
 | POST | `/api/production/lines/{lineId}/tasks/{taskId}/dispatch` | 进入打包/执行 |
 | POST | `/api/production/lines/{lineId}/tasks/{taskId}/decision` | 回答 `Q` |
 | POST | `/api/production/lines/{lineId}/tasks/{taskId}/cancel` | 取消 |
+| GET | `/api/production/lines/{lineId}/tasks/{taskId}/questions` | 待答 `Q`（决策卡片数据源） |
 | GET | `/api/production/lines/{lineId}/runs` | 运行台账 |
 | GET | `/api/production/lines/{lineId}/artifacts` | 产物树（只读） |
 | GET | `/api/production/lines/{lineId}/audit` | 项目整理报告 |
@@ -784,9 +785,25 @@ packer ──pack.json──▶ executor
 > **增量（2026-11-10，只读 REST 切片）**：上表的**读半边**已落地——插件经
 > `system.collect.api.routes` 申报 7 条 GET（lines / line / tasks / task / runs /
 > artifacts / audit），请求由核心转成 `api/delegate`；`audit` 走 `write=false`
-> 只出报告，不落 `audit.md`。写操作（POST/PATCH/DELETE、dispatch / decision /
-> cancel）留到下一片，当前命中即 405（不"收下请求但不做事"）。UI 活动栏第 4 项
-> 「生产线」已接上列表 / 任务队列 / 运行台账 / 产物 / 整理报告与依赖缺失态。
+> 只出报告，不落 `audit.md`。UI 活动栏第 4 项「生产线」已接上列表 / 任务队列 /
+> 运行台账 / 产物 / 整理报告与依赖缺失态。
+>
+> **增量（2026-11-10，写切片）**：上表的**写半边**也已落地——POST `/lines`、PATCH /
+> DELETE `/lines/{lineId}`、POST `/lines/{lineId}/tasks`、PATCH `/tasks/{taskId}`、
+> POST `.../dispatch|decision|cancel`，另补一条 GET `.../tasks/{taskId}/questions`
+> （决策卡片的数据源；没有它 UI 不知道要回答哪些 `Q`）。口径：
+> - 写路由全部复用已有命令门面（`production.line.create` / `production.task.create` /
+>   `production.task.transition` / `production.prepare.answer|all_recommended`），
+>   REST 层不复制状态机；
+> - `dispatch` 默认**后台跑**：核心的委派回包只等 30s，而打包 / 执行要等模型与本机命令，
+>   同步必然 504；受理即回 `accepted: true` + 当前任务，进度看任务状态 / 运行台账，
+>   失败写 `task.yaml.last_error`；
+> - 错误码映射：`not_found → 404`，状态机与冲突（`invalid_transition` /
+>   `terminal_state` / `line_busy` / `questions_open` / `dispatch_in_flight` 等）`→ 409`，
+>   其余请求问题 `→ 400`；DELETE 产线只删插件数据，项目资产保留并回 `assets_kept`；
+>   有在途任务时拒绝删除（409 `line_busy`）。
+> - UI：活动栏「生产线」加「+ 新建产线 / 新建任务 / 删除产线」与任务菜单
+>   （打包 / 执行 / 拍板 / 取消）；拍板弹窗按 `questions` 逐条回答或「全部按推荐」。
 
 Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 
