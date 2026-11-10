@@ -189,6 +189,13 @@ cd plugins/tree.ui.default; <flutter-sdk>/bin/flutter.bat analyze lib
 > **D-4 已决**：插件化这一版用 **`1.0.5+1`**（`1.0.4+3` 已有 annotated tag 且已推到 origin，
 > 沿用等于给两个不同提交挂同一个版本号）。
 
+> **2026-11-10 更新（1.0.6 本地出包，未发布）**：桌面仓根版本升 `1.0.6+1`、UI 插件
+> `1.0.6`。已产出 `dist/tree-desktop-1.0.6-windows-x64.zip`（31.0 MB）、
+> `dist/installer/tree-desktop-1.0.6-windows-x64-setup.exe`（21.5 MB）、
+> `dist/tree-ui-default-1.0.6.zip`（18.9 MB）、`dist/tree_core.exe` 与
+> `build/plugins/plugin-index.json`（16 条）。**push / tag / 资产上传仍待人工执行**；
+> Gitee 资产仍缺可用 token。
+
 发版流程（细节见 [development.md](development.md) 发布检查单）：
 
 1. 两仓分别 push；桌面仓**两个远端都要推**（GitHub 落后 3 个、Gitee 落后 106 个提交）；
