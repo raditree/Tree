@@ -493,6 +493,39 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
   **483/483**（新增 opt-in / 专家再召 3 条）、`--selftest` **193/0**；两插件
   `build_plugins --only ...` 产物自检通过；协议仓契约 14/14；插件仓零核心依赖门禁通过。
 
+### 7.10 P6 实施记录（2026-11-10）
+
+`tree.production.line` 0.5.0 落地项目整理，仍不新增核心点位：
+
+- 命令（同执行站 `production`）：`production.audit.run`
+  （`{line_id, task_id?, write?}`）。显式给了 `task_id` 就必须存在（拼错不静默）；
+  缺 `data_dir` / `team_id` / `workspace_dir` 一律 fail-closed，工作空间不存在回
+  `workspace_unavailable`。
+- 只读边界：扫描**不改任何工作空间文件**；唯一写入是项目资产
+  `<workspace>/<docs.asset_dir>/<line>/audit.md`；`write=false` 时连它都不写
+  （纯查询，供 UI 预览）。单测以“审计前后工作空间文件集合”断言只新增 audit.md。
+- 扫描范围（有界、确定性）：跳过 `.git/.dart_tool/build/node_modules/.docnorm` 等目录；
+  只读文本扩展名；单次 ≤ 2000 个文件、单文件 ≤ 512 KiB、台账 ≤ 500 条；到点写
+  `notes` 说明（不静默截断）。
+- 四块内容：
+  - 文档审计：按 `line.yaml.docs.memory_manifest` 逐份判断存在性（`checked` /
+    `missing`）；清单为空时留说明；
+  - TODO 台账：只认大写 `TODO/FIXME/XXX/HACK`（避免正文里的 “todo” 误报），
+    记 `path / line / marker / text`（正文裁到 200 字符）；
+  - 冗余候选：FNV-1a 64 位内容摘要做重复组（≥ 1 KiB 且 ≥ 2 个路径）+ 超大文件
+    （≥ 256 KiB），均按体积降序；不引入额外依赖；
+  - 说明：扫描截断等。
+- 报告 schema 固定（`version: 1`）：顶层 `version / line_id / task_id /
+  generated_at / workspace / files{scanned,skipped,bytes} / docs{checked,missing} /
+  todos[] / redundancy{duplicates[],large_files[]} / notes[]`；单测钉死键集合，
+  防实现细节漂移。
+- 落档：`audit.md` 由 `renderAuditMd` 渲染（文档审计 / TODO 台账 / 冗余候选 /
+  说明四节），机读真值是回包里的 `report`；不写入插件数据根。
+- 验证：analyze 0、单测 **84/84**（新增审计纯逻辑 4 条 + 门面 5 条）、
+  `--selftest` **77/0**（新增 schema / TODO / 文档审计 / 重复组 / 超大文件 /
+  write=false / 只读断言 10 条）；`build_plugins --only tree.production.line`
+  产物自检通过；协议仓契约 14/14；插件仓零核心依赖门禁通过。
+
 ---
 
 ## 8. 准备阶段（用户活跃窗口）
@@ -739,8 +772,8 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 **DN-7（收束产物）与 DN-9/DN-10（图谱）是 P3 前置**，不阻塞 P1/P2。
 
 > **进度（2026-11-10）**：P1 已完成（§7.5）、P2 已完成（§7.6）、P3 已完成（§7.7）、
-> P4 已完成（§7.8）、P5 已完成（§7.9）⇒ 下一片是 **P6 项目整理**（文档审计、TODO 台账、
-> 死代码/冗余候选、只读报告）；P7 本地模型 LFM3 与 P8 并行与预算可并行准备。
+> P4 已完成（§7.8）、P5 已完成（§7.9）、P6 已完成（§7.10）⇒ 下一片是 **P7 本地模型
+> LFM3**（角色默认绑定、工具调用能力探测、降级阶梯）；P8 并行与预算可并行准备。
 
 门禁顺序沿用项目规则：`dart analyze`（无新增）→ 受影响包全量 `dart test` →
 `tree_protocol` 访问控制 → 涉及 UI 才跑 `flutter`。
