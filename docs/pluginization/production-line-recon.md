@@ -963,3 +963,65 @@ Agent 侧（`tree.agent` 增量，不加新路由前缀）：
 - 文档契约门禁：`packages/tree_protocol/test/docs_contract_test.dart`
 - P0 文档规范化的通用口径与切片：[doc-normalization-recon.md](../doc-normalization-recon.md) §7/§8
 - 当前阶段与车道：[project-status.md](../project-status.md)
+
+---
+
+## 16. 语义纠偏：产线与 Agent 并列（2026-11-11 定稿）
+
+> 背景：P1~P8 落地时把产线做成了 Agent 的子功能——数据按 `<team_id>` 分目录、
+> 派发必须带调用方 `agent_id`、入口挂在左侧活动栏。这与 §2「与 Agent 同级并列」
+> 的原始语义冲突。本节定稿纠偏口径，按 3 个切片实施。
+
+### 16.1 定稿口径
+
+1. **产线是独立功能**，与 Agent 同级并列：创建时弹出与 Agent 创建同规格的配置页
+   （名称 / 工作空间 / 执行 Agent / 角色与模型 / 工具），使用时核心交互在**中栏工作台**
+   （任务队列 + 决策收件箱），不再塞在左侧窄栏。
+2. **数据全局存放**：`<data_root>/production_lines/production/<line_id>/`。产线不随
+   Agent / 团队归属漂移；`team_id` 在 REST / 站请求里降为**调用方身份**（可空），
+   不再决定数据目录，也不再因缺失而 fail-closed。
+3. **执行身份自报**：每条产线在 `line.yaml.executor` 写 `{agent_id, team_id}`；
+   打包 / 执行 / 专家都用它召员工（`agent.worker.run` 的 scope 带执行 Agent 及其团队），
+   与「谁点了一下派发」无关。
+
+### 16.2 `line.yaml` 增量
+
+```yaml
+executor:
+  agent_id: agt_...
+  team_id: ""        # 空 = 该 Agent 没有上级团队（单 Agent 即团队）
+```
+
+- 新建时允许留空（配置页还没选执行 Agent）；`PATCH` 支持浅合并；
+- 未知键 / 非对象一律 `invalid_arguments`，不静默存一份不生效的配置；
+- 派发时若 `executor.agent_id` 为空：回退调用方 `scope.agent_id`（兼容一个版本），
+  两者都空则 `executor_required`，不猜一个可能错的 Agent。
+
+### 16.3 存量迁移
+
+- 命令 `production.line.migrate`，REST `POST /api/production/migrate`
+  （body/query：`agent_id?`、`team_id?`、`dry_run?`）。
+- 扫描 `<data_root>/production_lines/*/` 下除 `production` / `.snapshots` / `_migrations`
+  以外的目录，把其中的 `line.yaml` 产线整体搬进全局作用域。
+- **幂等**：搬完后源目录不再有产线；重复调用 `migrated_count=0`。
+- **冲突拒绝**：目标已有同 id 产线时只记 `conflicts`，不覆盖、不合并。
+- **留快照**：真正搬迁前复制到 `production_lines/.snapshots/<时间戳>/<原作用域>/<line_id>/`；
+  台账写 `production_lines/_migrations/<时间戳>.json`。
+- **补执行身份**：`line.yaml.executor` 为空时用参数补齐；参数缺省时若旧目录名是
+  `agt_*`（历史上前端把 Agent 当团队用）则回退该 id，否则跳过并报 `executor_required`。
+
+### 16.4 实施切片
+
+| 切片 | 内容 | 状态 |
+| --- | --- | --- |
+| 1 | 后端：全局作用域、`line.yaml.executor`、迁移命令 / REST、派发与员工身份去调用方化 | 已完成（插件 `0.8.0`） |
+| 2 | 创建配置页：与 Agent 创建同规格；产线入口不再作为 Agent 子项；迁移入口 | 待开始 |
+| 3 | 中栏工作台：任务队列 / 决策收件箱 / 产物与台账窗口；左侧只留产线列表 | 待开始 |
+
+### 16.5 兼容与风险
+
+- 旧产线缺 `executor` 时回退调用方 agent **一个版本**；切片 3 完成后移除回退。
+- 迁移是**移动**不是复制：快照只用于回滚，长期保留由 `.snapshots` 清理策略决定。
+- UI 的 `team_id` 查询参数保留但不再影响归属；切片 2/3 一并清掉多余的 team 传参。
+- 全局作用域下多窗口共用同一批产线；并发写的单写者仍是插件进程（`store` 原子写 + 任务级状态机），
+  与 §9.6 的 `max_parallel_tasks` / 写域判据一致。
