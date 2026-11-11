@@ -1,6 +1,6 @@
 // 本地 zip 插件安装（`POST /api/plugin/install/local`）的用例。
 //
-// 锁住的口径（handover §7.4 P0「本地 zip 安装」/ D-1 / known-issues #38）：
+// 锁住的口径（L-10 / D-1 / known-issues #38）：
 // 1. 装的是**目录形态** `plugins/<id>/`（UI 插件带 `data/`、多个 dll，扁平放不下）；
 // 2. `plugin.json` 是唯一的合同：缺它 / 缺 id / command 不在包内都当场拒，
 //    且**一个文件都不落**；

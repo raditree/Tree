@@ -567,7 +567,7 @@ void main(List<String> args) {
         // 片 C：核心 → 归属插件的 REST 委派。params 就是 §5.2 信封。
         final Map<String, dynamic> envelope = params;
         if (apiDelegateMode == 'timeout') {
-          // 不回包：核心侧按 apiDelegateTimeout 映射 504，进程本身保持运行。
+          // 不回包：核心侧按心跳判活（连续 N 拍无证据）映射 504，进程本身保持运行。
           await Future<void>.delayed(const Duration(seconds: 5));
           return;
         }

@@ -72,7 +72,8 @@ void main() {
 
   Future<({CoreServer server, _Client client, PluginBus bus})> serve(
     List<({String id, List<String> args})> plugins, {
-    Duration delegateTimeout = const Duration(milliseconds: 250),
+    Duration heartbeatInterval = const Duration(seconds: 30),
+    int missThreshold = 3,
   }) async {
     writeYaml(yamlFor(plugins));
     final MemoryStore store = MemoryStore();
@@ -89,8 +90,8 @@ void main() {
     final PluginBus bus = PluginBus(
       configFile: p.join(temp.path, 'config', 'plugins.yaml'),
       coreVersion: 'test',
-      heartbeatInterval: const Duration(seconds: 30),
-      apiDelegateTimeout: delegateTimeout,
+      heartbeatInterval: heartbeatInterval,
+      missThreshold: missThreshold,
     );
     await bus.start();
     final CoreServer server = await CoreServer.start(
@@ -292,7 +293,7 @@ void main() {
     expect(ctx.server.delegatedRouter.routeCount, 0);
   });
 
-  test('超时 ⇒ 504 且 reason 可读', () async {
+  test('心跳丢失 ⇒ 504 且 reason 可读（不是墙钟超时）', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx = await serve(
       <({String id, List<String> args})>[
         (
@@ -302,9 +303,12 @@ void main() {
             'POST:$gitStatus',
             '--api-delegate-mode',
             'timeout',
+            '--ignore-ping',
           ],
         ),
       ],
+      heartbeatInterval: const Duration(milliseconds: 100),
+      missThreshold: 2,
     );
     addTearDown(() async {
       ctx.client.close();
@@ -315,7 +319,7 @@ void main() {
       '/api/files/ag1/git-status',
     );
     expect(timeout.status, 504);
-    expect((timeout.json['reason'] ?? '').toString(), contains('超时'));
+    expect((timeout.json['reason'] ?? '').toString(), contains('心跳'));
   });
 
   test('回包非法 ⇒ 502 且 reason 可读', () async {
@@ -580,8 +584,9 @@ void main() {
           ],
         ),
       ],
-      // 假插件要先落 100MiB 再回包，默认 250ms 一定判超时。
-      delegateTimeout: const Duration(minutes: 2),
+      // 100MiB 落盘期间只要插件还回 ping，就不该因为时长被判失败；
+      // 这里把判活窗口放大，避免 CI 慢盘影响用例。
+      missThreshold: 20,
     );
     addTearDown(() async {
       ctx.client.close();

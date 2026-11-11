@@ -93,7 +93,6 @@ class PluginBus {
     this.toolTableRefreshHook,
     this.restartBufferMaxPerPlugin = 32,
     this.restartBufferMaxTotalBytes = 1 << 20,
-    this.apiDelegateTimeout = const Duration(seconds: 30),
   }) : restartBuffer = PluginRestartBuffer(
          maxPerPlugin: restartBufferMaxPerPlugin,
          maxTotalBytes: restartBufferMaxTotalBytes,
@@ -167,12 +166,6 @@ class PluginBus {
 
   /// 心跳间隔 I（默认 10s；看门狗节拍与单拍窗口都用它）。
   final Duration heartbeatInterval;
-
-  /// `api/delegate` 的回包截止时间（默认 30s；测试可缩短）。
-  ///
-  /// 这不是"杀插件"的墙钟：到点只把**本次请求**以 504 失败，插件进程照常运行；
-  /// 与心跳判活（[missThreshold]）是两条独立的口径。
-  final Duration apiDelegateTimeout;
 
   /// 片 C：委派路由归属表（核心接线时注入；未注入时仍可收集，只是不生效）。
   DelegatedRouter? delegatedRouter;
@@ -5390,24 +5383,25 @@ class PluginBus {
   ///
   /// 失败一律转成 [PluginDelegateException]（带可读 reason），由 HTTP 层映射：
   /// - 归属插件未安装 / 已停用 / 当前不可用 ⇒ 503；
-  /// - 到 [apiDelegateTimeout] 仍未回包 ⇒ 504；
+  /// - 在途连续 [missThreshold] 拍没有心跳（`ping` 无响应 / 通道无回包）⇒ 504；
   /// - 插件回 JSON-RPC 错误 / 通道异常 ⇒ 502（调用方还应校验回包 schema）。
+  ///
+  /// **不设墙钟死线**：扫描这类长任务只要插件还在回 `ping`，就应当一直等；
+  /// 失败判据是「心跳证据丢失」，不是「过了多少秒」（与 M9 §1.1 同一口径）。
   Future<Map<String, dynamic>> requestApiDelegate(
     String pluginId,
     Map<String, dynamic> envelope,
   ) async {
     final PluginHost host = requireApiDelegateHost(pluginId);
     try {
-      return await host.requestMethod(
-        PluginRpcMethods.apiDelegate,
-        envelope,
-        timeout: apiDelegateTimeout,
+      return await host.liveness.guard(
+        () => host.requestMethod(PluginRpcMethods.apiDelegate, envelope),
       );
-    } on PluginRequestTimeout catch (error) {
+    } on LivenessLostException catch (error) {
       throw PluginDelegateException(
         504,
-        '归属插件 $pluginId 在 ${apiDelegateTimeout.inMilliseconds}ms 内没有回包'
-        '（api/delegate 超时）：$error',
+        '归属插件 $pluginId 心跳丢失（连续 ${host.liveness.missedCount} 拍未达），'
+        '本次委派不再等待：$error',
         pluginId: pluginId,
       );
     } on PluginException catch (error) {
