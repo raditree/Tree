@@ -421,7 +421,7 @@ pubspec.yaml    → plugins/tree.ui.default/pubspec.yaml（改：零 path 依赖
 | `CONTRIBUTING.md` | 门禁顺序与工作目录；「UI 改动在插件仓」 |
 | `docs/development.md` | 构建链一节（`package_windows` 现在从哪读 UI） |
 | `docs/pluginization/ui-pluginization_detailed.md` | §4「代码改造清单（本仓）」改为「插件仓」；§1 交付物表 |
-| `docs/handover.md` | 仓布局与 CI 口径 |
+| `docs/plugin-platform.md` | 仓布局与 CI 口径 |
 | `CHANGELOG.md` | 迁移条目（用户可见：安装位置与升级路径不变） |
 | 本文件 | S6 完成后把「状态」改为已实施，并补实测结论 |
 

@@ -28,10 +28,10 @@
 | **A UI 移仓** | MIG-UI-7 清理与真机验收（S6） | 进行中 | 车道 D 发版 | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | **B 核心收窄** | — | 空闲（S7 已完成） | 待新任务（S9 归车道 C） | 同上 §2.5 |
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
-| **D 发版** | REL-1.0.6 push/tag/资产 | 已出包（待 push / tag / 上传） | 覆盖安装验证 | [handover.md](handover.md) §6 |
+| **D 发版** | REL-1.0.7 | 已完成（桌面 `v1.0.7+1` / 插件 `v1.0.6`，GitHub + Gitee 资产已传） | 覆盖安装验证 | [work-log.md](work-log.md)（2026-11-10 REL-1.0.7） |
 | **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | H-SEM 语义纠偏（与 Agent 并列，3 个切片） | 进行中（切片 1 已完成：插件 `0.8.0` 全局作用域 + `line.executor` + 迁移；切片 2/3 待开始） | 切片 2：创建配置页；切片 3：中栏工作台 | [production-line-recon.md](pluginization/production-line-recon.md) §16 |
+| **H 标准开发流生产线** | H-SEM 语义纠偏（与 Agent 并列，3 个切片） | 已完成（插件 `0.8.0` 全局作用域 + `line.executor` + 迁移；UI `1.0.8` 创建配置页 + 中栏工作台） | 真机验收产线工作台 | [production-line-recon.md](pluginization/production-line-recon.md) §16 |
 | **I 存储插件 tree.storage** | — | 已完成（ST-1~ST-6；docnorm 已接入） | 待新任务 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；embedding 已被 DN-9 消费） | 待新任务（JEV 待产线主控） | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |

@@ -1,12 +1,12 @@
 # 桌面仓门禁（L-21 / D-9）。
 #
-# 与 docs/handover.md §5.2 同顺序：静态检查 → 包内全量测试 → 契约门禁 →
+# 与 docs/plugin-platform.md §4 同顺序：静态检查 → 包内全量测试 → 契约门禁 →
 # 插件仓零核心依赖检查 → UI（analyze + test）。
 #
 # 两条刻意固定：
 # 1. 一律 `windows-latest`：本产品只发 Windows，门禁必须在真目标平台上跑
 #    （路径守卫 / 进程 / 编码类行为在 Linux runner 上不可信）；
-# 2. SDK 用维护版本（Dart 3.13.4 / Flutter 3.47.5，见 handover §5.1）：
+# 2. SDK 用维护版本（Dart 3.13.4 / Flutter 3.47.5，见 development.md）：
 #    版本落后时 `dart pub get` 会因 `sdk: ^3.13.0` 直接失败，这是有意的红灯。
 #
 # `plugins/` 是独立仓（本仓 .gitignore 掉了），插件门禁在这里显式检出
@@ -114,7 +114,7 @@ jobs:
           channel: stable
           cache: true
       - run: flutter pub get
-      # 先只守 lib：test/ 里还有 7 条既有 info（thinking_window_test.dart，见
-      # handover §4.3），清掉之前把 `test` 纳入这里只会让流水线常年红灯。
+      # 先只守 lib：test/ 既有 info 已于 2026-11-11 清零（插件仓 31940f8/086acde），
+      # 但流水线保持只守 lib，避免测试文件的风格波动挡住功能门禁。
       - run: flutter analyze lib
       - run: flutter test
