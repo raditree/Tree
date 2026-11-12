@@ -1,6 +1,8 @@
 # 产线主控完整决策循环（D6-O）交付计划
 
-> 状态：**计划（本期只落文档，不动代码；实施由用户启动）**。
+> 状态：**已实施（O1~O5 落码并过门禁；O6 真模型端到端联调待做）**。
+> 实施结果见 [work-log.md](../work-log.md)（2026-11-12「D6-O 主控决策循环落地」）：
+> 插件 `tree.production.line 0.9.0`（单测 156 / 自检 117）、UI 工作台主控条（UI 单测 20）。
 > 上游拍板：D6「`orchestrator` 保留并接线——先接模型/工具配置 + 准备阶段消费，
 > 完整的『继续/重试/询问/停止』决策循环单列切片」（见
 > [production-line-stability-recon.md](production-line-stability-recon.md) §5）。

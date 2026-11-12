@@ -133,6 +133,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 | 工具描述 / 参数 schema（模型读的"工具用法"） | tool/ 各文件的 `ToolSpec`：`builtin_tools.dart` / `message_tool.dart` / `team_tool.dart` / `spec_tool.dart` / `mcp_tool.dart` / `plugin_tool.dart` | 每轮重新下发的工具表（**不进前缀缓存**）；MCP / 插件工具的描述由服务与插件自带 |
 | 每次工具结果前拼的会话状态（`sessionStatusText`） | tool/status_text.dart | todo 三态 + 已选 Spec 三态 |
 | 压缩摘要提示词 | llm/llm_summarizer.dart | 压缩时的一次总结调用（不带工具、复用模型输出长度） |
+| 产线主控决策提示词（`orchestratorSystemPrompt` / `orchestratorUserPrompt`） | plugins/tree.production.line/lib/src/orchestrator.dart | 执行期每次 tick 由插件经 `llm.call` 直发（不落 `.self`、不进核心前缀缓存）：角色 / 事实 / 边界 / 输出契约 + 有界快照 JSON 与上一条决策 |
 
 两条配套规则：
 
