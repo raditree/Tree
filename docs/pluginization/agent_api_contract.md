@@ -190,25 +190,54 @@
 
 ### 14) GET /api/models
 - 请求：`GET /api/models`
-- 200 响应：`{"models":[{"model_id":"deepseek-chat","name":"DeepSeek Chat","kind":"chat","protocol":"openai","dimensions":null,"max_input_tokens":null,"confidence_threshold":null,"base_url":"https://api.deepseek.com","has_api_key":true,"thinking":false,"if_vision":false,"reasoning_effort":"high","reasoning_effort_options":["low","high","max"],"max_seqlen":64000,"max_output_tokens":8192,"token_scale":2.0,"longest_session_tokens":0}]}`
+- 200 响应：`{"models":[{"provider":"deepseek","key":"deepseek/deepseek-chat","model_id":"deepseek-chat","name":"DeepSeek Chat","kind":"chat","protocol":"openai","dimensions":null,"max_input_tokens":null,"confidence_threshold":null,"base_url":"https://api.deepseek.com","has_api_key":true,"thinking":false,"if_vision":false,"reasoning_effort":"high","reasoning_effort_options":["low","high","max"],"max_seqlen":64000,"max_output_tokens":8192,"token_scale":2.0,"longest_session_tokens":0}]}`
+- D7 新增 `provider` / `key`：模型身份是 `provider/model_id`；旧文件（无 `provider` 键）读作 `legacy`（`key = legacy/<model_id>`），绑定与文件都不变。
 - 缓存存在时每条额外带只读 `meta`（P8；`pricing` / `reasoning_effort_options` / `context_length` / `error` 等，未探测不出现该键）
 - 空模型池：`{"models":[]}`；响应中**永远没有 api_key**
 
 ### 15) POST /api/models
-- 请求：`POST /api/models`，body `{"model_id":"deepseek-chat","name":"DeepSeek Chat","base_url":"https://api.deepseek.com","api_key":"sk-<secret>","thinking":false,"if_vision":false,"reasoning_effort":"high","reasoning_effort_options":["low","high","max"],"max_seqlen":64000,"max_output_tokens":8192}`
-- 200 响应：`{"success":true,"model":{"model_id":"deepseek-chat","name":"DeepSeek Chat","base_url":"https://api.deepseek.com","thinking":false,"if_vision":false,"reasoning_effort":"high","reasoning_effort_options":["low","high","max"],"max_seqlen":64000,"max_output_tokens":8192,"token_scale":2.0,"longest_session_tokens":0}}`
-- 失败：`400 {"detail":"api_key 不能为空"}` · `409 {"detail":"模型已存在：deepseek-chat"}`
+- 请求：`POST /api/models`，body `{"provider":"deepseek","model_id":"deepseek-chat","name":"DeepSeek Chat"}`（归到 provider 下时 **不需要** 再填 `base_url` / `api_key`）
+- 裸模型（无 provider）仍然必填 `base_url` / `api_key`，与核心旧口径一致。
+- 200 响应：`{"success":true,"model":{"provider":"deepseek","key":"deepseek/deepseek-chat","model_id":"deepseek-chat",...}}`
+- 失败：`400 {"detail":"api_key 不能为空"}` · `400 {"detail":"provider 不存在：deepseek"}` · `409 {"detail":"模型已存在：deepseek/deepseek-chat"}`
+- 显示名**不做唯一校验**（STAB-PL-8）：唯一键只有 `provider/model_id`。
 
 ### 16) PATCH /api/models/{modelId}
-- 请求：`PATCH /api/models/deepseek-chat`，body `{"name":"DS","base_url":"","api_key":"","reasoning_effort_options":["low","high"],"max_output_tokens":4096}`（`base_url`/`api_key` 空串 = 保留原值）
-- 200 响应：`{"success":true,"model":{"model_id":"deepseek-chat","name":"DS","base_url":"https://api.deepseek.com","thinking":false,"if_vision":false,"reasoning_effort":"high","reasoning_effort_options":["low","high"],"max_seqlen":64000,"max_output_tokens":4096,"token_scale":2.0,"longest_session_tokens":0}}`
-- 失败：`404 {"detail":"模型不存在"}` · `500（max_seqlen 传字符串 ⇒ as num? 抛 TypeError）`
+- 请求：`PATCH /api/models/deepseek%2Fdeepseek-chat`（`{modelId}` 用 URL 编码的完整键；裸 `model_id` 仍可解析）body `{"name":"DS","base_url":"","api_key":"","reasoning_effort_options":["low","high"],"max_output_tokens":4096}`（`base_url`/`api_key` 空串 = 保留原值）
+- `provider` / `model_id` 创建后不可改（400）。
+- 200 响应：`{"success":true,"model":{"provider":"deepseek","key":"deepseek/deepseek-chat",...}}`
+- 失败：`404 {"detail":"模型不存在"}` · `409 {"detail":"模型绑定有歧义，请重新选择（候选：a/m1 / legacy/m1）","candidates":["a/m1","legacy/m1"]}`（裸 id 命中多个 provider）
 
 ### 17) DELETE /api/models/{modelId}
-- 请求：`DELETE /api/models/deepseek-chat`（无 query / body）
+- 请求：`DELETE /api/models/deepseek%2Fdeepseek-chat`（无 query / body）
 - 200 响应：`{"success":true,"bound_agents":["agt_1","agt_2"]}`
 - 无人绑定：`{"success":true,"bound_agents":[]}`
-- 失败：`404 {"detail":"模型不存在"}`
+- 失败：`404 {"detail":"模型不存在"}` · `409` 歧义体同上
+
+### 18) GET /api/providers（D7）
+- 请求：`GET /api/providers`
+- 200 响应：`{"providers":[{"id":"deepseek","name":"DeepSeek 官方","base_url":"https://api.deepseek.com","has_api_key":true,"api_key_env":"DEEPSEEK_API_KEY","protocol":"openai","enabled":true,"created_at":"...","updated_at":"...","model_count":3,"cached_model_count":42,"fetched_at":"...","error":""}]}`
+- 配置文件：`config/providers/<id>.yaml`（`id` / `name` / `base_url` / `api_key` / `api_key_env` / `protocol` / `enabled`）；`base_url` 回显脱敏，`api_key` 永不出插件。
+
+### 19) POST /api/providers（D7）
+- 请求：body `{"name":"DeepSeek 官方","base_url":"https://api.deepseek.com/v1","api_key":"sk-<secret>","api_key_env":"DEEPSEEK_API_KEY"}`
+- `id` 缺省按显示名 slug 生成（`deepseek`），冲突自动加 `-2`；`api_key_env` 非空时请求优先读环境变量。
+- 新增成功即 `GET {base_url}/models` 拉取并写缓存（失败只记 `error`，**不阻断保存**）。
+- 200 响应：`{"success":true,"provider":{...},"cache":{"provider_id":"deepseek","fetched_at":"...","error":"","models":[{"model_id":"deepseek-v4.1-flash","name":"DeepSeek V4.1 Flash","kind":"chat","context_length":131072,"max_output_tokens":8192,"input_modalities":["text","image"],"output_modalities":["text"],"reasoning_effort_options":["low","high"],"pricing":{...}}]}}`
+- 失败：`400 {"detail":"base_url 不能为空"}` / `"base_url 必须是 http(s) 地址"` / `"api_key_env 不是合法的环境变量名：..."`
+
+### 20) GET / PATCH / DELETE /api/providers/{providerId}
+- `GET`：`{"provider":{...},"cache":{...}|null}`
+- `PATCH`：body 同新增；`base_url` / `api_key` 空串 = 保留原值，`api_key_env` 显式空串 = 清空。
+- `DELETE`：有模型绑定时 `409 {"detail":"provider 下还有 1 个模型，请先删除或转移","bound_models":["deepseek/deepseek-chat"]}`；成功同时删除目录缓存。
+- 未知 id：`404 {"detail":"provider 不存在"}`
+
+### 21) POST /api/providers/{providerId}/refresh（D7）
+- 重新拉取 `/models` 并写 `config/provider_models/<id>.json`。
+- 200：`{"success":true,"cache":{...}}`；失败（端点不可达 / 无密钥）：`{"success":false,"error":"...","cache":{"...","models":<上一次成功条目>}}`
+
+### 22) GET /api/providers/{providerId}/models（D7）
+- 返回缓存：`{"provider_id":"deepseek","fetched_at":"...","error":"","models":[...]}`；没有缓存时 `models` 为空。
 
 ## 附：自检与不确定项
 

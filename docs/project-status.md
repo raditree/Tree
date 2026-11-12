@@ -3,8 +3,8 @@
 > 只回答三件事：**现在什么阶段**、**几条车道在跑**、**每条车道下一步做什么**。
 > 过去式 → [work-log.md](work-log.md)；文档索引 → [README.md](README.md)。
 
-**当前：大版本迭代**（核心微内核化 + UI 源码移仓）｜ 版本线 `1.0.6+1`
-**出口**：S1–S6 完成 + 核心面 35 条 + 真机安装/升级验收通过 → 稳定性迭代 → 发版窗口
+**当前：稳定性迭代**（只修缺陷、补测试；产线与模型池 9 项问题先侦查后修）｜ 版本线 `1.0.7+1`
+**出口**：P0/P1 清零 + 全量测试 / E2E / 真机清单通过 → 发版窗口（新能力一律不入本期）
 
 ---
 
@@ -29,9 +29,9 @@
 | **B 核心收窄** | — | 空闲（S7 已完成） | 待新任务（S9 归车道 C） | 同上 §2.5 |
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
 | **D 发版** | REL-1.0.7 | 已完成（桌面 `v1.0.7+1` / 插件 `v1.0.6`，GitHub + Gitee 资产已传） | 覆盖安装验证 | [work-log.md](work-log.md)（2026-11-10 REL-1.0.7） |
-| **E 稳定性** | — | 空闲（缺陷可插队） | 随时接 known-issues | [known-issues.md](known-issues.md) |
+| **E 稳定性** | STAB-PL-1~9 产线与模型池问题侦查 + 落地（D1~D7 全部完成，含 D7-5 数据副本回归） | 进行中 | 真机验收产线文件窗 / 角色配置 | [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | H-SEM 语义纠偏（与 Agent 并列，3 个切片） | 已完成（插件 `0.8.0` 全局作用域 + `line.executor` + 迁移；UI `1.0.8` 创建配置页 + 中栏工作台） | 真机验收产线工作台 | [production-line-recon.md](pluginization/production-line-recon.md) §16 |
+| **H 标准开发流生产线** | H-SEM 语义纠偏（与 Agent 并列，3 个切片） | 已完成（插件 `0.8.0` 全局作用域 + `line.executor` + 迁移；UI `1.0.8` 创建配置页 + 中栏工作台） | 主控决策循环（D6-O，O1~O6） | [production-line-orchestrator-loop-plan.md](pluginization/production-line-orchestrator-loop-plan.md) |
 | **I 存储插件 tree.storage** | — | 已完成（ST-1~ST-6；docnorm 已接入） | 待新任务 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；embedding 已被 DN-9 消费） | 待新任务（JEV 待产线主控） | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
@@ -61,4 +61,5 @@ P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalizat
 
 | 日期 | 变更 | 依据 |
 | --- | --- | --- |
+| 2026-11-12 | **大版本迭代 → 稳定性迭代**；车道 E 接产线与模型池 9 项问题，先出侦查文档 | 用户 2026-11-12 拍板：本期只侦察、只修缺陷；证据见 [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | 2026-11-08 | 建立本文件；判定为**大版本迭代** | 跨仓/契约/路由收窄同时进行 |
