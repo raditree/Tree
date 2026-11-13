@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:tree_local_exec/tree_local_exec.dart';
+
 import 'plugin_host.dart' show PluginConfig, PluginException;
 
 /// UI 插件的进程宿主（片 D）。
@@ -65,6 +67,7 @@ class UiHost {
     String dataRoot = '',
     void Function(String line)? onStdoutLine,
     void Function(String line)? onStderrLine,
+    void Function(String message)? log,
   }) async {
     if (config.command.trim().isEmpty) {
       throw PluginException('插件 ${config.id} 未配置 command');
@@ -81,6 +84,9 @@ class UiHost {
         config.command,
         config.args,
         environment: <String, String>{
+          // 与 [PluginHost] 同口径：先把按登录口径重建的环境交给界面进程
+          // （界面里起的子进程 / 打开的终端才不会丢用户 PATH），再叠配置与核心端点。
+          ...await cachedLoginEnvironment(log: log),
           ...config.env,
           'TREE_CORE_URL': coreUrl,
           'TREE_CORE_TOKEN': coreToken,

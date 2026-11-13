@@ -37,23 +37,40 @@ typedef StationTopologyQuery = Future<Map<String, dynamic>> Function({
   String sourcePluginId,
 });
 
+/// `env.*` 族的**统一入口**：由 `EnvironmentCommands` 实现。
+///
+/// 环境是**整机一份**（不是 team 的、也不是某个 agent 工作空间的），所以这族没有
+/// team 闸门；挂载位置层只做命令白名单复核与分派，具体的「读缓存 / 重读注册表」
+/// 由实现方负责（没接线时以「未接线」显式失败，不做静默降级）。
+typedef StationEnvironmentQuery = Future<Map<String, dynamic>> Function({
+  required String command,
+  Map<String, dynamic>? arguments,
+  String sourcePluginId,
+});
+
 /// 执行站命令的挂载位置集中，**只挂平台面命令**。
 ///
 /// A5（2026-10-25）起核心不再实现任何领域执行语义：`fs.*` / `terminal.*` /
 /// `agent.*` / `llm.call` / `tool.*` / `session.rename` / `ssh.reconnect` /
 /// `usage.query` 由 `local_executor` / `ssh_executor` / `tree.agent` 等插件在
-/// 自己的执行站上自建；核心留下的只有两族**平台面**命令：
+/// 自己的执行站上自建；核心留下的只有三族**平台面**命令：
 ///
 /// - `plugin.*`：插件热重启控制面 + 执行器挂载 + 工具/快照转发；
-/// - `station.*`：站点拓扑只读查询。
+/// - `station.*`：站点拓扑只读查询；
+/// - `env.*`：整机环境变量（读缓存 / 主动重读注册表）。
 ///
 /// **[implementedPrefixes] 是"核心到底实现到哪一族"的唯一出处**：点位表里出现了
-/// 这两个前缀之外的命令，就是 #43 那个形状（路由得到、执行必失败），
+/// 这三个前缀之外的命令，就是 #43 那个形状（路由得到、执行必失败），
 /// `station_points_test.dart` 的门禁会因此失败。
 ///
 /// 依赖没接线时**不做静默降级**：命令以「未接线」的可读原因失败。
 class ExecuteStationMounts {
-  ExecuteStationMounts({this.pluginManager, this.topologyQuery, this.log});
+  ExecuteStationMounts({
+    this.pluginManager,
+    this.topologyQuery,
+    this.environmentQuery,
+    this.log,
+  });
 
   /// 挂载位置 id 前缀（每个命令一个 id：`core.execute.plugin.list` …）。
   static const String mountIdPrefix = 'core.execute';
@@ -64,14 +81,19 @@ class ExecuteStationMounts {
   /// `station.*` 族（站点拓扑，只读）入口；null = 这些命令显式报「未接线」。
   final StationTopologyQuery? topologyQuery;
 
+  /// `env.*` 族（整机环境变量）入口；null = 这些命令显式报「未接线」。
+  final StationEnvironmentQuery? environmentQuery;
+
   final void Function(String message)? log;
 
   /// 本层实现了哪些命令前缀（= 核心仍然自己执行的族）。
   static const String pluginPrefix = 'plugin.';
   static const String stationPrefix = 'station.';
+  static const String envPrefix = 'env.';
   static const List<String> implementedPrefixes = <String>[
     pluginPrefix,
     stationPrefix,
+    envPrefix,
   ];
 
   /// 这条命令本层有没有实现（点位表与门禁都读它，不再各处另数一遍前缀）。
@@ -124,6 +146,15 @@ class ExecuteStationMounts {
     if (command.startsWith(stationPrefix)) {
       try {
         return await _stationCommand(context, command);
+      } catch (error) {
+        return StationCommandOutcome.failed('命令 $command 执行异常：$error');
+      }
+    }
+    // `env.*` 是整机级能力：没有 team / agent 归属可证明，闸门只有命令白名单
+    // （见 [_envCommand]）。
+    if (command.startsWith(envPrefix)) {
+      try {
+        return await _envCommand(context, command);
       } catch (error) {
         return StationCommandOutcome.failed('命令 $command 执行异常：$error');
       }
@@ -251,6 +282,30 @@ class ExecuteStationMounts {
     final Map<String, dynamic> result = await query(
       command: command,
       teamId: teamId,
+      arguments: context.arguments,
+      sourcePluginId: context.sourcePluginId,
+    );
+    return _outcomeOf(result, command);
+  }
+
+  /// `env.*` 族的分派（整机环境变量）。
+  ///
+  /// **没有 team 闸门**（与另两族刻意不同）：环境是整机一份，team 在这里没有对应
+  /// 的资源可归属；要求一个 team_id 只会把「证明不了」变成假门槛，而真正的风险面
+  /// （插件进程本来就能读 core 的环境）并不会因此收窄。
+  Future<StationCommandOutcome> _envCommand(
+    StationCommandContext context,
+    String command,
+  ) async {
+    final StationEnvironmentQuery? query = environmentQuery;
+    if (query == null) {
+      return StationCommandOutcome.failed(
+        '命令 $command 尚无挂载实现（核心未给执行站注入环境读口：未接线，'
+        '不假装已经读过）',
+      );
+    }
+    final Map<String, dynamic> result = await query(
+      command: command,
       arguments: context.arguments,
       sourcePluginId: context.sourcePluginId,
     );

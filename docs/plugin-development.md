@@ -105,7 +105,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `station/command` | 请求 | `{command, arguments, team_id?, agent_id?, session_id?, mode_key?}` | `{command, ok, mount_id, payload, error}` |
 | `station/subscribe` | 请求 | `{station, point?, scope?, replace?, station_id?}` | `{ok, station_id, station_ids, kind, scope, replaced, error, subscriptions}` |
 | `station/unsubscribe` | 请求 | 同上（`station` / `point` / `station_id`） | `{ok, station_id, station_ids, kind, removed, error}` |
-| `station/register` | 请求 | `{kind, name, readme, description?, schema?, commands?, max_subscriptions?, shared?, allowed_plugins?, config?}`（**`readme` 必填；`execute` 必须带非空 `commands`**，见 §3.3） | `{ok, station_id, kind, error}` |
+| `station/register` | 请求 | `{kind, name, readme, description?, schema?, commands?, max_subscriptions?, shared?, allowed_plugins?, config?}`（**`readme` 必填；`execute` 必须带非空 `commands`**；同名重注册会刷新 `commands`，见 §3.3） | `{ok, station_id, kind, error}` |
 | `station/unregister` | 请求 | `{station_id}` | `{ok, removed, error}` |
 | `station/trigger` | 请求 | `{station_id, topic?, scope?, payload?, meta?}`（**必须带确定的 `mode_key`**，见 §3.3） | `{ok, station_id, kind, result, error}`；`result` 含 `summary` / `delivered` / `skipped` / `deliveries[]` |
 | `station/stream` | **通知** | `{request_id, delta?}` / `{request_id, done:true, …}` / `{request_id, error:{…}}` | 不等应答（见 §5.4） |
@@ -134,17 +134,18 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | 中转站 relay | 拦截-回填：核心把数据交给你，你决定改不改 | 订阅；**每个点位唯一订阅者** |
 | 收集站 collect | 一对多收集 + 汇聚，不回填原数据流 | 由核心按接入点代订阅（工具定义） |
 
-### 3.1 全部内置点位（28 个 id：广播 10 + 执行 2 + 中转 12 + 收集 4）
+### 3.1 全部内置点位（29 个 id：广播 10 + 执行 3 + 中转 12 + 收集 4）
 
-> **执行站只剩两族**（2026-10-31，known-issues #43）：`fs` / `terminal` / `agent` /
-> `llm` / `tool` / `session` / `ssh` / `usage` 八族从内置点位表里**整体删除**了。A5
-> 撤掉核心的领域实现之后，那 20 条命令在核心里只剩「路由得到、执行必失败」，而内置名
-> 拦截又让真正的实现方认领不了它们；删表就是把族名让给插件（`local_executor` /
-> `ssh_executor` / `tree.agent`）。**命令名仍然可以下**——只要有一个插件把这一族申报成
-> 自己的自建执行站（`station/register` + `commands`），核心就把命令原样转过去。
-> 命名与回包口径见 [exec_station_contract.md](exec_station_contract.md) §8。
-> 核心自己仍然执行的两族是下面表里的 `system.execute.plugin` 与
-> `system.execute.station`，插件不得占用 `plugin.` / `station.` 前缀。
+> **执行站只剩核心自己执行的三族**（2026-10-31，known-issues #43；2026-11-13 加环境族）：
+> `fs` / `terminal` / `agent` / `llm` / `tool` / `session` / `ssh` / `usage` 八族从内置
+> 点位表里**整体删除**了。A5 撤掉核心的领域实现之后，那 20 条命令在核心里只剩「路由
+> 得到、执行必失败」，而内置名拦截又让真正的实现方认领不了它们；删表就是把族名让给
+> 插件（`local_executor` / `ssh_executor` / `tree.agent`）。**命令名仍然可以下**——只要有
+> 一个插件把这一族申报成自己的自建执行站（`station/register` + `commands`），核心就把
+> 命令原样转过去。命名与回包口径见 [exec_station_contract.md](exec_station_contract.md) §8。
+> 核心自己仍然执行的三族是下面表里的 `system.execute.plugin` /
+> `system.execute.station` / `system.execute.env`，插件不得占用 `plugin.` / `station.` /
+> `env.` 前缀。
 
 | 点位 id | 类型 | 触发时机 | 回填/产出 |
 |---|---|---|---|
@@ -162,6 +163,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `system.relay.loop.run` | 中转 | 每一轮开始处（上下文装配完、进入内置 LlmSession **之前**） | 回 `{stream:true}` ⇒ **整轮循环形状归你**（第几跳、工具怎么排、何时收尾）；文本/思考/提示/用量经 `station/stream` 推回，**工具走 `tool.call` 并回带 `run_id`**；落库、卡片、取消与判死仍在核心（别名 `loop.run`，详见 §5.6） |
 | `system.execute.plugin` | 执行 | — | `plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state` / `plugin.stateDump` / `plugin.stateFetch`（插件热重启的控制面，见 §6.5；模型能使唤的那一面见 §6.7；别名 `plugin`）。**后两条不得被申报成 agent tool**：它们是生命周期原语，只能由插件自己下 |
 | `system.execute.station` | 执行 | — | `station.list` / `station.state`（**只看不动**的拓扑：谁接管了哪个点位、自建站归谁。内置点位任何 team 都可见，插件自建站只对订阅者所在 team 可见；接管权易手仍只走 `station/subscribe`，这里不开第二条路；别名 `station`，见 §6.9） |
+| `system.execute.env` | 执行 | — | `env.get` / `env.refresh`（**整机环境变量**：核心启动后按登录口径重读一次，插件需要时再刷新。`env.get` 读当前环境（可带 `names` 过滤），`env.refresh` 重读注册表并回刷新前后差异（`include_env: true` 才带整份环境）；**不要求 team**——环境没有 team 归属可证明；别名 `env`，见 §6.1） |
 | `system.broadcast` | 广播 | 通用主题（自定 topic） | 通知 |
 | `system.broadcast.tool.pre` | 广播 | 工具调用前 | 通知 |
 | `system.broadcast.tool.post` | 广播 | 工具调用后 | 通知 |
@@ -246,7 +248,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | **`readme` 必填**（非空且不全空白） | 站是你建的，"它干什么、什么时候被触发、订阅者该怎么回"只有你说得清；共享给别人时，这份 readme 是对方唯一能读到的说明书 | `station/register 需要 readme（站点介绍，必填）：这个站干什么、什么时候被触发、订阅者该怎么回。内置站点的介绍来自核心的点位表。` |
 | `name` 里不能有点号 | 会与归属前缀判定撞车（插件 `a` 建 `b.relay.x` 能顶掉 `a.b` 的站） | 点名「只允许」的字符集 |
 | 收集站必须带非空 `schema` | 输入格式由站点定义，订阅者要按它产出 | `收集站必须定义 schema（输入格式：fields 非空），当前为空` |
-| **执行站必须带非空 `commands`**（≤32 条，命令名 `[A-Za-z][A-Za-z0-9_.-]*`，不得占用核心内置命令与 `plugin.` / `station.` 前缀，也不得被别的执行站占用） | 执行站的价值就是按命令名路由；空命令无法路由，重名会让下命令的人拿到别人的实现 | `自建执行站需要非空 commands 列表（插件能执行哪些命令）` / `命令 X 已被其它插件执行站占用` |
+| **执行站必须带非空 `commands`**（≤64 条，命令名 `[A-Za-z][A-Za-z0-9_.-]*`，不得占用核心内置命令、`plugin.` / `station.` / `env.` 保留前缀，也不得被别的执行站占用） | 执行站的价值就是按命令名路由；空命令无法路由，重名会让下命令的人拿到别人的实现 | `自建执行站需要非空 commands 列表（插件能执行哪些命令）` / `命令 X 已被其它插件执行站占用` |
 
 **执行站与可订阅站点不同**：`shared` / `allowed_plugins` 只作用于可订阅站点（广播 / 中转 / 收集）；
 执行站按命令名路由，不接受订阅或触发。要限制谁能下这些命令，由执行站在 `station/command`
@@ -257,6 +259,12 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 
 **同名重复注册 = 幂等**：返回既有站点、不报错、**也不覆盖**第一次写的 `readme`（插件重启
 会再注册一遍，所以这条校验排在幂等分支之后——这次没带介绍也不该把既有站拒掉）。
+
+**自建执行站的 `commands` 例外地会被刷新**：命令表只存在插件侧，核心的点位表里没有
+自建站，所以它**随站点一起落盘**（`stations.yaml` 的 `commands`），重启后按盘恢复；
+同名重注册时以**本次声明**为准刷新白名单并重新挂执行器（挂载是运行期态，重启必丢）。
+旧文件没有 `commands` 时恢复成空表，下一次重注册会自动补齐；老插件注册时不带
+`commands` 则保持原状（不把“没声明”当成“声明为空”）。
 
 共享出去的站怎么用（`shared` / `allowed_plugins` 这把闸门**订阅与触发共用**）：
 
@@ -614,7 +622,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 ### 6.1 命令清单
 
 > **两类命令要分开读**（2026-10-31，known-issues #43）：
-> - `plugin.*` / `station.*` —— **核心自己执行**的内置点位（§3.1 那两行）；
+> - `plugin.*` / `station.*` / `env.*` —— **核心自己执行**的内置点位（§3.1 那三行）；
 > - 其余（`fs.*` / `terminal.*` / `agent.*` / `llm.call` / `tool.*` / `session.*` /
 >   `ssh.*` / `usage.*`）—— **核心不再执行**。参数与回包形状仍然登记在这里，是因为
 >   那是各家执行器**共同的历史口径**（改形状等于改契约）；能不能下到，取决于有没有
@@ -649,6 +657,8 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `plugin.stateFetch` | `dump_id?`（只能是自己上一世的那个） | 有：`{ok, has_snapshot:true, dump_id, payload, bytes}`；没：`{ok, has_snapshot:false, reason}` | 取回**上一世**的快照（一份只喂一世） |
 | `station.list` | — | `{ok, team_id, count, stations:[{station_id, kind, kind_label, builtin, description, subscriber_count, subscribers, handled_by?, commands?, counts}]}` | **拓扑只看不动**：谁接管了哪个点位（中转点位看 `handled_by`）；列表是**投影**，不递 `readme`/公告板/`config`（需那些请对单一点位下 `station.state`，见 §6.9） |
 | `station.state` | `station_id` 或 `point`（订阅时那套别名，如 `llm.handle`） | `{ok, team_id, station:{…整份 describe}}` | 看一个站点的当前读数（**订得到就问得到**）；内置点位全可见，插件自建站只对订阅者所在 team 可见 |
+| `env.get` | `names?`（字符串数组；不传 = 整份） | `{ok, count, env:{…}}`；带 `names` 时另带 `missing:[…]`（没找到的名字，**不静默吞掉**） | 读核心**当前**环境（登录口径的缓存；没算过就先算一次）。键名保持环境里的写法（Windows 环境变量名大小写不敏感，查找也按这个口径） |
+| `env.refresh` | `include_env?`（默认 false） | `{ok, count, refreshed_at, baseline, changed, added, removed, env?}` | **主动重读**注册表并替换缓存；`changed/added/removed` 是刷新前后差异（按名字排好序），`baseline` = `cache`（有旧缓存）或 `process`（拿进程环境当基线）。默认不回整份环境，`include_env: true` 才带。**不要求 team**（整机级能力） |
 | `usage.query` | `session_id?`, `tail_bytes?`（≤ 2 MiB） | `{ok, agent_id, session_id, usage_file, count, skipped, calls:[{at,source,model,prompt_tokens,cached_tokens,completion_tokens,estimated,duration_ms}], summary:{calls,prompt_tokens,completion_tokens,cached_tokens,by_source}}` | 按会话取**逐调用用量账本**（计费/预算类插件的地基）；会话口径与其他命令一致（参数 → scope → 默认会话）且回包 **echo 生效值**；`estimated=true` 的行是本地估算，**不得当计费依据** |
 
 **失败回包也可能带 `payload`**（2026-10-05 新增，**纯增量**）：`ok:false` 只表示"这次命令
@@ -668,6 +678,8 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 - `plugins.yaml` 的 `scope.team_id` 是**上限**：声明了就只能服务该 team。**留空 = 所有 team**
   （命令按每条命令的 `agent_id` 解析真实归属）。
 - 解析不出归属（agent 不存在 / 没声明也没带 agent 且该 agent 无团队）⇒ 拒绝并给可读原因。
+- **例外：`env.*` 是整机级能力**，没有 agent / team 归属可证明，下命令只带 `command` 即可
+  （身份仍会随命令透传，但不参与闸门判定）。
 
 ### 6.3 工具：申报与执行
 
@@ -973,6 +985,29 @@ plugins:
   绝不改写 exe 的 PE 资源**；运行时窗口 / 托盘图标由 UI 插件自己负责。
 - **重校验**：每次应用品牌前都重新检查文件是否存在、可读；失效 ⇒ 移除该条并记一条可读
   日志、回退上一条或默认，**不静默保留旧图**。
+
+**身份可以晚到（协议 1.1 / `ui_contract: 1.1`）**：核心不再要求 `ui.hello` 是第一条业务帧。
+
+- 身份建立前到达的 `station/subscribe|unsubscribe|register|unregister|trigger` 进入
+  连接级挂起队列（默认 **64 条 / 10s**），`ui.hello` 成功后按到达顺序补放；
+- 到期仍未 hello ⇒ 队列内每条回 `station_ack(ok:false, code: identity_required)`，之后
+  该连接的站点请求立即拒绝；队列满 ⇒ 新请求回 `identity_queue_overflow`（不牵连已挂起项）；
+- 同一连接只允许一个 `plugin_id`：hello 与已绑定身份不符 ⇒ `identity_conflict` 并断开。
+
+**站点请求有回执（协议 1.1）**：每条上行站点请求**恰好**回一条
+`{"type":"station_ack","request":"subscribe","station_id":"…","ok":true}`；成功也回。
+失败带稳定 `code` 与可读 `message`：
+
+| code | 含义 | 可重试 |
+| --- | --- | --- |
+| `station_not_found` | 站点还不存在（插件未注册 / 未安装） | 是 |
+| `identity_required` / `identity_queue_overflow` | 身份未建立 / 挂起队列满 | 是 |
+| `not_broadcast` / `scope_invalid` / `not_owner` | 白名单 / scope / 归属不合法 | 否 |
+| `invalid_request` | 缺必填字段 | 否 |
+| `subscribe_rejected` / `broadcast_rejected` | 站点侧拒绝（上限、配置、scope 不可证明归属） | 视情况 |
+
+客户端按 `code` 决策重试（UI 默认 `1/2/4/8/16s` 退避，≤5 次），**不要**匹配 `message`。
+旧的通用 `error` 帧只承载协议级错误（`ui.hello` 被拒、未知上行帧等）。
 
 **UI 插件是纯消费者**：不承接 `api/delegate`，也不能订阅 relay / execute / collect 站点。
 所有功能性调用走 REST，唯一例外是 PTY 流式会话（走 WebSocket）。WS 上行只允许：

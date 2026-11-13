@@ -1150,6 +1150,7 @@ class PluginBus {
       // UI 插件的进程输出同样进日志 API（stdout 是开发期诊断，stderr 是错误）。
       onStdoutLine: (String line) => pluginLog?.call(config.id, line, 'stdout'),
       onStderrLine: (String line) => pluginLog?.call(config.id, line, 'stderr'),
+      log: log,
     );
   }
 
@@ -4105,11 +4106,66 @@ class PluginBus {
       };
     }
     final String stationId = selfBuiltStationId(config.id, kind, name);
-    // 幂等：同名重复注册拿到既有站点（插件重启后会再注册一遍）
+    // 幂等：同名重复注册拿到既有站点（插件重启后会再注册一遍）。
+    // **自建执行站不能只回旧实例**：命令白名单只存在插件侧，从 stations.yaml
+    // 恢复时拿不到点位表，挂载也会随进程重启丢失。这里用本次声明的 commands
+    // 补齐并重挂执行器，否则 `agent.worker.run` 之类命令会永远"未知命令"。
     final StationInstance? existing = stationId.isEmpty
         ? null
         : stations.station(stationId);
     if (existing != null) {
+      if (existing is ExecuteStation && !existing.builtin) {
+        final List<String> declared = _selfBuiltExecuteCommands(
+          params['commands'],
+        );
+        // 旧插件不带 commands：保持原状（不把"没声明"当成"声明为空"）。
+        if (declared.isNotEmpty) {
+          final String? commandError = _checkExecuteCommands(declared);
+          if (commandError != null) {
+            return <String, dynamic>{
+              'ok': false,
+              'station_id': existing.id,
+              'kind': kind.wire,
+              'error': commandError,
+            };
+          }
+          final String? takenError = _executeCommandTaken(
+            declared,
+            ignoreStationId: existing.id,
+          );
+          if (takenError != null) {
+            return <String, dynamic>{
+              'ok': false,
+              'station_id': existing.id,
+              'kind': kind.wire,
+              'error': takenError,
+            };
+          }
+          final String? replaceError = existing.replaceCommands(declared);
+          if (replaceError != null) {
+            return <String, dynamic>{
+              'ok': false,
+              'station_id': existing.id,
+              'kind': kind.wire,
+              'error': replaceError,
+            };
+          }
+          final String? mountError = _mountExecutor(config.id, existing);
+          if (mountError != null) {
+            return <String, dynamic>{
+              'ok': false,
+              'station_id': existing.id,
+              'kind': kind.wire,
+              'error': mountError,
+            };
+          }
+          stations.save();
+          log?.call(
+            '插件 ${config.id} 自建执行站 ${existing.id} 刷新命令表：'
+            '${declared.join('、')}',
+          );
+        }
+      }
       return <String, dynamic>{
         'ok': true,
         'station_id': existing.id,
@@ -4166,20 +4222,17 @@ class PluginBus {
           'error': commandError,
         };
       }
-      final Set<String> taken = <String>{
-        for (final StationInstance candidate in stations.stationList())
-          if (candidate is ExecuteStation && candidate.id != stationId)
-            ...candidate.commands,
-      };
-      for (final String command in executeCommands) {
-        if (taken.contains(command)) {
-          return <String, dynamic>{
-            'ok': false,
-            'station_id': '',
-            'kind': kind.wire,
-            'error': '命令 $command 已被其它插件执行站占用',
-          };
-        }
+      final String? takenError = _executeCommandTaken(
+        executeCommands,
+        ignoreStationId: id,
+      );
+      if (takenError != null) {
+        return <String, dynamic>{
+          'ok': false,
+          'station_id': '',
+          'kind': kind.wire,
+          'error': takenError,
+        };
       }
     }
     final StationInstance station = switch (kind) {
@@ -4269,9 +4322,17 @@ class PluginBus {
     ];
   }
 
+  /// 自建执行站命令表上限（条）。
+  ///
+  /// 32 是自建站刚落地时的保守值；产线把 P1~P8 + D6-O 的命令都挂在同一个执行站上
+  /// 已经 35 条（此前被幂等分支掩盖，重注册刷新时才暴露）。上限只防"命令表失控"，
+  /// 64 足够覆盖真实插件，同时仍是有界值。
+  static const int _maxSelfBuiltExecuteCommands = 64;
+
   /// 自建执行站命令表校验：非空、不超限、名字合法、不得占用核心内置命令。
   ///
-  /// **控制面命名空间只封 `plugin.` / `station.`**（核心确实自己执行的那两族）。
+  /// **控制面命名空间封 `plugin.` / `station.`，整机环境封 `env.`**（核心确实
+  /// 自己执行的这三族，见 `ExecuteStationMounts.implementedPrefixes`）。
   /// `tool.` / `agent.` 曾经也在禁令里，那是 A5 之前的历史包袱：那时这两个前缀是
   /// **内置**命令，插件抢了会抢不掉；领域实现撤出核心后，这两个前缀反而成了
   /// 真正的实现方（tree.agent）唯一顺手的名字，禁令不退就会把让出去的名又堵死
@@ -4280,8 +4341,8 @@ class PluginBus {
     if (commands.isEmpty) {
       return '自建执行站需要非空 commands 列表（插件能执行哪些命令）';
     }
-    if (commands.length > 32) {
-      return 'commands 过多（${commands.length}，上限 32）';
+    if (commands.length > _maxSelfBuiltExecuteCommands) {
+      return 'commands 过多（${commands.length}，上限 $_maxSelfBuiltExecuteCommands）';
     }
     final RegExp name = RegExp(r'^[A-Za-z][A-Za-z0-9_.-]*$');
     for (final String command in commands) {
@@ -4291,9 +4352,31 @@ class PluginBus {
       if (StationPoints.allCommands.contains(command)) {
         return '命令 $command 是核心内置命令，插件不得自建同名命令';
       }
-      if (command.startsWith('plugin.') || command.startsWith('station.')) {
-        return '命令 $command 属于控制面命名空间，插件不得自建';
+      if (command.startsWith('plugin.') ||
+          command.startsWith('station.') ||
+          command.startsWith('env.')) {
+        return '命令 $command 属于核心保留命名空间（plugin. / station. / env.），'
+            '插件不得自建';
       }
+    }
+    return null;
+  }
+
+  /// 这批命令是否已被**别的**执行站占用（[ignoreStationId] 用于排除自己）。
+  ///
+  /// 新建与热重启重注册共用同一口径：重注册时自己已经在站表里，不排除就会
+  /// 自己跟自己冲突。
+  String? _executeCommandTaken(
+    List<String> commands, {
+    String ignoreStationId = '',
+  }) {
+    final Set<String> taken = <String>{
+      for (final StationInstance candidate in stations.stationList())
+        if (candidate is ExecuteStation && candidate.id != ignoreStationId)
+          ...candidate.commands,
+    };
+    for (final String command in commands) {
+      if (taken.contains(command)) return '命令 $command 已被其它插件执行站占用';
     }
     return null;
   }
@@ -5817,6 +5900,7 @@ class PluginBus {
       // 因此插件在 hello 握手期间就能下命令（不会撞上"未接线 ⇒ -32601"的窗口）。
       onPluginRequest: (String method, Map<String, dynamic> params) =>
           _handlePluginRequest(config, method, params),
+      log: log,
     );
   }
 

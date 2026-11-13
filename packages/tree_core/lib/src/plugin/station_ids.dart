@@ -96,8 +96,9 @@ abstract final class StationHubIds {
   // **2026-10-31（known-issues #43，Q-5 走 A）**：`fs` / `terminal` / `agent` /
   // `llm` / `tool` / `session` / `ssh` / `usage` 八族的点位 id 整体删除——A5
   // (`258a28c`) 撤掉核心的领域实现后，那 20 条命令只剩「路由得到、执行必失败」，
-  // 而内置名拦截又让真正的实现方认领不了。执行站只剩 `plugin` / `station` 两族：
-  // 它们是核心**确实自己执行**的生命周期与控制面命令。领域族名让给插件
+  // 而内置名拦截又让真正的实现方认领不了。执行站只剩 `plugin` / `station` / `env`
+  // 三族（`env` 于 2026-11-13 新增，属于整机事实而非领域能力）：它们是核心
+  // **确实自己执行**的生命周期、控制面与环境命令。领域族名让给插件
   // （`tree.agent` / `local_executor` / `ssh_executor`），申报口径见
   // `docs/exec_station_contract.md` §8。
   /// 执行站·插件族：`plugin.list` / `plugin.restart` / `plugin.suspend` /
@@ -120,6 +121,17 @@ abstract final class StationHubIds {
   /// team 可见**（别人的站里写着别人的 topic 与配置）；本族只读，接管权易手仍然
   /// 只走 `station/subscribe` 那一条（不在这里开第二条口子）。
   static const String executeStation = 'system.execute.station';
+
+  /// 执行站·环境族：`env.get` / `env.refresh`（2026-11-13 新增）。
+  ///
+  /// 定位：环境变量是**整机事实**，不属于任何领域（文件 / 终端 / 模型），也不属于
+  /// 任何 team / agent 的工作空间。核心是唯一知道「按登录口径重建」规则的地方
+  /// （见 `tree_local_exec/windows_environment.dart`），插件（`local_executor` 等）
+  /// 需要一份**新**环境时来这里问，而不是各自去 `reg.exe` 一遍。
+  ///
+  /// 口径：`env.get` 读核心缓存（没算过就算一次），`env.refresh` 主动重读注册表
+  /// 并替换缓存（回刷新前后差异）；整机级能力，**不要求 team**（见执行站挂载位置）。
+  static const String executeEnv = 'system.execute.env';
 
   // ── 中转站（拦截-回填；每个点位各自唯一订阅者） ──────────────────────────
 
@@ -264,6 +276,7 @@ abstract final class StationHubIds {
     broadcastConfigChanged,
     executePlugin,
     executeStation,
+    executeEnv,
     relayToolPre,
     relayToolPost,
     relayLlmHandle,

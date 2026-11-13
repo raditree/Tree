@@ -684,6 +684,84 @@ void main() {
     expect(sub.code, 'not_subscribable');
   });
 
+  test('自建执行站：命令表随站点落盘并跨重启恢复', () {
+    final StationHub first = hub();
+    expect(
+      first.register(
+        ExecuteStation(
+          id: 'plugin.demo.execute.worker',
+          description: '演示执行站',
+          readme: '演示：产线调员工',
+          commands: const <String>['agent.worker.run', 'llm.call'],
+        ),
+      ),
+      isNull,
+    );
+
+    // 「重启」：新中枢读同一个文件。命令表必须一起恢复——它没有点位表可回落，
+    // 丢了就会让 agent.worker.run 这类命令变成"未知命令"。
+    final StationHub reloaded = hub();
+    reloaded.load();
+    final ExecuteStation restored =
+        reloaded.station('plugin.demo.execute.worker')! as ExecuteStation;
+    expect(restored.builtin, isFalse);
+    expect(restored.commands, <String>['agent.worker.run', 'llm.call']);
+  });
+
+  test('自建执行站：旧文件没有 commands ⇒ 空表，可被重注册刷新并落盘', () {
+    File(storePath).parent.createSync(recursive: true);
+    File(storePath).writeAsStringSync(
+      'version: 1\n'
+      'stations:\n'
+      '  - id: plugin.demo.execute.worker\n'
+      '    kind: execute\n'
+      '    description: 旧文件\n'
+      '    readme: 旧文件没有 commands\n',
+    );
+    final StationHub h = hub();
+    h.load();
+    final ExecuteStation restored =
+        h.station('plugin.demo.execute.worker')! as ExecuteStation;
+    expect(restored.commands, isEmpty, reason: '旧文件恢复出来只能是空表');
+
+    // 插件重启后同名重注册：核心用本次声明补齐（总线幂等分支的集成用例
+    // 在 plugin_request_test.dart）。
+    expect(
+      restored.replaceCommands(const <String>['agent.worker.run']),
+      isNull,
+    );
+    expect(restored.commands, <String>['agent.worker.run']);
+    h.save();
+
+    final StationHub reloaded = hub();
+    reloaded.load();
+    expect(
+      (reloaded.station('plugin.demo.execute.worker')! as ExecuteStation).commands,
+      <String>['agent.worker.run'],
+      reason: '刷新后的命令表必须落盘',
+    );
+  });
+
+  test('内置执行站的命令表不落盘（继续由点位表现算）', () {
+    final StationHub h = hub();
+    final ExecuteStation execute = h.executePointFor(
+      StationHubIds.executePlugin,
+    )!;
+    h.save();
+    final String text = File(storePath).readAsStringSync();
+    expect(
+      text.contains(StationHubIds.executePlugin),
+      isTrue,
+      reason: '内置站点本身照常落盘',
+    );
+    expect(
+      text.contains('commands:'),
+      isFalse,
+      reason: '内置命令表由点位表决定，不写进 yaml',
+    );
+    expect(execute.commands, contains('plugin.list'));
+  });
+
   test('插件下线：中枢注销其全部订阅并落盘', () async {
     final StationHub h = hub();
     final StationScope scope = team('team-1');

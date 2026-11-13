@@ -556,6 +556,17 @@ sealed class StationInstance {
           board: BroadcastStation.parseBoard(raw['board']),
         );
       case StationKind.execute:
+        // 内置点位：白名单由**点位表**决定（点位新增命令后旧文件也能立刻生效）。
+        // 自建站：命令表只在插件侧声明，必须从盘上恢复——否则重启后空表，
+        // `agent.worker.run` 这类命令会被核心判成"未知命令"。
+        final Object? rawCommands = raw['commands'];
+        final List<String>? storedCommands = rawCommands is List
+            ? <String>[
+                for (final Object? item in rawCommands)
+                  if (item != null && '$item'.trim().isNotEmpty)
+                    '$item'.trim(),
+              ]
+            : null;
         return ExecuteStation(
           id: id,
           description: description,
@@ -566,8 +577,9 @@ sealed class StationInstance {
           enabled: enabled,
           createdAt: createdAt,
           subscribers: subscribers,
-          // 白名单由**点位表**决定，不从盘上读：点位新增命令后旧文件也能立刻生效
-          commands: StationPoints.byId(id)?.commands,
+          commands: builtin
+              ? StationPoints.byId(id)?.commands
+              : storedCommands,
         );
       case StationKind.relay:
         return RelayStation(
@@ -918,12 +930,31 @@ final class ExecuteStation extends StationInstance {
     super.createdAt,
     super.subscribers,
     List<String>? commands,
-  }) : commands = List<String>.unmodifiable(
-         commands ?? _commandsOf(id),
-       );
+  }) : commands = List<String>.of(commands ?? _commandsOf(id));
 
   /// **本点位**的命令白名单（点位表决定；未知点位 = 空表 ⇒ 什么命令都拒绝）。
+  ///
+  /// 内置点位只在内存里由点位表决定；插件自建站由建站方在 `station/register`
+  /// 声明，并且**落盘**（见 [extraJson]），否则核心重启后拿不到点位表、命令表为空。
   final List<String> commands;
+
+  /// 刷新自建执行站的命令白名单（插件热重启重注册时用）。
+  ///
+  /// 返回 null = 成功。内置点位的白名单来自点位表，调用方不应也不能改。
+  /// 新表里没有的命令顺带摘下挂载：留着只会是一条"命令还在、执行器已换"的僵尸项。
+  String? replaceCommands(List<String> next) {
+    if (builtin) {
+      return '内置执行站的命令白名单由点位表决定（$id），不能改';
+    }
+    commands
+      ..clear()
+      ..addAll(next);
+    final Set<String> allowed = next.toSet();
+    _mounts.removeWhere(
+      (StationCommandMount mount) => !allowed.contains(mount.command),
+    );
+    return null;
+  }
 
   /// 从点位表取某执行站点的命令（落盘恢复时也用这条，避免白名单丢失）。
   static List<String> _commandsOf(String id) =>
@@ -1092,6 +1123,13 @@ final class ExecuteStation extends StationInstance {
       );
     }
   }
+
+  @override
+  Map<String, dynamic> extraJson() => builtin
+      // 内置点位不落命令表：重启后由点位表现算，点位新增命令时旧文件也能立刻生效。
+      ? const <String, dynamic>{}
+      // 自建站的命令表只存在插件侧，必须跟着站点一起落盘。
+      : <String, dynamic>{'commands': List<String>.of(commands)};
 
   @override
   Map<String, dynamic> extraDescribe() => <String, dynamic>{

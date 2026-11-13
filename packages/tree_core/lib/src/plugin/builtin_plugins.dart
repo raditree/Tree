@@ -690,6 +690,10 @@ Future<List<String>> seedDesktopUiPlugin({
     if (stored == command) return const <String>[];
     // 只有「默认界面」这一条才由这里修路径：用户手改过 command 的自定义条目不动。
     if (existing['builtin'] != true) return const <String>[];
+    // 旧命令指向的文件**仍然存在** ⇒ 那是用户装在这台机器上的界面（例如
+    // `plugins/tree.ui.default/` 的热装产物），不是"换安装目录后指空了"。
+    // 抢回随包路径会让热装的界面在下一次核心启动时被静默降级回随包旧版。
+    if (stored.isNotEmpty && File(stored).existsSync()) return const <String>[];
     final PluginStoreResult fixed = store.update(
       kDesktopUiPluginId,
       <String, dynamic>{'command': command},

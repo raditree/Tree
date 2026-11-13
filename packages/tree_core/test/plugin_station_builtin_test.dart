@@ -60,7 +60,7 @@ void main() {
   /// 预建点位的**条数**（从表推导；改表不需要回来改这里的数字）。
   int prebuiltCount() => expectedPrebuilt().length;
 
-  test('空存储：24 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
+  test('空存储：25 个内置点位一次建齐，id 是点位常量（不含 team / mode）', () {
     final StationHub hub = StationHub(storePath: storePath);
     expect(hub.stationList(), isEmpty, reason: '预建之前确实是空的（懒创建的世界）');
 
@@ -77,9 +77,9 @@ void main() {
         reason: '点位 id 不含 team×mode 后缀（点位化的核心）',
       );
     }
-    // 每个**点位**都是一条独立实例：按类型数是 10 / 2 / 12（不是四种类型各一个）
+    // 每个**点位**都是一条独立实例：按类型数是 10 / 3 / 12（不是四种类型各一个）
     expect(hub.stationList().whereType<BroadcastStation>(), hasLength(10));
-    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(2));
+    expect(hub.stationList().whereType<ExecuteStation>(), hasLength(3));
     expect(hub.stationList().whereType<RelayStation>(), hasLength(12));
 
     // 面板快照口径（前端卡片直接渲染这几个字段）：中文名 / 内置 / 订阅数 / 分组

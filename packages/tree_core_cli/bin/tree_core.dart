@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:tree_core/tree_core.dart';
+import 'package:tree_local_exec/tree_local_exec.dart';
 
 /// 核心进程入口（`dart compile exe` → `tree_core.exe`）。
 ///
@@ -217,6 +218,25 @@ Future<void> _warmUpPeripheralsAfterHandshake(
   try {
     await warmUpPeripherals(
       <WarmUpTask>[
+        (
+          name: '环境变量',
+          // 启动时**主动重读一次**（而不是等第一次工具调用）：用户刚在系统里配好的
+          // PATH / 新装工具，核心与随后拉起的插件进程要立刻按它工作。之后需要再
+          // 刷新时走执行站 `env.refresh`（插件可调）。
+          run: () async {
+            final Map<String, String> env = await refreshLoginEnvironment(
+              log: log,
+            );
+            final int pathSegments = (env['Path'] ?? env['PATH'] ?? '')
+                .split(';')
+                .where((String part) => part.trim().isNotEmpty)
+                .length;
+            log(
+              '按登录口径读取环境变量 ${env.length} 项'
+              '（PATH $pathSegments 段${Platform.isWindows ? '' : '，非 Windows 沿用继承值'}）',
+            );
+          },
+        ),
         (
           name: '插件',
           run: () async {

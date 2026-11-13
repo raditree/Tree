@@ -23,13 +23,13 @@ void main() {
       );
     });
 
-    test('类型分布：广播 10 / 执行 2 / 中转 12 / 收集 4', () {
+    test('类型分布：广播 10 / 执行 3 / 中转 12 / 收集 4', () {
       int count(StationKind kind) => StationPoints.ofKind(kind).length;
       expect(count(StationKind.broadcast), 10);
-      expect(count(StationKind.execute), 2);
+      expect(count(StationKind.execute), 3);
       expect(count(StationKind.relay), 12);
       expect(count(StationKind.collect), 4);
-      expect(StationPoints.all.length, 28);
+      expect(StationPoints.all.length, 29);
     });
 
     test('退役 id 不在表里（它们只用于读侧迁移与落盘对账）', () {
@@ -102,9 +102,9 @@ void main() {
       );
     });
 
-    test('命令 → 点位：9 条平台面命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：11 条平台面命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 9, reason: '$commands');
+      expect(commands.length, 11, reason: '$commands');
       expect(commands, <String>{
         // 插件族（20261015-hot-restart 阶段 1）
         'plugin.list',
@@ -117,6 +117,9 @@ void main() {
         // 站点族（20261015-hot-restart 阶段 6：只看不动的控制面）
         'station.list',
         'station.state',
+        // 环境族（2026-11-13：整机环境变量，启动预热 + 插件按需刷新）
+        'env.get',
+        'env.refresh',
       });
       for (final String command in commands) {
         final StationPointSpec? owner = StationPoints.ownerOfCommand(command);
@@ -161,6 +164,7 @@ void main() {
       expect(ExecuteStationMounts.implementedPrefixes, <String>[
         'plugin.',
         'station.',
+        'env.',
       ]);
     });
 

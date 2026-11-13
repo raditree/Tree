@@ -229,30 +229,68 @@ Future<String?> regQueryValues(String key) async {
   }
 }
 
-/// 取一份环境：**进程内只算一次**（注册表里的登录环境在一次运行里不会变；用户改完
-/// PATH 也要重开终端才生效，与 Windows 自己的口径一致）。
+/// 取一份环境：**默认进程内只算一次**（注册表里的登录环境在一次运行里通常不变；
+/// 用户改完 PATH 也要重开终端才生效，与 Windows 自己的口径一致）。
 ///
 /// 失败仍按 [loginEnvironment] 的规则整体退回继承值。
+///
+/// 缓存的是 **Future** 而不是结果表：启动预热与首批插件进程会并发取它，
+/// 用 Future 才能把「读注册表」压成一次（否则每个并发调用都各跑一遍 `reg.exe`）。
+/// 需要「用户刚改了系统环境变量」时用 [refreshLoginEnvironment] 主动重读。
 Future<Map<String, String>> cachedLoginEnvironment({
   Map<String, String>? inherited,
   RegQuery? query,
   void Function(String message)? log,
-}) async {
-  final Map<String, String>? cached = _cached;
+}) {
+  final Future<Map<String, String>>? cached = _cached;
   if (cached != null) return cached;
-  final Map<String, String> env = await loginEnvironment(
-    inherited: inherited,
-    query: query,
-    log: log,
+  return _store(
+    loginEnvironment(inherited: inherited, query: query, log: log),
   );
-  _cached = env;
-  return env;
 }
 
-Map<String, String>? _cached;
+/// **主动刷新**：重新读注册表并替换进程内缓存，返回刷新后的环境。
+///
+/// 与 [cachedLoginEnvironment] 的区别只有「强制重读」：失败仍整体退回继承值
+/// （不会把可用环境换成半套）。核心执行站 `env.refresh` 与启动预热都走它。
+Future<Map<String, String>> refreshLoginEnvironment({
+  Map<String, String>? inherited,
+  RegQuery? query,
+  void Function(String message)? log,
+}) => _store(
+  loginEnvironment(inherited: inherited, query: query, log: log),
+);
+
+/// 最近一次算好的环境（还没算过 = null）。
+///
+/// 同步快照供「刷新前后差异」这类只读比较用；它**不会**触发计算。
+Map<String, String>? loginEnvironmentSnapshot() => _snapshot;
+
+/// 最近一次算好的时间（还没算过 = null）。
+DateTime? loginEnvironmentRefreshedAt() => _refreshedAt;
+
+Future<Map<String, String>> _store(Future<Map<String, String>> pending) {
+  final Future<Map<String, String>> tracked = pending.then(
+    (Map<String, String> env) {
+      _snapshot = env;
+      _refreshedAt = DateTime.now();
+      return env;
+    },
+  );
+  _cached = tracked;
+  return tracked;
+}
+
+Future<Map<String, String>>? _cached;
+Map<String, String>? _snapshot;
+DateTime? _refreshedAt;
 
 /// 仅供测试：清掉进程内缓存（生产代码不需要——注册表环境在一次运行里当常量看）。
-void resetLoginEnvironmentCache() => _cached = null;
+void resetLoginEnvironmentCache() {
+  _cached = null;
+  _snapshot = null;
+  _refreshedAt = null;
+}
 
 /// 按登录口径取一份环境；**任何一步失败整体退回 [inherited]**（默认 = 当前进程环境）。
 ///

@@ -572,6 +572,67 @@ void main() {
       contains('plugin.sample'),
       reason: '自建执行站的命令必须挂回建站插件自己',
     );
+
+    // 插件热重启会再注册一次：命令表必须以**本次声明**为准并重新挂执行器，
+    // 否则重启后从 stations.yaml 恢复出来的旧站会一直是空表（agent.worker.run
+    // 就会变成"未知命令"）。
+    final Map<String, dynamic> again =
+        (await pluginRequest(
+          bus,
+          method: 'station/register',
+          params: <String, dynamic>{
+            'kind': 'execute',
+            'name': 'local',
+            'readme': '夹具：自建执行站',
+            'commands': <String>['agent.worker.run'],
+          },
+        ))['result'] as Map<String, dynamic>;
+    expect(again['ok'], isTrue, reason: '${again['error']}');
+    expect(again['station_id'], 'plugin.sample.execute.local');
+    expect(station.commands, <String>['agent.worker.run'], reason: '重注册必须刷新命令表');
+    expect(
+      station
+          .mounts(command: 'agent.worker.run')
+          .map((StationCommandMount mount) => mount.mountId)
+          .toList(),
+      contains('plugin.sample'),
+      reason: '重注册必须重新挂上执行器（挂载是运行期态，重启后会丢）',
+    );
+  });
+
+  test('station/register：自建执行站命令表上限 64（35 条可注册，65 条拒绝）', () async {
+    final PluginBus bus = await startBus(teamPluginYaml());
+
+    final Map<String, dynamic> wide =
+        (await pluginRequest(
+          bus,
+          method: 'station/register',
+          params: <String, dynamic>{
+            'kind': 'execute',
+            'name': 'wide',
+            'readme': '夹具：宽命令表',
+            'commands': <String>[
+              for (int i = 0; i < 35; i++) 'demo.wide$i',
+            ],
+          },
+        ))['result'] as Map<String, dynamic>;
+    expect(wide['ok'], isTrue, reason: '${wide['error']}');
+
+    final Map<String, dynamic> tooWide =
+        (await pluginRequest(
+          bus,
+          method: 'station/register',
+          params: <String, dynamic>{
+            'kind': 'execute',
+            'name': 'too_wide',
+            'readme': '夹具：超限命令表',
+            'commands': <String>[
+              for (int i = 0; i < 65; i++) 'demo.tooWide$i',
+            ],
+          },
+        ))['result'] as Map<String, dynamic>;
+    expect(tooWide['ok'], isFalse);
+    expect(tooWide['error'], contains('commands 过多'));
   });
 
   test('station/register：自建收集站带 schema ⇒ 可建，且订阅上限可自报', () async {

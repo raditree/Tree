@@ -40,7 +40,7 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 | `TeamService` + `MessageDispatcher` | 成员即 agent；创建/审核/移除；派活、广播、`wait_for`；活动日志；失活 fail-closed + 待补发 |
 | `SpecService` | 内置规范播种 + 自定义规范扫描 + 索引/已选全文两个快照（进系统提示词） |
 | `McpService` | stdio / Streamable HTTP MCP 客户端；懒连接、心跳判活、工具命名空间化 |
-| `PluginBus` + 站点体系 | 插件子进程 JSON-RPC；广播 / 执行 / 中转 / 收集四类站点、35 个点位（广播 10 + 执行 11 + 中转 12 + 收集 2；中转站含 `ssh.execute` 与整轮接管 `loop.run`）|
+| `PluginBus` + 站点体系 | 插件子进程 JSON-RPC；广播 / 执行 / 中转 / 收集四类站点、29 个点位（广播 10 + 执行 3 + 中转 12 + 收集 4；执行站只剩核心自己执行的 `plugin` / `station` / `env` 三族；中转站含 `ssh.execute` 与整轮接管 `loop.run`）|
 
 ## 3. 一次会话运行的链路
 

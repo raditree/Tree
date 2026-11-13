@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:tree_protocol/tree_protocol.dart';
 
 import '../plugin/builtin_plugins.dart';
+import '../plugin/environment_commands.dart';
 import '../plugin/execute_mounts.dart';
 import '../plugin/plugin_bus.dart';
 import '../plugin/plugin_config_store.dart';
@@ -411,19 +412,23 @@ class CoreServer {
     await _http.close(force: force);
   }
 
-  // ── 站点接线（A5 平台面：plugin.* / station.*） ─────────────────────────
+  // ── 站点接线（A5 平台面：plugin.* / station.* / env.*） ──────────────────
 
   /// 执行站平台命令的挂载位置 + 插件总线需要的**运行期四元组**解析器。
   ///
   /// A5 后核心不再实现领域命令（fs.* / terminal.* / agent.* / llm.call / tool.*）；
-  /// 这里只把两族平台命令（`plugin.*` / `station.*`）挂到内置执行站上，并接上
+  /// 这里只把三族平台命令（`plugin.*` / `station.*` / `env.*`）挂到内置执行站上，并接上
   /// UI 插件的 WS 站点总线。
   void _wirePluginStations() {
     final PluginBus? bus = pluginBus;
     if (bus == null) return;
+    final EnvironmentCommands environment = EnvironmentCommands(
+      log: (String message) => errorLog?.call('[core:env] $message'),
+    );
     final ExecuteStationMounts mounts = ExecuteStationMounts(
       pluginManager: bus.handlePluginCommand,
       topologyQuery: bus.handleStationQuery,
+      environmentQuery: environment.handle,
       log: (String message) => errorLog?.call('[core:station] $message'),
     );
     _stationMounts = mounts;

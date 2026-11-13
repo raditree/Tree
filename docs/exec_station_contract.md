@@ -100,6 +100,12 @@ RPC 层错误**不走这个信封**：`command` 缺失、`arguments` 不是对�
 （`StationPoints.ownerOfCommand`），同名会被核心以"已被其它插件执行站占用"拒绝
 （`plugin_bus.dart:4176`）。所以不存在"两个执行站提供同名 `file.read`"这种形态。
 
+**自建执行站的命令表随站点落盘**：`commands` 只存在插件侧（点位表里没有自建站），所以
+`stations.yaml` 会保存它并在核心重启后恢复；同名重注册时以本次声明刷新白名单并重新挂
+执行器。否则重启后命令表为空，`agent.worker.run` 这类命令会被判成"未知命令"。
+（实现：`station_instance.dart` 的 `ExecuteStation.extraJson` / `replaceCommands`，
+`plugin_bus.dart` 的 `station/register` 幂等分支。）
+
 **8 个旧名不是别名，是另一条死路**：本机执行器同时接受 `fs.read` / … / `fs.writeBytes`
 与 `terminal.exec`（`plugins/local_executor/lib/src/executor.dart:27-50`）。
 但它们**不是"没申报"**——恰恰相反，这 8 个名字都在核心的**内置点位表**里
@@ -495,6 +501,11 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
   都得被 `ExecuteStationMounts.handles` 认下」＋ `plugin_hot_restart_station_test` 的
   「按全表核对挂载位置」；`plugin-development.md` §3.1 / §4 / §5.6 / §6.1 / §11 与
   `agent_pluginization.md` 的过渡期说明同步收口。
+- **2026-11-13 增量（环境族）**：新增 `system.execute.env`（别名 `env`，命令 `env.get` /
+  `env.refresh`）；内置点位 28 → 29、执行站命令 9 → 11；`ExecuteStationMounts`
+  `implementedPrefixes` 加 `env.`，`_checkExecuteCommands` 把 `env.` 一并列为保留命名空间。
+  这一族**不要求 team**（环境是整机一份，没有 team 归属可证明），与 `plugin.*` /
+  `station.*` 的归属闸门刻意不同；回包形状见 `plugin-development.md` §6.1。
 - **片 1 留下一条已知不一致**：`builtin_plugins.dart:230` 的示例插件描述仍在讲
   `fs.read / llm.call / tool.call / session.rename` 四个演示开关——那四条命令在片 2 换名
   之前确实没有承接方。文字随片 2 一起改（改在核心侧，改早了会与还没动的插件产物更不符）。

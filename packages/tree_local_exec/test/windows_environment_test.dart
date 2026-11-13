@@ -175,4 +175,55 @@ void main() {
       }
     });
   });
+
+  group('缓存与主动刷新', () {
+    tearDown(resetLoginEnvironmentCache);
+
+    test('缓存：同一份环境只算一次（并发取也只读一次注册表）', () async {
+      resetLoginEnvironmentCache();
+      int calls = 0;
+      Future<String?> query(String key) async {
+        calls++;
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+        return '    Path    REG_SZ    C:\\x\r\n';
+      }
+
+      final List<Map<String, String>> results = await Future.wait(
+        <Future<Map<String, String>>>[
+          cachedLoginEnvironment(
+            inherited: <String, String>{'TREE_HOME': r'E:\tree'},
+            query: query,
+          ),
+          cachedLoginEnvironment(
+            inherited: <String, String>{'TREE_HOME': r'E:\tree'},
+            query: query,
+          ),
+        ],
+      );
+      expect(identical(results[0], results[1]), isTrue, reason: '缓存的是 Future，不是结果表');
+      expect(loginEnvironmentSnapshot(), same(results[0]));
+      expect(loginEnvironmentRefreshedAt(), isNotNull);
+      // Windows 上一次计算 = 机器级 + 用户级两次 reg 查询；非 Windows 不走注册表
+      expect(calls, Platform.isWindows ? 2 : 0);
+    });
+
+    test('refresh：强制重算并替换缓存（时间戳前进，快照跟着换）', () async {
+      resetLoginEnvironmentCache();
+      await cachedLoginEnvironment(
+        inherited: <String, String>{'K': 'v1'},
+      );
+      final DateTime before = loginEnvironmentRefreshedAt()!;
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+      final Map<String, String> refreshed = await refreshLoginEnvironment(
+        inherited: <String, String>{'K': 'v2'},
+      );
+      expect(refreshed['K'], 'v2');
+      expect(loginEnvironmentSnapshot(), same(refreshed));
+      expect(
+        loginEnvironmentRefreshedAt()!.isAfter(before),
+        isTrue,
+        reason: '刷新必须真的重算（不是把缓存原样退回）',
+      );
+    });
+  });
 }

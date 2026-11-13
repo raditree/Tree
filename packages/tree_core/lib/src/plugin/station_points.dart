@@ -276,6 +276,27 @@ abstract final class StationPoints {
           '③ team 证明不了就拒（fail-closed，与 plugin 族控制面同口径）。',
       commands: <String>['station.list', 'station.state'],
     ),
+    StationPointSpec(
+      id: StationHubIds.executeEnv,
+      kind: StationKind.execute,
+      label: '环境变量',
+      description:
+          '执行站·环境族：env.get（读当前环境，可带 names 过滤）/ env.refresh'
+          '（按登录口径重读注册表并替换缓存，回刷新前后差异；include_env=true 才带整份环境）',
+      alias: 'env',
+      readme:
+          '环境族（env.get / env.refresh）：解决「用户装了新工具 / 改了 PATH，而核心与插件'
+          '进程还是启动时那份环境」的问题。触发时机：插件调 `station/command` 时；核心启动'
+          '后也会先按登录口径重读一次（机器级 + 用户级注册表，`Path` = 机器级在前 + 用户级'
+          '在后），插件与界面进程随后继承这份环境。回包口径：`env.get` 回 '
+          '`{ok, count, env:{…}}`（带 `names` 时只回这些，另带 `missing`）；'
+          '`env.refresh` 回 `{ok, count, refreshed_at, baseline, changed, added, removed}`，'
+          '`include_env: true` 才附整份 `env`。限制：① 本族是**整机级**能力，不要求 team'
+          '（环境没有 team 归属可证明）；② 刷新是「重读注册表」而不是「改写系统环境」——'
+          '不会、也不能把值写回用户机器；③ 失败整体退回继承值并留日志，不会把可用环境'
+          '换成半套。',
+      commands: <String>['env.get', 'env.refresh'],
+    ),
   ];
 
   /// 中转站点位（每个点位各自唯一订阅者）。

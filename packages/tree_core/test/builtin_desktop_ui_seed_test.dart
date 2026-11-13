@@ -160,6 +160,46 @@ void main() {
     expect(lines.join('\n'), contains('重指'));
   });
 
+  test('旧命令指向的界面仍在（热装到 plugins/）⇒ 不抢回随包路径', () async {
+    // 现场：UI 插件经 /api/plugin/install/local 装到 plugins/tree.ui.default/，
+    // 下一次核心启动若把 command 改回同目录的随包 tree_ui.exe，界面就被静默降级。
+    final String installed = p.join(
+      temp.path,
+      'plugins',
+      kDesktopUiPluginId,
+      kDesktopUiBinaryName,
+    );
+    File(installed).parent.createSync(recursive: true);
+    File(installed).writeAsStringSync('placeholder');
+    final Map<String, dynamic> entry = <String, dynamic>{
+      'id': kDesktopUiPluginId,
+      'name': 'Tree 默认界面',
+      'command': installed,
+      'args': <String>[],
+      'env': <String, String>{},
+      'enabled': true,
+      'granularity': 'team',
+      'scope': <String, dynamic>{},
+      'runtime': 'ui',
+      'builtin': true,
+    };
+    expect(store.upsert(entry).ok, isTrue);
+    placeUi(); // 随包那份也在，但它不是用户正在用的
+    final List<String> lines = <String>[];
+    expect(
+      await seedDesktopUiPlugin(
+        store: store,
+        executableDir: executableDir,
+        isWindows: false,
+        log: lines.add,
+      ),
+      isEmpty,
+      reason: '文件还在 ⇒ 不是"路径指空"，不能替用户换回随包界面',
+    );
+    expect(store.readEntry(kDesktopUiPluginId)!['command'], installed);
+    expect(lines, isEmpty);
+  });
+
   test('不是 builtin 的同 id 条目（用户自己写的）⇒ 一点都不动', () async {
     final Map<String, dynamic> custom = <String, dynamic>{
       'id': kDesktopUiPluginId,

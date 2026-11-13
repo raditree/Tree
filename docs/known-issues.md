@@ -2769,3 +2769,181 @@ docnorm 的 `reuse` 建议目前只做**符号级候选 + LLM 核实**（同名/
    下标/滑块/折叠/定位的整套坐标系，本轮不做；
 2. 占位槽 88px 是估算值，滑块拖到未加载段时的落点仍靠 `MessageSeekCorrection` 收口（既有口径）。
 
+## #48 自建执行站重启后命令表为空 ⇒ `agent.worker.run` 等插件命令被判“未知命令”
+
+**状态**：**已修复（2026-11-13：命令表落盘 + 重启恢复 + 重注册刷新）**
+**影响**：任何“插件自建执行站”的能力都会在核心重启后失效，最典型的是产线打包 /
+执行（`tree.production.line` → `tree.agent` 的 `agent.worker.run`）：任务一打包就
+`blocked`，运行台账写「未知命令 agent.worker.run（可用命令：plugin.* / station.*）」。
+新建的核心进程第一次启动时命令表是好的，**只要重启过就坏**。
+
+### 现象
+
+- 运行中的 `plugin.tree.agent.execute.agent_tools` 站点存在，但
+  `GET /api/plugin/stations/...` 的 `commands` 为空、`mounts` 为空；
+- `config/stations.yaml` 里该站点没有 `commands` 字段，`readme` 还是旧版本文案；
+- tree.agent 的启动日志显示“领域工具执行站：plugin.tree.agent.execute.agent_tools”
+  （注册成功），但命令一条都路由不到。
+
+### 根因
+
+1. **自建执行站的命令表不落盘**：`ExecuteStation` 没有覆盖 `extraJson`，而内置点位的
+   命令可以靠 `StationPoints` 现算，自建站没有点位表可回落。核心重启从
+   `stations.yaml` 恢复时 `commands` 只能拿到空表（`StationInstance.tryParse` 当时
+   一律 `StationPoints.byId(id)?.commands`）。
+2. **同名重注册不刷新**：`station/register` 命中已存在站点时直接返回旧实例，不再读
+   本次的 `readme` / `commands`，也不重新挂执行器。插件重启后虽然“注册成功”，拿回
+   的仍是那份空表旧站；挂载又是运行期态，重启必然丢。
+
+### 修复
+
+1. `ExecuteStation.extraJson()`：**自建站**把 `commands` 写进 `stations.yaml`（内置点位
+   继续不写，由点位表现算）；
+2. `StationInstance.tryParse`：自建执行站从盘上恢复 `commands`；
+3. `station/register` 幂等分支：自建执行站以本次声明**刷新命令表 + 重挂执行器 +
+   落盘**（老插件不带 `commands` 则保持原状）；
+4. 新增 `ExecuteStation.replaceCommands`（摘掉新表里没有的挂载）与
+   `PluginBus._executeCommandTaken`（新建 / 重注册共用“命令已被占用”校验）；
+5. 重注册刷新还暴露了一个被掩盖的老问题：产线自建执行站声明了 **35 条**命令，
+   而当年的上限是 32 条（新建路径本来就会拒，只是幂等分支一直没走到校验）。
+   上限提到 **64 条**（`_maxSelfBuiltExecuteCommands`），仍是有界值。
+
+### 验证
+
+- `plugin_station_test.dart`：自建站命令表跨重启恢复；旧文件空表可被刷新并再次落盘；
+  内置站命令表不落盘；
+- `plugin_request_test.dart`：同名重注册后 `commands` 刷新、执行器重新挂到建站插件；
+  35 条命令可注册、65 条被拒；
+- `plugin_station_builtin_test.dart` / `station_points_test.dart` 回归全绿（共 52 条）；
+- `dart analyze` 0；新 `tree_core.exe` 已编译到 `dist/`。
+
+### 遗留
+
+- 旧 `stations.yaml` 不需要手工删：新核心启动后插件会用同名注册自动补齐并写回；
+- 若插件长期不重启（不重注册），旧文件恢复出的命令表仍为空——这是运行期挂载缺失的
+  既有边界，命令会以“暂无挂载位置 / 未知命令”显式失败，不会静默成功。
+
+## #49 UI 站点订阅先于 `ui.hello` 发出 ⇒ agent 对话收不到任何实时帧
+
+**状态**：**已修复（2026-11-13：UI 侧顺序修正 `42416e9`；同日协议 1.1 根治）**
+**影响**：界面发消息后“完全没反应”——后端 LLM 与工具照常执行，但 `msg_chunk` /
+`msg_start` / `msg_end` / `tool_start` / `tool_end` / `agent_status` 一条都到不了；
+输入按钮不切成“停止”、agent 状态恒为 idle；切到对应 agent 只能看到 REST 快照
+（历史消息），之后仍然没有实时增量。
+
+### 现象
+
+- `GET /api/plugin/stations/plugin.tree.agent.broadcast.events` 与
+  `.../system.broadcast.plugin.state` 均为 `subscriber_count = 0`、`subscriptions = []`；
+- 站点公告板（`board_latest`）里 `msg_chunk` / `agent_status` 一直在产出，说明插件侧
+  与核心桥接正常，缺的是 UI 这一侧的订阅；
+- 造一条独立 WS 连接复现：先发 `station/subscribe` 再发 `ui.hello`，核心回
+  `{"type":"error","data":{"error":"连接尚未完成 ui.hello，不能订阅站点…"}}`；
+  先 `ui.hello` 再订阅则立即收到 `station_delivery`（`state=reset`）。
+
+### 根因
+
+1. `WebSocketService.connect()` 的顺序是「乐观置已连接 → `onConnectionChange(true)`
+   → 起心跳 → `_sendHello()`」；
+2. `StationClient` 把订阅挂在 `onConnectionChange`：回调当拍就发 `station/subscribe`，
+   于是订阅帧永远排在 `ui.hello` 前面；
+3. 核心 `StationWsBridge._handleSubscribe` 用 `ui.hello` 建立的 bond 判定归属，
+   未绑定即拒收（回 `error` 帧），且不登记任何订阅；
+4. `StationClient.handleFrame` 只认 `station_delivery`，其余帧（含这条 error）
+   一律静默丢弃；`_stations` 已记下站点 id，除断线重连外不会再次订阅 ⇒
+   **整条 UI 生命周期的站点订阅都是 0**。
+
+### 修复
+
+- `websocket_service.dart`：把 `_sendHello()` 提到 `onConnectionChange?.call(true)` 之前
+  （身份先于一切业务帧；两者都写同一个 sink，线上顺序确定）；
+- `station_client.dart`：`error` 帧留一条 `debugPrint`，同类拒收不再无声。
+
+### 验证
+
+- UI 插件 `flutter analyze lib` 0；全量 `flutter test` **982/982**；
+- 真核心 WS 实测：hello 在前时订阅立刻收到 `station_delivery(reset)`；
+- 提交：插件仓 `42416e9`。
+
+### 根治（协议 1.1）
+
+只在客户端修顺序仍然把契约正确性押在“每个客户端都记得先发 hello”上，因此同日把顺序依赖
+从协议里删掉（方案与兼容矩阵见
+[ui-station-identity-root-fix.md](pluginization/ui-station-identity-root-fix.md)）：
+
+- 核心 `StationWsBridge`：身份前到达的 `station/*` 请求进入连接级挂起队列
+  （默认 64 条 / 10s），`ui.hello` 成功后按到达顺序补放；超时 / 溢出逐条回
+  `station_ack(ok:false, code: identity_required | identity_queue_overflow)`；
+- 新增下行 `station_ack`（每条站点请求恰好一条回执，成功也回）与 9 个稳定错误码；
+- UI `StationClient`：按 `error code` 决策 `1/2/4/8/16s` 退避重订（≤5 次），
+  `station_not_found` / 插件热重启（`closed`）后可自动恢复并清横幅；
+- `ui_contract` 1.0 → **1.1**（协议包 / UI 自持契约 / 黑盒套件 / `plugin-development` §7.2 同步）。
+
+**效果**：即使客户端仍把订阅发在 hello 之前，新核心也会补放（旧 UI 单独升级核心即恢复）；
+站点请求失败不再静默——有回执、有稳定码、有重试。
+
+### 遗留
+
+- 生效需要重建 UI 插件并热装（协议侧改动随新核心即可救回旧 UI）；
+
+## #50 插件进程只继承 core 启动时的环境，系统环境变量改了也不会刷新（agent 的 shell 丢 PATH）
+
+**状态**：已修复（2026-11-13，核心侧）。
+
+### 现象
+
+用户（2026-11-13）：「能不能主动刷新环境变量（启动时一次，然后增加一个核心的执行站，
+插件需要时可调用）」。背景是同类现场反复出现：在系统里装完新工具 / 改完 PATH 后，
+Tree 的 agent shell 里 `gh` 之类仍然找不到；只有整套重启才可能恢复，而重启后也未必
+拿得到（取决于启动方当时的环境）。
+
+### 根因
+
+按登录口径重建环境（#18 的修复，`tree_local_exec/windows_environment.dart`）只接线在
+**核心自己的 `LocalWorkspaceIO`** 上；A5 把本地执行下沉成 `local_executor` 插件之后，
+核心不再实例化它，而插件侧的 `executor.dart` 直接用 `Process.start` **继承插件进程环境**：
+
+1. `PluginHost.start` 只传 `config.env`（`includeParentEnvironment` 默认 true）⇒ 插件
+   拿到的是 **core 进程的环境**，也就是"启动 core 的那个人当时的环境"；
+2. `UiHost.start` 同理（只额外注入 `TREE_CORE_URL/TOKEN/DATA_ROOT`）；
+3. `cachedLoginEnvironment` 一旦算过就永远是同一份，**没有任何刷新入口**——就算核心
+   想重读，也没有一条插件够得着的通路。
+
+于是「用户后来改的系统环境变量」与「Tree 里 agent 看到的环境」之间没有任何刷新时机。
+
+### 修复
+
+- `tree_local_exec`：缓存从「结果表」改成「Future」——启动预热与首批插件进程并发取
+  也只读一次注册表；新增 `refreshLoginEnvironment`（强制重读并替换缓存）、
+  `loginEnvironmentSnapshot` / `loginEnvironmentRefreshedAt`（同步快照与时间戳，
+  供「刷新前后差异」比较）。
+- 核心启动：握手后的外设预热里新增「环境变量」任务，**主动重读一次**并记日志
+  （`${env.length} 项 / PATH 段数`，不打印值）。
+- 进程口径：`PluginHost.start` / `UiHost.start` 在 `Process.start` 时把
+  `cachedLoginEnvironment()` 与 `config.env`（以及 UI 的 `TREE_*`）合并后显式传入
+  ⇒ 插件与界面进程从第一刻起就拿登录口径的环境。
+- 执行站新增环境族 `system.execute.env`（别名 `env`）：
+  - `env.get`：读当前环境（可带 `names` 过滤，缺失的名字进 `missing`）；
+  - `env.refresh`：重读注册表并回 `{changed, added, removed, baseline, refreshed_at}`，
+    `include_env: true` 才带整份环境；
+  - **不要求 team**：环境是整机一份，没有 team 归属可证明（与 `plugin.*` /
+    `station.*` 的归属闸门刻意不同）；`env.` 同时列为自建执行站的保留前缀。
+- 文档：`plugin-development.md` §3.1 / §6.1 / §6.2、`exec_station_contract.md`、
+  `architecture.md` 的点位计数同步（29 = 广播 10 + 执行 3 + 中转 12 + 收集 4）。
+
+### 验证
+
+- `tree_local_exec`：`windows_environment_test` 17/17（新增缓存 Future 只读一次、
+  refresh 重算并推进时间戳）；
+- `tree_core`：`exec_station_env_test`（新增）、`station_points_test`、
+  `plugin_station_builtin_test`、`plugin_hot_apply_test`、`plugin_station_query_test`
+  全绿；`dart analyze` 0；
+- `tree_core_cli`：`dart analyze` 0。
+
+### 遗留
+
+- 插件进程**已在运行**时无法改写自身环境（OS 层面不可变）：`env.refresh` 刷新的是
+  核心的缓存，运行中的插件要享受新值，必须自己在起子进程时把 `env.get` 的结果传下去
+  （`local_executor` 目前是继承启动时那份，**尚未**接入这一步）；
+- 登录口径重建只在 Windows 生效；POSIX 仍按继承值（与 `#17` 的登录外壳是两套语义）。
+

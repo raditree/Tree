@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:tree_local_exec/tree_local_exec.dart';
 import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
 
 import '../util/liveness.dart';
@@ -64,6 +65,7 @@ class PluginHost {
     )?
     onPluginRequest,
     void Function(String line)? onStderrLine,
+    void Function(String message)? log,
   }) async {
     if (config.command.trim().isEmpty) {
       throw PluginException('插件 ${config.id} 未配置 command');
@@ -73,7 +75,13 @@ class PluginHost {
       process = await Process.start(
         config.command,
         config.args,
-        environment: config.env.isEmpty ? null : config.env,
+        // 环境按**登录口径**重建后再交给插件（见 windows_environment.dart）：
+        // 插件自己的子进程（`local_executor` 的 shell / git）都继承这一份，用户
+        // 在系统里配的 PATH 才不会丢；`config.env` 仍逐键覆盖它。
+        environment: <String, String>{
+          ...await cachedLoginEnvironment(log: log),
+          ...config.env,
+        },
         runInShell: Platform.isWindows && _needsShell(config.command),
       );
     } catch (error) {

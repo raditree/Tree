@@ -109,7 +109,10 @@
     `Path` 按"机器级 + `;` + 用户级"拼，其余同名用户级覆盖机器级；`REG_EXPAND_SZ` 按合成后的表展开
     （**查找表带上继承值**，否则会留一串没展开的 `%SystemRoot%`）；**注册表里没有的继承变量原样保留**
     （运行环境注入的 `TREE_*` / 工具链条目不该被抹掉）；**任何一步失败整体退回继承**并留日志。
-    接线四处、同进程只算一次：本地 `exec`、`git`、本地 PTY（核心的 `LocalPtyStarter`）、后台 hook 脚本。
+    接线四处、同进程默认只算一次：本地 `exec`、`git`、本地 PTY（核心的 `LocalPtyStarter`）、后台 hook 脚本。
+    **主动刷新**走 `refreshLoginEnvironment`（重读注册表并替换缓存，回快照 / 时间戳）：
+    核心启动后预热一次，之后插件需要时经执行站 `env.refresh` 触发；`cachedLoginEnvironment`
+    缓存的是 Future，启动预热与首批插件进程并发取也只读一次注册表。
     理由：纯继承会让 agent 的 shell **少**用户在系统里配的 PATH 项（实测少 `C:\Program Files\GitHub CLI\`）、
     **多**启动方注入的项（实测多 `…\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe`，
     连带把 shell 选成了 MSIX 打包版 pwsh）。非 Windows 直接返回继承值。
