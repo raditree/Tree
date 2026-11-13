@@ -190,6 +190,10 @@ class CoreServer {
   /// 执行站平台命令的挂载位置（`plugin.*` / `station.*`）。
   ExecuteStationMounts? _stationMounts;
 
+  /// 站点身份建立前挂起请求的时限 / 上限（协议 1.1；由 [start] 注入，测试可缩短）。
+  Duration _stationPendingTtl = const Duration(seconds: 10);
+  int _stationPendingCapacity = 64;
+
   /// 已实现路由（= [ApiPaths.coreOwned] 的 35 条）。
   final CoreRouter router;
 
@@ -279,6 +283,12 @@ class CoreServer {
 
     /// token 注册表的时钟（测试注入可控时间）。
     DateTime Function()? tokenClock,
+
+    /// 站点身份建立前挂起请求的时限（协议 1.1；测试可缩短到毫秒级）。
+    Duration stationPendingTtl = const Duration(seconds: 10),
+
+    /// 站点身份建立前挂起队列的条数上限（协议 1.1；测试可调小）。
+    int stationPendingCapacity = 64,
   }) async {
     final HttpServer http = await HttpServer.bind(
       address ?? InternetAddress.loopbackIPv4,
@@ -373,6 +383,8 @@ class CoreServer {
       server.errorLog?.call('WS 链路 $text');
     };
     // 平台执行站（plugin.* / station.*）+ UI 插件 WS 站点总线接线。
+    server._stationPendingTtl = stationPendingTtl;
+    server._stationPendingCapacity = stationPendingCapacity;
     server._wirePluginStations();
     server._registerRoutes();
     // L-28：把核心**当前已实现**的方法路由交给委派归属表做同键拒收。
@@ -449,6 +461,8 @@ class CoreServer {
         unawaited(bus.declareUiBranding(pluginId, branding));
       },
       branding: () => bus.activeBranding,
+      pendingTtl: _stationPendingTtl,
+      pendingCapacity: _stationPendingCapacity,
     );
     bus.stations.onStationRemoved = bridge.onStationRemoved;
     bus.onPluginOffline = bridge.onPluginOffline;

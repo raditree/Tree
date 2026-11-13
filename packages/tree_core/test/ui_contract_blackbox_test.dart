@@ -451,7 +451,7 @@ plugins:
     expect(meta.status, 200, reason: meta.text);
     expect(
       meta.json['ui_contract'],
-      '1.0',
+      '1.1',
       reason:
           'UI 自持契约的版本号：只增不改；改了这里就等于换了 UI 的编译期契约',
     );

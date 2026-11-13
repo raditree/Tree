@@ -14,6 +14,7 @@
 | [team.md](team.md) | 团队与成员语义：成员即 agent、审核闸门、共享工作目录与私有分栏、SSH 跟随、会话并行、派活与回信、活动日志 |
 | [plugin-development.md](plugin-development.md) | 写插件的系统指南：一分钟上手、协议与生命周期、站点与点位（点位由核心与插件申报，数量以 `/api/meta` 为准）、scope 两套含义、执行站命令、流式接管、UI 槽位、调试 |
 | [exec_station_contract.md](exec_station_contract.md) | **执行站契约**（L-25）：`station/command` 回包信封的六个键、两个执行站命令表逐条对照（本机 8 / SSH 10 与四处能力差异）、失败来源全清单与错误码表、逐命令幂等标注、八环传递链与门禁设计 |
+| [pluginization/ui-station-identity-root-fix.md](pluginization/ui-station-identity-root-fix.md) | **UI 站点身份「可晚到」与订阅回执（协议 1.1 根治）**：`ui.hello` 从“前置条件”降级为“身份声明”，身份前到达的 `station/*` 请求有界挂起、hello 后按序补放；新增 `station_ack` 回执与 9 个稳定错误码（`identity_required` / `station_not_found` / `not_broadcast` …）；客户端按码退避重订、`closed` 后恢复；P1~P4 切片、兼容矩阵与风险边界 |
 | [pluginization/scope-de-domainization-recon.md](pluginization/scope-de-domainization-recon.md) | **L-23 `scope` 去领域化侦查**（本期不实现）：wire 消费点、4 类判定点、12 个插件的空 `scope` 声明、C1→C2 方案与 S0~S4 执行序 / 验收判据 |
 | [pluginization/agent-loop-restructure-recon.md](pluginization/agent-loop-restructure-recon.md) | **Agent loop 三线结构侦察与语义对齐（AC-1）**：Agent 实例 / 消息机 / loop 的现状对照、统一信封与直投/排队语义、队列落档、状态机、广播/执行/中转站点面、12 处冲突点与 AC-1~AC-6 切片 |
 | [pluginization/production-line-recon.md](pluginization/production-line-recon.md) | **标准开发流生产线侦查与语义对齐**（本期只落档）：与 Agent 同级的三实体（产线/任务/员工）、20 分钟=用户活跃窗口（单题不设时限、未答次日续答、未答不实施）、打包→执行双模型与 `message` 回环、专家工具与工具白名单、模型信息并入模型配置页（左导航 + 右内容）、`docs/production_lines/` 项目资产 + `line.yaml`/`task.yaml`/`runs` 数据模型、P0~P8 切片与 TC-PL-01~14、D1~D10 全部拍板 |

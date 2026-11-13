@@ -39,6 +39,8 @@ class StationWsBridge {
     this.onUiBranding,
     this.branding,
     this.queueCapacity = WsConnectionOutbox.defaultQueueCapacity,
+    this.pendingTtl = const Duration(seconds: 10),
+    this.pendingCapacity = 64,
   });
 
   /// 站点中枢（订阅、注册、落盘都在它这里）。
@@ -73,6 +75,18 @@ class StationWsBridge {
   /// 每条连接的投递队列上限。
   final int queueCapacity;
 
+  /// 身份建立前挂起站点请求的时限（默认 10s）。
+  ///
+  /// 身份**不再要求先于业务帧**（协议 1.1）：`ui.hello` 到达前收到的站点请求先挂起，
+  /// 绑定后按到达顺序补放。只有整个时限内都没 hello 才丢弃并逐条回
+  /// `identity_required`——既不让顺序错误丢订阅，也不给“永不握手”的连接留状态。
+  final Duration pendingTtl;
+
+  /// 身份建立前挂起队列的条数上限（默认 64）。
+  ///
+  /// 溢出只拒**该条**请求（`identity_queue_overflow`），不牵连已挂起的其它请求。
+  final int pendingCapacity;
+
   final Map<String, _UiConnectionState> _connections =
       <String, _UiConnectionState>{};
 
@@ -101,29 +115,179 @@ class StationWsBridge {
         _handleHello(connection, frame);
         return true;
       case WsInboundType.stationSubscribe:
-        _handleSubscribe(connection, frame);
-        return true;
       case WsInboundType.stationUnsubscribe:
-        _handleUnsubscribe(connection, frame);
-        return true;
       case WsInboundType.stationRegister:
-        _handleRegister(connection, frame);
-        return true;
       case WsInboundType.stationUnregister:
-        _handleUnregister(connection, frame);
-        return true;
       case WsInboundType.stationTrigger:
-        unawaited(_handleTrigger(connection, frame));
+        _handleStationFrame(connection, frame);
         return true;
       default:
         return false;
     }
   }
 
+  /// 站点请求的统一入口：身份未建立时**挂起**，建立后按到达顺序执行。
+  ///
+  /// 这是协议 1.1 的核心：顺序不再是契约的一部分（见
+  /// `docs/pluginization/ui-station-identity-root-fix.md` §3.1）。
+  void _handleStationFrame(
+    WsConnection connection,
+    Map<String, dynamic> frame,
+  ) {
+    final _UiConnectionState state = _stateFor(connection);
+    if (state.bond == null) {
+      _holdUntilIdentity(connection, state, frame);
+      return;
+    }
+    _dispatchStationFrame(connection, frame);
+  }
+
+  /// 身份已建立：交给对应的处理函数（保持原有语义与白名单）。
+  void _dispatchStationFrame(
+    WsConnection connection,
+    Map<String, dynamic> frame,
+  ) {
+    switch (frame['type']) {
+      case WsInboundType.stationSubscribe:
+        _handleSubscribe(connection, frame);
+        return;
+      case WsInboundType.stationUnsubscribe:
+        _handleUnsubscribe(connection, frame);
+        return;
+      case WsInboundType.stationRegister:
+        _handleRegister(connection, frame);
+        return;
+      case WsInboundType.stationUnregister:
+        _handleUnregister(connection, frame);
+        return;
+      case WsInboundType.stationTrigger:
+        unawaited(_handleTrigger(connection, frame));
+        return;
+    }
+  }
+
+  /// 一条连接的会话状态（首条站点帧到达时就建，不等 hello）。
+  _UiConnectionState _stateFor(WsConnection connection) =>
+      _connections.putIfAbsent(
+        connection.id,
+        () => _UiConnectionState(connection, capacity: queueCapacity),
+      );
+
+  /// 身份未建立：入队；溢出 / 已过期则当场回执拒绝（不静默丢）。
+  void _holdUntilIdentity(
+    WsConnection connection,
+    _UiConnectionState state,
+    Map<String, dynamic> frame,
+  ) {
+    final String request = _requestOf(frame);
+    final String stationId = _stationIdOf(frame);
+    if (state.identityExpired) {
+      _sendAck(
+        connection,
+        request: request,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.identityRequired,
+        message: '连接尚未完成 ui.hello，站点请求被拒绝；请先声明身份后重试',
+      );
+      return;
+    }
+    if (state.pending.length >= pendingCapacity) {
+      _sendAck(
+        connection,
+        request: request,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.identityQueueOverflow,
+        message: '身份到达前挂起的站点请求已达上限（$pendingCapacity），该请求未受理',
+      );
+      return;
+    }
+    state.pending.add(frame);
+    state.pendingTimer ??= Timer(
+      pendingTtl,
+      () => _expirePending(connection),
+    );
+  }
+
+  /// 挂起到期：逐条回 `identity_required`，之后该连接的站点请求 fail-fast。
+  void _expirePending(WsConnection connection) {
+    final _UiConnectionState? state = _connections[connection.id];
+    if (state == null || state.bond != null) return;
+    state.pendingTimer = null;
+    state.identityExpired = true;
+    final List<Map<String, dynamic>> pending = List<Map<String, dynamic>>.of(
+      state.pending,
+    );
+    state.pending.clear();
+    for (final Map<String, dynamic> frame in pending) {
+      _sendAck(
+        connection,
+        request: _requestOf(frame),
+        stationId: _stationIdOf(frame),
+        ok: false,
+        code: StationErrorCodes.identityRequired,
+        message:
+            '连接在 ${pendingTtl.inSeconds}s 内未完成 ui.hello，该站点请求已丢弃',
+      );
+    }
+  }
+
+  /// 身份建立：按到达顺序补放挂起请求。
+  void _drainPending(WsConnection connection, _UiConnectionState state) {
+    state.pendingTimer?.cancel();
+    state.pendingTimer = null;
+    if (state.pending.isEmpty) return;
+    final List<Map<String, dynamic>> pending = List<Map<String, dynamic>>.of(
+      state.pending,
+    );
+    state.pending.clear();
+    for (final Map<String, dynamic> frame in pending) {
+      _dispatchStationFrame(connection, frame);
+    }
+  }
+
+  /// 上行帧 → 回执的动作名（[StationRequestName]）。
+  String _requestOf(Map<String, dynamic> frame) => switch (frame['type']) {
+    WsInboundType.stationSubscribe => StationRequestName.subscribe,
+    WsInboundType.stationUnsubscribe => StationRequestName.unsubscribe,
+    WsInboundType.stationRegister => StationRequestName.register,
+    WsInboundType.stationUnregister => StationRequestName.unregister,
+    WsInboundType.stationTrigger => StationRequestName.trigger,
+    _ => '',
+  };
+
+  /// 请求里的站点 id（缺失 ⇒ 空串；回执仍要回，不能因此不回）。
+  String _stationIdOf(Map<String, dynamic> frame) =>
+      (_data(frame)['station_id'] ?? '').toString().trim();
+
+  /// 回一条 `station_ack`（成功也回：客户端据此确认语义已生效）。
+  void _sendAck(
+    WsConnection connection, {
+    required String request,
+    required String stationId,
+    required bool ok,
+    String code = '',
+    String message = '',
+  }) {
+    connection.send(
+      StationAck(
+        request: request,
+        stationId: stationId,
+        ok: ok,
+        code: code,
+        message: message,
+      ).toFrame(),
+    );
+  }
+
   /// 连接断开：摘掉它的全部订阅；该 UI 插件的最后一条连接断开时注销自建站。
   void onConnectionClosed(WsConnection connection) {
     final _UiConnectionState? state = _connections.remove(connection.id);
     if (state == null) return;
+    state.pendingTimer?.cancel();
+    state.pendingTimer = null;
+    state.pending.clear();
     state.outbox.dispose();
     for (final WsStationSubscriberChannel channel in state.channels.values) {
       stations.station(channel.stationId)?.unsubscribeKey(channel.subscriberKey);
@@ -278,19 +442,14 @@ class StationWsBridge {
       );
       return;
     }
-    final _UiConnectionState state = _connections.putIfAbsent(
-      connection.id,
-      () => _UiConnectionState(
-        connection,
-        capacity: queueCapacity,
-      ),
-    );
+    final _UiConnectionState state = _stateFor(connection);
     final _UiBond? existing = state.bond;
     if (existing != null && existing.pluginId != pluginId) {
       // 一条连接不能中途换身份：已有的订阅归属无法安全迁移，直接断开。
       _rejectAndClose(
         connection,
         '连接已绑定 UI 插件 ${existing.pluginId}，不能再声明为 $pluginId',
+        code: StationErrorCodes.identityConflict,
       );
       return;
     }
@@ -307,6 +466,8 @@ class StationWsBridge {
     onUiHello?.call(pluginId, windowId);
     // 品牌申报随 hello 到达：没带 branding 键 = 该插件撤回申报（回退上一条 / 默认）。
     onUiBranding?.call(pluginId, data['branding']);
+    // 协议 1.1：身份建立前挂起的站点请求，按到达顺序补放（顺序不再影响订阅）。
+    _drainPending(connection, state);
   }
 
   void _handleSubscribe(WsConnection connection, Map<String, dynamic> frame) {
@@ -315,30 +476,49 @@ class StationWsBridge {
     final Map<String, dynamic> data = _data(frame);
     final String stationId = (data['station_id'] ?? '').toString().trim();
     if (stationId.isEmpty) {
-      _sendError(connection, 'station/subscribe 缺少 station_id');
+      _sendAck(
+        connection,
+        request: StationRequestName.subscribe,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/subscribe 缺少 station_id',
+      );
       return;
     }
     final StationInstance? station = stations.pointFor(stationId);
     if (station == null) {
-      _sendError(
+      _sendAck(
         connection,
-        '站点不存在：$stationId（可用广播站见 /api/meta.stations）',
+        request: StationRequestName.subscribe,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.stationNotFound,
+        message: '站点不存在：$stationId（可用广播站见 /api/meta.stations）',
       );
       return;
     }
     if (station.kind != StationKind.broadcast) {
       // 白名单：中转 / 执行 / 收集站对 WS 一律不可订阅，原因必须可读。
-      _sendError(
+      _sendAck(
         connection,
-        '站点 $stationId 是${station.kind.label}，WS 侧只允许订阅广播站',
+        request: StationRequestName.subscribe,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.notBroadcast,
+        message: '站点 $stationId 是${station.kind.label}，WS 侧只允许订阅广播站',
       );
       return;
     }
     final StationScope scope = StationScope.parse(data['scope']);
     if (!scope.isValidSubscriber) {
-      _sendError(
+      _sendAck(
         connection,
-        '订阅 scope 非法：mode_key 只能是 local | ssh，或留空表示通配',
+        request: StationRequestName.subscribe,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.scopeInvalid,
+        message: '订阅 scope 非法：mode_key 只能是 local | ssh，或留空表示通配',
       );
       return;
     }
@@ -352,7 +532,14 @@ class StationWsBridge {
     final String key = subscriber.key;
     final _UiConnectionState? state = _connections[connection.id];
     if (state == null) {
-      _sendError(connection, '连接状态已失效，请重新 ui.hello');
+      _sendAck(
+        connection,
+        request: StationRequestName.subscribe,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.identityRequired,
+        message: '连接状态已失效，请重新 ui.hello',
+      );
       return;
     }
     final WsStationSubscriberChannel? old = state.channels[key];
@@ -378,7 +565,14 @@ class StationWsBridge {
     );
     if (!result.ok) {
       channel.dispose();
-      _sendError(connection, result.error, code: result.code);
+      _sendAck(
+        connection,
+        request: StationRequestName.subscribe,
+        stationId: stationId,
+        ok: false,
+        code: _mapSubscribeErrorCode(result.code),
+        message: result.error,
+      );
       return;
     }
     state.channels[key] = channel;
@@ -390,6 +584,13 @@ class StationWsBridge {
       // 重逢同一订阅（窗口主动重订 / 重连后的同键订阅）：旧通道已换新，seq 从 1 重新开始。
       log?.call('UI 复用订阅 ${station.id}（channel=${channel.channelId}），seq 重新计数');
     }
+    // 成功回执先于 reset：客户端先确认“订阅语义已生效”，再拿水位基线。
+    _sendAck(
+      connection,
+      request: StationRequestName.subscribe,
+      stationId: stationId,
+      ok: true,
+    );
     // **每条新通道都要发 reset**：seq 是「每个 WS 通道」的计数器，新通道天生从 1 开始。
     // 只在 `old != null` 时发会让「断线重连」这条最常见的路径漏掉 reset——
     // UI 还留着断线前的水位（例如 42），重连后收到 1..42 会被当作重复帧丢掉
@@ -403,11 +604,28 @@ class StationWsBridge {
     final Map<String, dynamic> data = _data(frame);
     final String stationId = (data['station_id'] ?? '').toString().trim();
     if (stationId.isEmpty) {
-      _sendError(connection, 'station/unsubscribe 缺少 station_id');
+      _sendAck(
+        connection,
+        request: StationRequestName.unsubscribe,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/unsubscribe 缺少 station_id',
+      );
       return;
     }
     final _UiConnectionState? state = _connections[connection.id];
-    if (state == null) return;
+    if (state == null) {
+      _sendAck(
+        connection,
+        request: StationRequestName.unsubscribe,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.identityRequired,
+        message: '连接状态已失效，请重新 ui.hello',
+      );
+      return;
+    }
     final List<WsStationSubscriberChannel> removed = state.channels.values
         .where((WsStationSubscriberChannel c) => c.stationId == stationId)
         .toList();
@@ -417,6 +635,13 @@ class StationWsBridge {
       _forgetChannel(channel);
       state.channels.remove(channel.subscriberKey);
     }
+    // 退订是幂等的：没有该站的通道也算成功（客户端据此停掉重试）。
+    _sendAck(
+      connection,
+      request: StationRequestName.unsubscribe,
+      stationId: stationId,
+      ok: true,
+    );
   }
 
   void _handleRegister(WsConnection connection, Map<String, dynamic> frame) {
@@ -426,23 +651,38 @@ class StationWsBridge {
     final String kindRaw = (data['kind'] ?? '').toString().trim();
     final StationKind? kind = StationKind.fromWire(kindRaw);
     if (kind == null) {
-      _sendError(
+      _sendAck(
         connection,
-        'station/register 需要合法的 kind（WS 侧只允许 broadcast，收到「$kindRaw」）',
+        request: StationRequestName.register,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/register 需要合法的 kind（WS 侧只允许 broadcast，收到「$kindRaw」）',
       );
       return;
     }
     if (kind != StationKind.broadcast) {
-      _sendError(
+      _sendAck(
         connection,
-        'WS 侧只允许注册广播站；${kind.label}不能在 UI 侧自建',
+        request: StationRequestName.register,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.notBroadcast,
+        message: 'WS 侧只允许注册广播站；${kind.label}不能在 UI 侧自建',
       );
       return;
     }
     final String name = (data['name'] ?? '').toString().trim();
     final String? nameError = StationHubIds.selfBuiltNameError(name);
     if (nameError != null) {
-      _sendError(connection, nameError);
+      _sendAck(
+        connection,
+        request: StationRequestName.register,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: nameError,
+      );
       return;
     }
     final String stationId = 'plugin.${bond.pluginId}.${kind.wire}.$name';
@@ -459,11 +699,25 @@ class StationWsBridge {
     final StationInstance? existing = stations.station(stationId);
     if (existing != null) {
       if (existing.kind != StationKind.broadcast) {
-        _sendError(connection, '站点 id 已被非广播站占用：$stationId');
+        _sendAck(
+          connection,
+          request: StationRequestName.register,
+          stationId: stationId,
+          ok: false,
+          code: StationErrorCodes.notBroadcast,
+          message: '站点 id 已被非广播站占用：$stationId',
+        );
         return;
       }
       if (!_owns(bond.pluginId, stationId)) {
-        _sendError(connection, '站点 id 已被其它插件占用：$stationId');
+        _sendAck(
+          connection,
+          request: StationRequestName.register,
+          stationId: stationId,
+          ok: false,
+          code: StationErrorCodes.notOwner,
+          message: '站点 id 已被其它插件占用：$stationId',
+        );
         return;
       }
       // 同 id 幂等：配置必须一致；不同配置可读拒收（不允许静默改写别人的站）。
@@ -476,21 +730,35 @@ class StationWsBridge {
           existing.allowedPlugins.length != allowedPlugins.length ||
           !_sameList(existing.allowedPlugins, allowedPlugins) ||
           !_sameMap(existing.config, stationConfig)) {
-        _sendError(
+        _sendAck(
           connection,
-          '站点 $stationId 已存在且配置不同；同 id 注册只允许幂等（原站点保持不变）',
+          request: StationRequestName.register,
+          stationId: stationId,
+          ok: false,
+          code: StationErrorCodes.subscribeRejected,
+          message: '站点 $stationId 已存在且配置不同；同 id 注册只允许幂等（原站点保持不变）',
         );
         return;
       }
       _ownedStations
           .putIfAbsent(bond.pluginId, () => <String>{})
           .add(stationId);
+      _sendAck(
+        connection,
+        request: StationRequestName.register,
+        stationId: stationId,
+        ok: true,
+      );
       return;
     }
     if (readme.isEmpty) {
-      _sendError(
+      _sendAck(
         connection,
-        'station/register 需要 readme（站点介绍，必填）：这个站干什么、什么时候被触发、订阅者该怎么回',
+        request: StationRequestName.register,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/register 需要 readme（站点介绍，必填）：这个站干什么、什么时候被触发、订阅者该怎么回',
       );
       return;
     }
@@ -506,7 +774,14 @@ class StationWsBridge {
       ),
     );
     if (error != null) {
-      _sendError(connection, error);
+      _sendAck(
+        connection,
+        request: StationRequestName.register,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.subscribeRejected,
+        message: error,
+      );
       return;
     }
     _ownedStations
@@ -517,6 +792,12 @@ class StationWsBridge {
       () => <WsStationSubscriberChannel>{},
     );
     log?.call('UI 插件 ${bond.pluginId} 注册自建广播站 $stationId');
+    _sendAck(
+      connection,
+      request: StationRequestName.register,
+      stationId: stationId,
+      ok: true,
+    );
   }
 
   void _handleUnregister(WsConnection connection, Map<String, dynamic> frame) {
@@ -525,23 +806,39 @@ class StationWsBridge {
     final Map<String, dynamic> data = _data(frame);
     final String stationId = (data['station_id'] ?? '').toString().trim();
     if (stationId.isEmpty) {
-      _sendError(connection, 'station/unregister 缺少 station_id');
+      _sendAck(
+        connection,
+        request: StationRequestName.unregister,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/unregister 缺少 station_id',
+      );
       return;
     }
     if (!_owns(bond.pluginId, stationId)) {
-      _sendError(
+      _sendAck(
         connection,
-        '站点 $stationId 不是插件 ${bond.pluginId} 在 UI 侧注册的自建站，拒绝注销',
+        request: StationRequestName.unregister,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.notOwner,
+        message: '站点 $stationId 不是插件 ${bond.pluginId} 在 UI 侧注册的自建站，拒绝注销',
       );
       return;
     }
     final Set<String>? owned = _ownedStations[bond.pluginId];
     owned?.remove(stationId);
-    if (!stations.unregister(stationId)) {
-      // 幂等：已经不在了也当成功（站点移除钩子不会触发，无需补 closed）。
-      return;
+    if (stations.unregister(stationId)) {
+      log?.call('UI 插件 ${bond.pluginId} 注销自建广播站 $stationId');
     }
-    log?.call('UI 插件 ${bond.pluginId} 注销自建广播站 $stationId');
+    // 幂等：已经不在了也当成功（站点移除钩子不会触发，无需补 closed）。
+    _sendAck(
+      connection,
+      request: StationRequestName.unregister,
+      stationId: stationId,
+      ok: true,
+    );
   }
 
   Future<void> _handleTrigger(
@@ -553,35 +850,71 @@ class StationWsBridge {
     final Map<String, dynamic> data = _data(frame);
     final String stationId = (data['station_id'] ?? '').toString().trim();
     if (stationId.isEmpty) {
-      _sendError(connection, 'station/trigger 缺少 station_id');
+      _sendAck(
+        connection,
+        request: StationRequestName.trigger,
+        stationId: '',
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/trigger 缺少 station_id',
+      );
       return;
     }
     final StationInstance? station = stations.station(stationId);
     if (station == null) {
-      _sendError(connection, '站点不存在：$stationId');
+      _sendAck(
+        connection,
+        request: StationRequestName.trigger,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.stationNotFound,
+        message: '站点不存在：$stationId',
+      );
       return;
     }
     if (station.kind != StationKind.broadcast) {
-      _sendError(
+      _sendAck(
         connection,
-        '站点 $stationId 是${station.kind.label}；WS 侧只能触发自己注册的广播站',
+        request: StationRequestName.trigger,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.notBroadcast,
+        message: '站点 $stationId 是${station.kind.label}；WS 侧只能触发自己注册的广播站',
       );
       return;
     }
     if (!_owns(bond.pluginId, stationId)) {
-      _sendError(
+      _sendAck(
         connection,
-        '站点 $stationId 不是插件 ${bond.pluginId} 注册的自建广播站，拒绝触发',
+        request: StationRequestName.trigger,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.notOwner,
+        message: '站点 $stationId 不是插件 ${bond.pluginId} 注册的自建广播站，拒绝触发',
       );
       return;
     }
     if (station is! BroadcastStation) {
-      _sendError(connection, '站点 $stationId 不是广播站，拒绝触发');
+      _sendAck(
+        connection,
+        request: StationRequestName.trigger,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.notBroadcast,
+        message: '站点 $stationId 不是广播站，拒绝触发',
+      );
       return;
     }
     final String topic = (data['topic'] ?? '').toString().trim();
     if (topic.isEmpty) {
-      _sendError(connection, 'station/trigger 缺少 topic');
+      _sendAck(
+        connection,
+        request: StationRequestName.trigger,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.invalidRequest,
+        message: 'station/trigger 缺少 topic',
+      );
       return;
     }
     final StationScope scope = StationScope.parse(data['scope']);
@@ -599,13 +932,24 @@ class StationWsBridge {
     );
     if (result.boardSeq == 0) {
       // 消息信封不可证明归属（团队为空 / mode 非法）或站点被禁用：可读拒绝。
-      _sendError(
+      _sendAck(
         connection,
-        result.skipped.isEmpty
+        request: StationRequestName.trigger,
+        stationId: stationId,
+        ok: false,
+        code: StationErrorCodes.broadcastRejected,
+        message: result.skipped.isEmpty
             ? '广播被拒：消息 scope 不可证明归属（team_id 必填、mode_key ∈ local | ssh）'
             : result.skipped.join('；'),
       );
+      return;
     }
+    _sendAck(
+      connection,
+      request: StationRequestName.trigger,
+      stationId: stationId,
+      ok: true,
+    );
   }
 
   // ── 内部 ────────────────────────────────────────────────────────────
@@ -617,11 +961,20 @@ class StationWsBridge {
       _sendError(
         connection,
         '连接尚未完成 ui.hello，不能$action；请先声明 {plugin_id, version, capabilities[]}',
+        code: StationErrorCodes.identityRequired,
       );
       return null;
     }
     return bond;
   }
+
+  /// 站点侧内部错误码 → 协议稳定码（不让两套词表同时暴露给客户端）。
+  String _mapSubscribeErrorCode(String internal) => switch (internal) {
+    'no_station' => StationErrorCodes.stationNotFound,
+    'invalid_scope' => StationErrorCodes.scopeInvalid,
+    'not_subscribable' => StationErrorCodes.notBroadcast,
+    _ => StationErrorCodes.subscribeRejected,
+  };
 
   bool _owns(String pluginId, String stationId) {
     if (StationHubIds.all.contains(stationId)) return false;
@@ -705,8 +1058,12 @@ class StationWsBridge {
     });
   }
 
-  void _rejectAndClose(WsConnection connection, String error) {
-    _sendError(connection, error);
+  void _rejectAndClose(
+    WsConnection connection,
+    String error, {
+    String code = '',
+  }) {
+    _sendError(connection, error, code: code);
     log?.call(error);
     unawaited(_closeSocket(connection, error));
   }
@@ -814,6 +1171,16 @@ class _UiConnectionState {
   final WsConnection connection;
   final WsConnectionOutbox outbox;
   _UiBond? bond;
+
+  /// 身份建立前挂起的站点请求（按到达顺序补放）。
+  final List<Map<String, dynamic>> pending = <Map<String, dynamic>>[];
+
+  /// 挂起队列的到期计时器（首条入队启动；hello / 关闭 / 到期取消）。
+  Timer? pendingTimer;
+
+  /// TTL 到期仍未 hello：之后的站点请求 fail-fast（不再排队）。
+  bool identityExpired = false;
+
   final Map<String, WsStationSubscriberChannel> channels =
       <String, WsStationSubscriberChannel>{};
 }

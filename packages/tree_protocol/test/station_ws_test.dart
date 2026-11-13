@@ -11,12 +11,13 @@ void main() {
       expect(StationWsFrames.unregister, 'station/unregister');
       expect(StationWsFrames.trigger, 'station/trigger');
       expect(StationWsFrames.delivery, 'station_delivery');
+      expect(StationWsFrames.ack, 'station_ack');
 
       expect(WsInboundType.all, containsAll(StationWsFrames.inbound));
       expect(WsOutboundType.all, containsAll(StationWsFrames.outbound));
       expect(StationWsFrames.inbound, hasLength(6));
-      expect(StationWsFrames.outbound, hasLength(1));
-      expect(StationWsFrames.all, hasLength(7));
+      expect(StationWsFrames.outbound, hasLength(2));
+      expect(StationWsFrames.all, hasLength(8));
     });
 
     test('上行与下行站点帧不重叠', () {
@@ -24,6 +25,67 @@ void main() {
         StationWsFrames.inbound.intersection(StationWsFrames.outbound),
         isEmpty,
       );
+    });
+  });
+
+  group('StationAck（协议 1.1）', () {
+    test('成功回执平铺解码；失败带稳定码与可读文案', () {
+      final StationAck ok = StationAck.fromFrame(<String, dynamic>{
+        'type': 'station_ack',
+        'request': 'subscribe',
+        'station_id': 'plugin.tree.agent.broadcast.events',
+        'ok': true,
+      })!;
+      expect(ok.request, StationRequestName.subscribe);
+      expect(ok.stationId, 'plugin.tree.agent.broadcast.events');
+      expect(ok.ok, isTrue);
+      expect(ok.code, isEmpty);
+      expect(ok.toFrame(), <String, dynamic>{
+        'type': 'station_ack',
+        'request': 'subscribe',
+        'station_id': 'plugin.tree.agent.broadcast.events',
+        'ok': true,
+      });
+
+      final StationAck failed = StationAck.fromFrame(<String, dynamic>{
+        'type': 'station_ack',
+        'data': <String, dynamic>{
+          'request': 'subscribe',
+          'station_id': 'plugin.tree.agent.broadcast.events',
+          'ok': false,
+          'code': StationErrorCodes.stationNotFound,
+          'message': '站点不存在',
+        },
+      })!;
+      expect(failed.ok, isFalse);
+      expect(failed.code, 'station_not_found');
+      expect(failed.message, '站点不存在');
+      expect(
+        StationAck.fromFrame(<String, dynamic>{'type': 'station_delivery'}),
+        isNull,
+      );
+    });
+
+    test('动作名与错误码集合稳定（客户端按码决策，不匹配文案）', () {
+      expect(StationRequestName.all, <String>{
+        'subscribe',
+        'unsubscribe',
+        'register',
+        'unregister',
+        'trigger',
+      });
+      expect(StationErrorCodes.all, <String>{
+        'identity_required',
+        'identity_queue_overflow',
+        'identity_conflict',
+        'station_not_found',
+        'not_broadcast',
+        'scope_invalid',
+        'not_owner',
+        'invalid_request',
+        'subscribe_rejected',
+        'broadcast_rejected',
+      });
     });
   });
 

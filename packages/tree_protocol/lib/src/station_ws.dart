@@ -42,6 +42,9 @@ abstract final class StationWsFrames {
   /// 站点投递（下行）。
   static const String delivery = WsOutboundType.stationDelivery;
 
+  /// 站点请求回执（下行，协议 1.1）。
+  static const String ack = WsOutboundType.stationAck;
+
   /// 全部 WS 站点帧名。
   static const Set<String> all = <String>{
     uiHello,
@@ -51,6 +54,7 @@ abstract final class StationWsFrames {
     unregister,
     trigger,
     delivery,
+    ack,
   };
 
   /// 上行（UI → 核心）。
@@ -64,7 +68,7 @@ abstract final class StationWsFrames {
   };
 
   /// 下行（核心 → UI）。
-  static const Set<String> outbound = <String>{delivery};
+  static const Set<String> outbound = <String>{delivery, ack};
 }
 
 /// `station_delivery.state` 的取值（§6.7 / 不变量 32）。
@@ -239,6 +243,152 @@ class StationDelivery {
   String toString() =>
       'StationDelivery(${stationId.toString()}, state=${state.wire}, '
       'topic=${topic ?? '-'}, seq=${seq ?? '-'})';
+}
+
+/// `station_ack.request` 的取值（**裸动作名**）。
+///
+/// 为什么不复用 [StationWsFrames] 的 `station/*`：那五个是**上行方法名**，回执里
+/// 要知道的是“哪一类动作被回执”，用裸名让回执本身不依赖请求帧的字面量。
+abstract final class StationRequestName {
+  /// 订阅广播站。
+  static const String subscribe = 'subscribe';
+
+  /// 退订广播站。
+  static const String unsubscribe = 'unsubscribe';
+
+  /// 注册自建广播站。
+  static const String register = 'register';
+
+  /// 注销自建广播站。
+  static const String unregister = 'unregister';
+
+  /// 向自建广播站发布事件。
+  static const String trigger = 'trigger';
+
+  /// 全部取值（完备性测试与文档用）。
+  static const Set<String> all = <String>{
+    subscribe,
+    unsubscribe,
+    register,
+    unregister,
+    trigger,
+  };
+}
+
+/// 站点面**稳定错误码**（`station_ack.code`）。
+///
+/// 客户端按它做决策（是否重试），**不得**靠 `message` 文本匹配。新增码只能追加；
+/// 核心内部既有码（`no_station` / `invalid_scope` 等）在出站处映射到本表。
+abstract final class StationErrorCodes {
+  /// 连接尚未完成 `ui.hello`，且挂起队列已到期。
+  static const String identityRequired = 'identity_required';
+
+  /// 身份建立前的挂起队列溢出：该条请求未被受理。
+  static const String identityQueueOverflow = 'identity_queue_overflow';
+
+  /// 同一连接声称了两个不同的插件身份。
+  static const String identityConflict = 'identity_conflict';
+
+  /// 站点还不存在（插件未注册 / 未安装）。
+  static const String stationNotFound = 'station_not_found';
+
+  /// WS 侧只允许广播站。
+  static const String notBroadcast = 'not_broadcast';
+
+  /// scope 非法（`mode_key` 只能是 local / ssh，或留空通配）。
+  static const String scopeInvalid = 'scope_invalid';
+
+  /// 触发 / 注销的不是自己注册的自建站。
+  static const String notOwner = 'not_owner';
+
+  /// 请求缺必填字段（`station_id` / `topic` / `kind` …）。
+  static const String invalidRequest = 'invalid_request';
+
+  /// 站点侧拒绝（订阅上限、配置不一致等；具体原因看 `message`）。
+  static const String subscribeRejected = 'subscribe_rejected';
+
+  /// 广播被拒（scope 不可证明归属 / 站点被禁用）。
+  static const String broadcastRejected = 'broadcast_rejected';
+
+  /// 全部取值（完备性测试与文档用）。
+  static const Set<String> all = <String>{
+    identityRequired,
+    identityQueueOverflow,
+    identityConflict,
+    stationNotFound,
+    notBroadcast,
+    scopeInvalid,
+    notOwner,
+    invalidRequest,
+    subscribeRejected,
+    broadcastRejected,
+  };
+}
+
+/// `station_ack` 帧的值对象（核心 → 请求方，协议 1.1）。
+///
+/// 线格式（**平铺**，与 `station_delivery` 同风格）：
+/// ```json
+/// {"type":"station_ack","request":"subscribe",
+///  "station_id":"plugin.tree.agent.broadcast.events","ok":true}
+/// ```
+/// 失败时带 `code`（[StationErrorCodes]）与可读 `message`。
+class StationAck {
+  const StationAck({
+    required this.request,
+    required this.stationId,
+    required this.ok,
+    this.code = '',
+    this.message = '',
+  });
+
+  /// 被回执的动作（[StationRequestName]）。
+  final String request;
+
+  /// 请求里的站点 id（缺失时为空串）。
+  final String stationId;
+
+  /// 是否受理成功。
+  final bool ok;
+
+  /// 稳定错误码（成功时为空串）。
+  final String code;
+
+  /// 可读解释（成功时为空串）。
+  final String message;
+
+  /// 从完整 WS 帧解析（`type` 不匹配返回 null）。
+  ///
+  /// 兼容顶层平铺与 `data` 包裹两种承载（与 [StationDelivery.fromFrame] 同口径）。
+  static StationAck? fromFrame(Map<String, dynamic> frame) {
+    if (frame['type'] != StationWsFrames.ack) return null;
+    final Object? data = frame['data'];
+    final Map<String, dynamic> json = data is Map
+        ? Map<String, dynamic>.from(data)
+        : frame;
+    return StationAck(
+      request: _asString(json['request']),
+      stationId: _asString(json['station_id']),
+      ok: json['ok'] == true,
+      code: _asString(json['code']),
+      message: _asString(json['message']),
+    );
+  }
+
+  /// 完整 WS 帧（平铺）。
+  Map<String, dynamic> toFrame() => <String, dynamic>{
+    'type': StationWsFrames.ack,
+    'request': request,
+    'station_id': stationId,
+    'ok': ok,
+    if (code.isNotEmpty) 'code': code,
+    if (message.isNotEmpty) 'message': message,
+  };
+
+  @override
+  String toString() =>
+      'StationAck($request, ${stationId.isEmpty ? '-' : stationId}, ok=$ok'
+      '${code.isEmpty ? '' : ', code=$code'})';
 }
 
 /// **topic 约定**：`<plugin_id>.<session_id>.<kind>`（设计文档 §6.7）。

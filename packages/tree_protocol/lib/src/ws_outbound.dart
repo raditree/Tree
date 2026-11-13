@@ -108,6 +108,14 @@ abstract final class WsOutboundType {
   /// 风格的方法名（见 `ws_inbound.dart`），两者不是同一套命名习惯。
   static const String stationDelivery = 'station_delivery';
 
+  /// 站点请求回执（核心 → WS 请求方，协议 1.1 新增）。
+  ///
+  /// 帧形状：`{type, request, station_id, ok, code?, message?}`。每条上行站点请求
+  /// （`station/subscribe|unsubscribe|register|unregister|trigger`）**恰好**回一条；
+  /// 成功也回（客户端据此确认语义已生效），失败按 [StationErrorCodes] 决策是否重试。
+  /// 行格式与 [stationDelivery] 同为平铺 snake_case。
+  static const String stationAck = 'station_ack';
+
   // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
   // 值复用 [TerminalOutboundType.*]（**别名**，不重复字面量），见 terminal.dart。
 
@@ -147,6 +155,7 @@ abstract final class WsOutboundType {
     pluginStatus,
     pluginConfigChanged,
     stationDelivery,
+    stationAck,
     terminalReady,
     terminalOutput,
     terminalExit,

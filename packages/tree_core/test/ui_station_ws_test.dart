@@ -141,8 +141,11 @@ plugins:
         log: (_) {},
       );
       server = await CoreServer.start(
-          enableHeartbeat: false,
+        enableHeartbeat: false,
         pluginBus: bus,
+        // 协议 1.1：挂起队列的时限 / 上限调小，便于在同一用例里验证补放与拒绝。
+        stationPendingTtl: const Duration(milliseconds: 500),
+        stationPendingCapacity: 3,
       );
       client = _Client(server);
     });
@@ -267,36 +270,65 @@ plugins:
       expect((data['scope'] as Map<String, dynamic>)['team_id'], 'team-1');
     });
 
-    test('订中转 / 执行 / 收集站被拒；未 ui.hello 被拒；未知 plugin_id 被拒', () async {
+    test('协议 1.1：身份前到达的订阅 / 注册被挂起，hello 后按序补放并回执', () async {
       final _WsClient ws = await _connect(server);
       sockets.add(ws);
 
-      // 未 hello：可读拒绝。
+      // 故意把业务帧发在 hello 之前（known-issues #49 的原始顺序）。
       ws.send(<String, dynamic>{
         'type': WsInboundType.stationSubscribe,
-        'data': <String, dynamic>{'station_id': 'system.broadcast'},
+        'data': <String, dynamic>{
+          'station_id': 'system.broadcast',
+          'scope': <String, dynamic>{},
+        },
       });
-      await ws.until(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.error &&
-            ((f['data'] as Map<String, dynamic>)['error'] as String).contains('ui.hello'),
-        reason: '未握手拒绝',
-      );
-      // 未握手同样不允许注册自建站（同一身份闸门）。
       ws.send(<String, dynamic>{
         'type': WsInboundType.stationRegister,
-        'data': <String, dynamic>{'kind': 'broadcast', 'name': 'nope', 'readme': 'x'},
+        'data': <String, dynamic>{
+          'kind': 'broadcast',
+          'name': 'notice',
+          'readme': '挂起补放',
+        },
       });
-      await ws.until(
-        (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.error &&
-            ws.frames.where((Map<String, dynamic> x) => x['type'] == WsOutboundType.error).length >= 2,
-        reason: '未握手不能注册',
+      await settle();
+      expect(
+        ws.frames.where(
+          (Map<String, dynamic> f) => f['type'] == WsOutboundType.error,
+        ),
+        isEmpty,
+        reason: '身份未到时不得以 error 拒收（必须挂起）',
       );
 
       ws.send(_hello('ui.alpha'));
-      await settle();
+      await awaitSubscribed(ws, 'system.broadcast');
+      await waitUntil(
+        () => bus.stations.station('plugin.ui.alpha.broadcast.notice') != null,
+        reason: '挂起的注册请求被补放',
+      );
+      final List<Map<String, dynamic>> acks = ws.frames
+          .where(
+            (Map<String, dynamic> f) =>
+                f['type'] == WsOutboundType.stationAck,
+          )
+          .toList();
+      expect(
+        acks.any(
+          (Map<String, dynamic> f) =>
+              f['request'] == StationRequestName.subscribe && f['ok'] == true,
+        ),
+        isTrue,
+        reason: '订阅成功必须有回执',
+      );
+      expect(
+        acks.any(
+          (Map<String, dynamic> f) =>
+              f['request'] == StationRequestName.register && f['ok'] == true,
+        ),
+        isTrue,
+        reason: '注册成功必须有回执',
+      );
 
+      // 白名单仍生效：中转 / 执行 / 收集站一律 not_broadcast（失败也回执）。
       for (final String stationId in <String>[
         StationHubIds.relayToolPre,
         StationHubIds.executePlugin,
@@ -304,37 +336,97 @@ plugins:
       ]) {
         ws.send(<String, dynamic>{
           'type': WsInboundType.stationSubscribe,
-          'data': <String, dynamic>{'station_id': stationId, 'scope': <String, dynamic>{}},
+          'data': <String, dynamic>{
+            'station_id': stationId,
+            'scope': <String, dynamic>{},
+          },
         });
-        // 逐站等待**点名本站**的拒绝：只等「错误数达到 N」会与前面两条未握手
-        // 拒绝提前凑数，导致本轮第三条拒绝还没到就断言（竞态）。
         await ws.until(
           (Map<String, dynamic> f) =>
-              f['type'] == WsOutboundType.error &&
-              ((f['data'] as Map<String, dynamic>)['error'] as String)
-                  .contains(stationId),
+              f['type'] == WsOutboundType.stationAck &&
+              f['station_id'] == stationId &&
+              f['ok'] == false,
           reason: '$stationId 拒绝',
         );
+        expect(
+          ws.frames.lastWhere(
+            (Map<String, dynamic> f) =>
+                f['type'] == WsOutboundType.stationAck &&
+                f['station_id'] == stationId,
+          )['code'],
+          StationErrorCodes.notBroadcast,
+        );
       }
-      final List<String> errors = ws.frames
-          .where((Map<String, dynamic> f) => f['type'] == WsOutboundType.error)
-          .map((Map<String, dynamic> f) => (f['data'] as Map<String, dynamic>)['error'] as String)
-          .toList();
-      expect(errors.where((String e) => e.contains('广播站')).length, 3);
-      expect(errors.every((String e) => e.trim().isNotEmpty), isTrue);
+    });
 
-      // 未知 plugin_id：error 后关闭连接。
+    test('身份超时：挂起请求逐条回 identity_required；hello 后可重发', () async {
+      final _WsClient ws = await _connect(server);
+      sockets.add(ws);
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.stationSubscribe,
+        'data': <String, dynamic>{
+          'station_id': 'system.broadcast',
+          'scope': <String, dynamic>{},
+        },
+      });
+      await ws.until(
+        (Map<String, dynamic> f) =>
+            f['type'] == WsOutboundType.stationAck &&
+            f['ok'] == false &&
+            f['code'] == StationErrorCodes.identityRequired,
+        reason: 'TTL 到期拒绝',
+      );
+
+      ws.send(_hello('ui.alpha'));
+      ws.send(<String, dynamic>{
+        'type': WsInboundType.stationSubscribe,
+        'data': <String, dynamic>{
+          'station_id': 'system.broadcast',
+          'scope': <String, dynamic>{},
+        },
+      });
+      await awaitSubscribed(ws, 'system.broadcast');
+    });
+
+    test('挂起队列溢出：超上限的那条回 identity_queue_overflow，不牵连已挂起请求', () async {
+      final _WsClient ws = await _connect(server);
+      sockets.add(ws);
+      for (int i = 0; i < 4; i++) {
+        ws.send(<String, dynamic>{
+          'type': WsInboundType.stationSubscribe,
+          'data': <String, dynamic>{
+            'station_id': 'system.broadcast',
+            'scope': <String, dynamic>{},
+          },
+        });
+      }
+      await ws.until(
+        (Map<String, dynamic> f) =>
+            f['type'] == WsOutboundType.stationAck &&
+            f['ok'] == false &&
+            f['code'] == StationErrorCodes.identityQueueOverflow,
+        reason: '溢出拒绝',
+      );
+
+      ws.send(_hello('ui.alpha'));
+      await awaitSubscribed(ws, 'system.broadcast');
+    });
+
+    test('未知 plugin_id：error 后关闭连接', () async {
       final _WsClient ghost = await _connect(server);
       sockets.add(ghost);
       ghost.send(_hello('ui.ghost'));
       await ghost.until(
         (Map<String, dynamic> f) =>
             f['type'] == WsOutboundType.error &&
-            ((f['data'] as Map<String, dynamic>)['error'] as String).contains('plugins.yaml'),
+            ((f['data'] as Map<String, dynamic>)['error'] as String).contains(
+              'plugins.yaml',
+            ),
         reason: '未知 plugin_id 拒绝',
       );
       expect(
-        ((ghost.frames.first['data'] as Map<String, dynamic>)['error'] as String).trim(),
+        ((ghost.frames.first['data'] as Map<String, dynamic>)['error'] as String)
+            .trim(),
         isNotEmpty,
       );
       await ghost.closed;
@@ -482,13 +574,13 @@ plugins:
       });
       await settle();
       final String stationId = 'plugin.ui.alpha.broadcast.notice';
-      // 注册成功没有确认帧，只能轮询核心状态（挂钟等待在满负载跑全量时会假红）。
+      // 注册成功现在有回执（协议 1.1），但仍轮询核心状态兜住帧时序。
       await waitUntil(
         () => bus.stations.station(stationId) != null,
         reason: '广播自建站注册到位',
       );
 
-      // 收集 / 执行：WS 侧不允许。
+      // 收集 / 执行：WS 侧不允许（失败也走 station_ack）。
       for (final String kind in <String>['collect', 'execute', 'relay']) {
         a.send(<String, dynamic>{
           'type': WsInboundType.stationRegister,
@@ -497,8 +589,17 @@ plugins:
       }
       await a.until(
         (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.error &&
-            a.frames.where((Map<String, dynamic> x) => x['type'] == WsOutboundType.error).length >= 3,
+            f['type'] == WsOutboundType.stationAck &&
+            f['request'] == StationRequestName.register &&
+            f['ok'] == false &&
+            a.frames
+                    .where(
+                      (Map<String, dynamic> x) =>
+                          x['type'] == WsOutboundType.stationAck &&
+                          x['ok'] == false,
+                    )
+                    .length >=
+                3,
         reason: '非广播 kind 拒绝',
       );
 
@@ -654,9 +755,18 @@ plugins:
       });
       await alpha.until(
         (Map<String, dynamic> f) =>
-            f['type'] == WsOutboundType.error &&
-            ((f['data'] as Map<String, dynamic>)['error'] as String).contains('不是插件 ui.alpha'),
+            f['type'] == WsOutboundType.stationAck &&
+            f['request'] == StationRequestName.trigger &&
+            f['ok'] == false,
         reason: '不能触发别人的自建站',
+      );
+      expect(
+        alpha.frames.lastWhere(
+          (Map<String, dynamic> f) =>
+              f['type'] == WsOutboundType.stationAck &&
+              f['request'] == StationRequestName.trigger,
+        )['code'],
+        StationErrorCodes.notOwner,
       );
     });
   });

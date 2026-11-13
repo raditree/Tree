@@ -10,7 +10,7 @@
 /// {
 ///   "core_version": "1.0.4",
 ///   "api_version": "1.0",
-///   "ui_contract": "1.0",
+///   "ui_contract": "1.1",
 ///   "ui": [
 ///     { "plugin_id": "tree_ui_default", "version": "1.0.0",
 ///       "capabilities": ["plugin.manage"], "connections": 2 }
@@ -41,7 +41,9 @@ library;
 ///    破坏性变更换新路径或新帧名，并升这个版本号；
 /// 2. **黑盒一致性套件**：`packages/tree_core/test/ui_contract_blackbox_test.dart`
 ///    用字面量把五条链路钉住（流式 / 工具卡 / 终端 / 站点重连 / 插件面板）。
-const String treeUiContractVersion = '1.0';
+/// 1.1：站点身份「可晚到」+ `station_ack` 回执 + 稳定错误码
+/// （见 `docs/pluginization/ui-station-identity-root-fix.md`）。
+const String treeUiContractVersion = '1.1';
 
 /// `/api/meta` 回包。
 class ApiMeta {
