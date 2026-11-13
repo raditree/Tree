@@ -35,6 +35,17 @@ void main() {
   late List<String> logs;
   late PluginBus bus;
 
+  /// 这组用例要跑插件仓里的**真源码入口**（`plugins/self_updater`）：插件仓是
+  /// 独立 git 仓，没检出 / 没 `pub get` 时整组**可见跳过**（远端/单仓环境不该因此
+  /// 变红）；`TREE_REQUIRE_PLUGIN_REPO=1` 时**不跳过**，交给 setUp 的断言报出
+  /// 具体缺什么（桌面仓 CI 已设，保证有仓必须真跑）。
+  final String? pluginReproSkip = _pluginToolSkipReason();
+  void crossRepoTest(
+    String description,
+    Future<void> Function() body, {
+    Timeout? timeout,
+  }) => test(description, body, skip: pluginReproSkip, timeout: timeout);
+
   setUp(() {
     temp = Directory.systemTemp.createTempSync('tree_self_restart_');
     logs = <String>[];
@@ -188,7 +199,7 @@ void main() {
 
   // ── 用例 ───────────────────────────────────────────────────────────────
 
-  test('自重启：目标就是发起者 ⇒ 先应答再动手，随后真的换了一世并续上快照', () async {
+  crossRepoTest('自重启：目标就是发起者 ⇒ 先应答再动手，随后真的换了一世并续上快照', () async {
     await startBus(<String>[...selfUpdaterEntry()]);
     expect(bus.generationOf(kSelfUpdaterPluginId), 1);
     expect(bus.lifecycleOf(kSelfUpdaterPluginId), PluginLifecycleState.ready);
@@ -254,7 +265,7 @@ void main() {
     );
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('重启别的插件：结论完整（resumed/代际/阶段），wait_ready 决定要不要再读一次状态', () async {
+  crossRepoTest('重启别的插件：结论完整（resumed/代际/阶段），wait_ready 决定要不要再读一次状态', () async {
     await startBus(<String>[...selfUpdaterEntry(), ...alphaEntry()]);
     await waitFor(
       () =>
@@ -302,7 +313,7 @@ void main() {
     expect(bus.generationOf('alpha'), 3);
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('失败都是结果：目标不存在的原因必须原样递回，不退化成"未给出原因"', () async {
+  crossRepoTest('失败都是结果：目标不存在的原因必须原样递回，不退化成"未给出原因"', () async {
     await startBus(<String>[...selfUpdaterEntry()]);
 
     final PluginCallResult ghost = await callTool(<String, dynamic>{
@@ -339,7 +350,7 @@ void main() {
     expect(missingId.text, contains('需要 plugin_id'));
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('归属证明不了 ⇒ 执行站 fail-closed 拒绝，而原因说得出"为什么"', () async {
+  crossRepoTest('归属证明不了 ⇒ 执行站 fail-closed 拒绝，而原因说得出"为什么"', () async {
     // 通配订阅（scope 空）⇒ 控制面四条没有可证明的 team：这是"谁的命令"这个问题
     // 没有答案，不是"命令写错了"。拒要拒得能说清，否则用户只会看到一个 tool 失败。
     await startBus(<String>[...selfUpdaterEntry(scopeLine: '{}')]);
@@ -365,7 +376,7 @@ void main() {
     );
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('action=list 经 tool 拿到全部插件读数（lifecycle / 代际 / 可否挂起）', () async {
+  crossRepoTest('action=list 经 tool 拿到全部插件读数（lifecycle / 代际 / 可否挂起）', () async {
     await startBus(<String>[...selfUpdaterEntry(), ...alphaEntry()]);
 
     final PluginCallResult listed = await callTool(<String, dynamic>{
@@ -398,7 +409,7 @@ void main() {
     );
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('强制停止：唯一能因用户动作而 kill 的入口，真的停住了一个赖着不退的进程', () async {
+  crossRepoTest('强制停止：唯一能因用户动作而 kill 的入口，真的停住了一个赖着不退的进程', () async {
     // alpha 收到 shutdown 也**不退**、而且彻底沉默：这正是"核心不等时长、也不因
     // 沉默杀它"（D8）留下的那一格 —— 能停它的只有用户显式按下的那个按钮。
     await startBus(<String>[
@@ -437,4 +448,30 @@ Map<String, dynamic> _payloadOf(String text) {
   return decoded is Map
       ? decoded.map((dynamic k, dynamic v) => MapEntry(k.toString(), v))
       : throw StateError('工具结果不是对象：$text');
+}
+
+/// 跨仓用例的前置：插件仓（独立 git 仓）没检出 / `self_updater` 没 `pub get` 时
+/// 给出**可见 skip 原因**；`TREE_REQUIRE_PLUGIN_REPO=1` 时返回 null（不跳过），
+/// 让 setUp 里的断言如实报出缺的是哪个文件。
+String? _pluginToolSkipReason() {
+  final String? repo = BuiltinPluginCatalog.repoRoot(Directory.current.path);
+  // 连本仓根都锚不到是本仓自己的问题：交给 setUp 的断言去红，不在这里吞掉。
+  if (repo == null) return null;
+  final bool ready =
+      File(
+        p.join(repo, 'plugins', 'self_updater', 'self_updater_plugin.dart'),
+      ).existsSync() &&
+      File(
+        p.join(
+          repo,
+          'plugins',
+          'self_updater',
+          '.dart_tool',
+          'package_config.json',
+        ),
+      ).existsSync();
+  if (ready) return null;
+  if (Platform.environment['TREE_REQUIRE_PLUGIN_REPO'] == '1') return null;
+  return '未检出插件仓或插件包未 pub get（plugins/self_updater）：跨仓用例跳过；'
+      '先跑 `dart run tool/build_plugins.dart`，或设 TREE_REQUIRE_PLUGIN_REPO=1 强制要求';
 }

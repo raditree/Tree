@@ -145,9 +145,21 @@ void main() {
       // 前端这一侧固定在 10s（lib/io/websocket_service.dart，本次不动），
       // CoreSettings.minLivenessWindowSeconds 就是照它定的——哪一侧改了这里都会红，
       // 逼着两侧一起改，避免"核心判活窗口比前端心跳还短"重新出现。
-      final File source = File(
-        '${_uiSourceRoot().path}/io/websocket_service.dart',
-      );
+      //
+      // UI 源码在插件仓（独立 git 仓）：没检出时这条**可见跳过**（远端/单仓环境
+      // 不该因此变红）；`TREE_REQUIRE_PLUGIN_REPO=1` 时仍然失败（CI 已设）。
+      final Directory? uiRoot = _uiSourceRootOrNull();
+      if (uiRoot == null) {
+        if (Platform.environment['TREE_REQUIRE_PLUGIN_REPO'] == '1') {
+          fail('UI 源码目录不存在：插件仓没检出到 plugins/（TREE_REQUIRE_PLUGIN_REPO=1）');
+        }
+        markTestSkipped(
+          '未检出插件仓（plugins/tree.ui.default/lib）：跨仓心跳前提校验跳过；'
+          '设 TREE_REQUIRE_PLUGIN_REPO=1 可强制要求',
+        );
+        return;
+      }
+      final File source = File('${uiRoot.path}/io/websocket_service.dart');
       expect(source.existsSync(), isTrue, reason: '找不到前端 WS 服务源码（仓库布局变了？）');
       final String src = source.readAsStringSync();
       final int timer = src.indexOf('_heartbeatTimer = Timer.periodic(');
@@ -502,21 +514,14 @@ void main() {
 }
 
 /// UI 源码根（cwd = `packages/tree_core`）：插件仓的 `plugins/tree.ui.default/lib`
-/// （S3 起桌面仓根不再有 `lib/`）。
-///
-/// 不存在就**直接失败**：静默跳过会让「前端心跳仍是 10s」这条跨仓前提无声失效。
-Directory _uiSourceRoot() {
+/// （S3 起桌面仓根不再有 `lib/`）。插件仓是独立 git 仓：不存在时返回 null，
+/// 由调用方决定"跳过还是失败"（`TREE_REQUIRE_PLUGIN_REPO=1` 时必须失败）。
+Directory? _uiSourceRootOrNull() {
   final Directory repoRoot = Directory('../..');
   final Directory root = Directory(
     '${repoRoot.path}/plugins/tree.ui.default/lib',
   );
-  if (!root.existsSync()) {
-    fail(
-      'UI 源码目录不存在：${root.path}——'
-      '插件仓没检出到 plugins/，或迁移路径漂了（门禁不许静默降级）',
-    );
-  }
-  return root;
+  return root.existsSync() ? root : null;
 }
 
 /// 记录落盘调用的假 sink（照 settings_test.dart 的写法，保持本文件自足）。
