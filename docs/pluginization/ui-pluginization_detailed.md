@@ -78,11 +78,11 @@ plugin.json
 | 启动者 | loader 拉核心 → 核心的 `UiHost` 拉起 `tree_ui.exe` |
 | 通信 | WS 客户端（`TREE_CORE_URL` + `TREE_CORE_TOKEN`），另用 REST 调委派端点 |
 | 握手 | 连上后第一帧发 `ui.hello {plugin_id, version, capabilities:["plugin.manage"]}` |
-| 退出 | 用户关窗 ⇒ 进程退出 ⇒ `UiHost` 置 stopped ⇒ 卸载可执行文件；核心继续运行 |
-| 崩溃 | `UiHost` 记录退出码，广播 `plugin_status` 置 stopped；不自动无限重启（避免安装/卸载时打架） |
-| 崩溃后重拉 | 用户在引导页或托盘点「启动界面」→ `POST /api/plugin/configs/{id}/restart` |
+| 退出 | 用户关窗 ⇒ 隐藏到托盘（进程仍在）；真正退出 ⇒ 关闭全部 UI 窗口 ⇒ 最后一个 UI 进程退出 ⇒ 核心收尾剩余插件并退出 |
+| 崩溃 | `UiHost` 记录退出码，广播 `plugin_status` 置 stopped；不自动无限重启（避免安装/卸载时打架）。若它是最后一个 UI 窗口且本次核心收到过 `ui.hello` ⇒ 核心同样自动退出 |
+| 崩溃后重拉 | 核心仍在时，用户在引导页或托盘点「启动界面」→ `POST /api/plugin/configs/{id}/restart` |
 
-**关键：UI 不再拥有核心的生命周期。** 关闭界面不等于关闭系统；系统是否有界面由 `ui.hello` 连接数决定。
+**关键：最后一个 UI 进程退出是核心生命周期的结束信号。** 但核心不会盲退：只有**本次运行期确实收到过 `ui.hello`**、且配置里仍有启用的 `runtime: ui` 条目、且当前不是在重启/关闭流程里，才会在 1s 去抖后收尾剩余 headless 插件并退出。全部 UI 被停用/卸载（引导页模式）或 UI 从未真正连上时，核心保持运行——否则用户既没有界面，也没有可用的引导页与日志现场。调试 / 自动化可用 `--keep-core-alive` 保留核心。
 
 身份来源：可执行体同目录的 `plugin.json`（`id` / `version`），能力默认声明
 `plugin.manage`。**没有清单时不发 `ui.hello`**（开发期 `flutter run`）：未在

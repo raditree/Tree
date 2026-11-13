@@ -54,6 +54,15 @@ class Launcher {
   /// 避免核心预热期读到空清单时把“还没播种”误当成“界面被停用”。
   bool _uiUp = false;
 
+  /// 本启动器拉起的核心自行退出时完成（附着模式不接这个信号）。
+  ///
+  /// 核心现在会在“所有 UI 插件进程都退出”后自动收起，启动器不能留下一个没有
+  /// 核心可管的控制台菜单。
+  final Completer<int> _coreExited = Completer<int>();
+
+  /// 是否由菜单主动发起退出（区分“用户选退出”与“核心自己没了”）。
+  bool _shuttingDown = false;
+
   static const Duration _uiWatchInterval = Duration(seconds: 3);
 
   Future<int> run() async {
@@ -147,6 +156,7 @@ class Launcher {
         stderr.writeln('[launcher] 核心已退出（$code）');
         _process = null;
       }
+      if (!_coreExited.isCompleted) _coreExited.complete(code);
     });
 
     final MinimalHandshake handshake = await completer.future.timeout(
@@ -544,6 +554,7 @@ class Launcher {
             } else if (choice == '3') {
               await _openDirectory(_logRoot());
             } else if (choice == '4' || choice.toLowerCase() == 'q') {
+              _shuttingDown = true;
               if (!done.isCompleted) done.complete(0);
             } else if (choice.isNotEmpty) {
               stdout.writeln('  未知选项：$choice');
@@ -552,17 +563,35 @@ class Launcher {
             stdout.flush();
           },
           onDone: () {
+            _shuttingDown = true;
             if (!done.isCompleted) done.complete(0);
           },
           onError: (Object error) {
+            _shuttingDown = true;
             stderr.writeln('[launcher] 读取控制台输入失败：$error');
             if (!done.isCompleted) done.complete(1);
           },
         );
-    final int code = await done.future;
+    // 菜单与“核心自行退出”赛跑：核心在 UI 全部退出后会自己收起，此时不能再把
+    // 用户留在一个没有核心可管的控制台里。附着模式没有子进程，这个 future 不完成。
+    bool coreGone = false;
+    final int code = await Future.any<int>(<Future<int>>[
+      done.future,
+      _coreExited.future.then((int exitCode) {
+        coreGone = true;
+        if (!_shuttingDown) {
+          _say('[launcher] 核心已退出（exit=$exitCode），启动器一并退出。');
+        }
+        return 0;
+      }),
+    ]);
     _watch?.cancel();
     _watch = null;
     await subscription.cancel();
+    if (coreGone) {
+      _http.close(force: true);
+      return code;
+    }
     await _shutdownCore();
     return code;
   }

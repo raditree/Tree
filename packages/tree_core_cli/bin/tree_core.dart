@@ -51,6 +51,8 @@ Future<void> main(List<String> args) async {
   final int port = _intArg(args, '--port') ?? 0;
   final bool enableHeartbeat = !args.contains('--no-heartbeat');
   final bool verbose = args.contains('--verbose');
+  // 所有 UI 退出后核心自动退出是**生产默认**；调试 / 自动化可以用它保留核心现场。
+  final bool keepCoreAlive = args.contains('--keep-core-alive');
 
   // 单实例闸门（2026-11-01）：核心只能有**一个**进程。多开的后果是每个核心各自拉起
   // 一套插件与界面窗口、并发写同一份数据根（实测出现过 3 个核心同时在跑）。
@@ -105,6 +107,10 @@ Future<void> main(List<String> args) async {
   );
   bootLog('设置 / 插件总线装配完成（预热推迟到握手之后）');
 
+  // 退出信号必须在服务器与插件总线之前就位：UI 可能在预热期就退出并触发自动退出，
+  // 晚创建的 Completer 会漏掉那一次（完成一个没人等的 future）。
+  final Completer<void> shutdown = Completer<void>();
+
   final CoreServer server = await CoreServer.start(
     port: port,
     enableHeartbeat: enableHeartbeat,
@@ -124,6 +130,20 @@ Future<void> main(List<String> args) async {
   }
   // 未捕获异常始终记下来：此时 500 回包往往也写不出去，客户端只能看到连接断开
   server.errorLog = coreLog.forPrefix('core:error');
+
+  // 生命周期请求（目前只有“所有 UI 插件进程都退出”）与 stdin `shutdown` 走
+  // **同一条收尾链路**：server.close() 会结束剩余插件、清实例记录、刷日志。
+  final void Function(String message) lifecycleLog = coreLog.forPrefix(
+    'core:lifecycle',
+  );
+  server.onShutdownRequested = (String reason) {
+    if (keepCoreAlive) {
+      lifecycleLog('$reason（--keep-core-alive：保持运行）');
+      return;
+    }
+    lifecycleLog('$reason ⇒ 核心自动退出');
+    _complete(shutdown);
+  };
 
   bootLog('监听已就绪，即将发出握手');
 
@@ -163,7 +183,6 @@ Future<void> main(List<String> args) async {
     ),
   );
 
-  final Completer<void> shutdown = Completer<void>();
   // 可靠退出通道：stdin 逐行命令（父进程写 `shutdown\n`）。
   //
   // 为什么不用 stdin EOF：**Windows 上父进程 `Process.stdin.close()` 不会让
@@ -352,6 +371,7 @@ tree_core — Tree 桌面端核心进程（本地回环 HTTP + WS，平台面）
   --data-dir <path>      数据根目录（默认：%APPDATA%\\Tree 等平台规范位置）
   --print-paths          打印解析出的数据根目录后退出
   --no-heartbeat         关闭保活心跳下发
+  --keep-core-alive      所有 UI 退出后核心不自动退出（调试 / 自动化用）
   --verbose              打开请求级日志
   -v, --version          打印版本
   -h, --help             打印本用法

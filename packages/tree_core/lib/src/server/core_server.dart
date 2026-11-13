@@ -225,6 +225,13 @@ class CoreServer {
   /// 未捕获异常日志回调（CLI 接到 stderr，始终打开）。
   void Function(String message)? errorLog;
 
+  /// **核心生命周期退出请求**（UI 全部退出等）。
+  ///
+  /// 只做“请求”不做收尾：收尾仍由宿主进程（CLI）走既有的 `shutdown` 链路
+  /// （`server.close()` → 插件收尸 → 清 `runtime/core.json` → 日志 flush）。
+  /// null = 不触发进程级退出（库 / 测试场景）。
+  void Function(String reason)? onShutdownRequested;
+
   void _access(HttpRequest request, int status) {
     accessLog?.call('${request.method} ${request.uri.path} -> $status');
   }
@@ -471,6 +478,13 @@ class CoreServer {
     );
     bus.stations.onStationRemoved = bridge.onStationRemoved;
     bus.onPluginOffline = bridge.onPluginOffline;
+    // UI 全部退出是**进程生命周期事件**，不是插件事件：总线判定所有闸门都过了
+    // 才上报，核心只负责把它翻成“本次进程该退了”。CLI 会把它接到 stdin 的
+    // shutdown 同一条收尾链路上（见 tree_core.dart）。
+    bus.onAllUiExited = (String reason) {
+      errorLog?.call('[core:lifecycle] $reason');
+      onShutdownRequested?.call(reason);
+    };
   }
 
   void _dispatch(HttpRequest request) {

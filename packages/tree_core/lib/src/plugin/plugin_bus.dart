@@ -82,6 +82,7 @@ class PluginBus {
     this.log,
     this.connectTimeout = const Duration(seconds: 20),
     this.uiHelloWindow = const Duration(seconds: 30),
+    this.uiExitGrace = const Duration(seconds: 1),
     this.heartbeatInterval = LivenessTracker.defaultInterval,
     this.missThreshold = LivenessTracker.defaultMaxMisses,
     this.coreVersion = '',
@@ -127,6 +128,12 @@ class PluginBus {
 
   /// UI 插件启动后等待 `ui.hello` 的连接窗口（超时只降级、**不杀进程**）。
   final Duration uiHelloWindow;
+
+  /// 全部 UI 窗口归零后的退出去抖。
+  ///
+  /// 不是为了“按时长判活”：它只覆盖两类同拍竞态——`closeAllUiWindows` 的
+  /// REST 回包还没写完、以及窗口刚退出又紧接着重新拉起。窗口一出现就取消。
+  final Duration uiExitGrace;
 
   /// 核心对插件暴露的 ws 基址（`ws://127.0.0.1:<port>`）。
   ///
@@ -320,6 +327,41 @@ class PluginBus {
 
   /// UI 插件“进程活着但窗口内没连上”的可读原因（面板状态 degraded）。
   final Map<String, String> _uiDegraded = <String, String>{};
+
+  /// **本次核心运行期**是否至少有一个 UI 窗口完成过 `ui.hello`。
+  ///
+  /// 与 [_uiHelloSeen] 不同：后者会随插件断开被清空（“当前这一世连上没有”），
+  /// 前者是“这套核心到底有没有真正被界面接管过”的寿命级事实。UI 从没连上就
+  /// 起不来时，核心不能自动退出——否则用户既没有界面、也看不到任何现场。
+  bool _uiEverHello = false;
+
+  /// 正在拉起、但还没登记进窗口表的 UI 窗口数。
+  ///
+  /// 拉起是异步的：`_spawnUi` 返回前窗口表里还没有它，此时若别的窗口刚好退出，
+  /// “全局归零”会被误判。这个计数让退出判定能看见“正在路上”的窗口。
+  int _uiSpawning = 0;
+
+  /// 已交给 `_disconnect` 优雅停止、但仍在等进程退出的 UI 窗口。
+  ///
+  /// `closeAllUiWindows` 会先把窗口从 [_uiWindows] 摘掉再停止进程，因此
+  /// [_onUiWindowExit] 不会再为它们跑；退出判定必须单独盯住这批宿主，
+  /// 否则“窗口表已空、进程还活着”时核心会提前走。
+  final Set<UiHost> _uiExitingHosts = <UiHost>{};
+
+  /// UI 归零退出的去抖计时器（新窗口一出现就取消）。
+  Timer? _uiExitTimer;
+
+  /// 是否已经向核心上层发过“UI 全部退出”的退出请求（每个核心进程只发一次）。
+  bool _uiExitRequested = false;
+
+  /// 是否正在关闭总线（核心退出流程自身不再触发 UI 归零退出）。
+  bool _closing = false;
+
+  /// **所有 UI 插件进程都退出**时的退出请求出口（核心接线；null = 只记录不退出）。
+  ///
+  /// 回调必须**同步且不抛异常**。核心侧把它接到自己的优雅退出链路
+  /// （`CoreServer.onShutdownRequested` → CLI 的 `shutdown`）。
+  void Function(String reason)? onAllUiExited;
 
   /// 每个**正在运行的实例**是按哪一份配置拉起来的（[applyConfigs] 判断"启动参数
   /// 有没有变"的唯一依据）。
@@ -1024,6 +1066,10 @@ class PluginBus {
   ///
   /// 与 [forceStop] 的区别：这里走优雅停止（不 kill），目录语义仍是“插件被停”，
   /// 而条目仍是启用 ⇒ 下一次对账会重新拉起。
+  ///
+  /// **也是“UI 主动退出应用”的唯一信号**：这批窗口是被界面自己请核心关的，
+  /// 因此全部窗口都退干净后允许核心自动退出（见 [_maybeRequestUiExit]）。
+  /// 管理面发起的停止（停用 / 重启 / 卸载 / 换文件 / 强制停止）不走这里。
   Future<Map<String, dynamic>> closeAllUiWindows(String pluginId) async {
     load();
     final String id = pluginId.trim();
@@ -1036,10 +1082,26 @@ class PluginBus {
         '插件 $id 的 runtime 是「${config.runtime}」，不是 ui',
       );
     }
-    final int closed = _liveUiWindowsOf(id).length;
+    // 先留一份宿主引用：`_disconnect` 会把窗口表整批摘掉，之后再想看
+    // “这批进程到底退没退”就只剩这里了。
+    final List<UiHost> closing = _liveUiWindowsOf(id).values.toList();
+    final int closed = closing.length;
     // `_disconnect` 已经把生命周期落到 stopped（非 restarting 时），这里只补一条状态帧。
     await _disconnect(id);
     _emitStatus(config, 'disabled', reason: 'UI 窗口已全部关闭');
+    if (closing.isNotEmpty) {
+      _uiExitingHosts.addAll(closing);
+      for (final UiHost host in closing) {
+        unawaited(
+          host.exited.then((int _) {
+            _uiExitingHosts.remove(host);
+            // 上一次判定可能因为“这个进程还没退”而作废：它现在退了，重新排一次。
+            _maybeRequestUiExit(reason: 'UI 主动关闭全部窗口（$id）');
+          }),
+        );
+      }
+      _maybeRequestUiExit(reason: 'UI 主动关闭全部窗口（$id）');
+    }
     return <String, dynamic>{
       'ok': true,
       'plugin_id': id,
@@ -1088,7 +1150,20 @@ class PluginBus {
     required int generation,
     required bool primary,
   }) async {
-    final UiHost host = await _spawnUi(config, windowId: windowId);
+    // 新窗口正在路上：取消可能已经排上的“UI 归零退出”，并让退出判定看见它。
+    _cancelPendingUiExit();
+    _uiSpawning++;
+    final UiHost host;
+    try {
+      host = await _spawnUi(config, windowId: windowId);
+    } finally {
+      _uiSpawning--;
+    }
+    // 拉起期间核心已经开始关闭：这个进程不能变成没人管的孤儿。
+    if (_closing) {
+      await host.close();
+      return;
+    }
     final Map<String, UiHost> windows = _uiWindows.putIfAbsent(
       config.id,
       () => <String, UiHost>{},
@@ -1191,6 +1266,7 @@ class PluginBus {
       _uiHelloWindowSeen.add('$pluginId#$resolvedWindow');
     }
     _uiHelloSeen.add(pluginId);
+    _uiEverHello = true;
     for (final String key in _uiHelloWindows.keys.toList()) {
       if (!key.startsWith('$pluginId#')) continue;
       _uiHelloWindows.remove(key)?.cancel();
@@ -1249,6 +1325,13 @@ class PluginBus {
         'disabled',
         reason: 'UI 插件进程异常退出（exit=$code）',
       );
+      // 崩溃也是“界面没了”：最后一个 UI 窗口这样退出去时，核心不该留在后台。
+      // 核心自己发起的停止不会走到这里（`_disconnect` 先摘窗口表，退出回调直接返回）。
+      if (!stoppedByCore) {
+        _maybeRequestUiExit(
+          reason: 'UI 插件 ${config.id} 的最后一个窗口异常退出（exit=$code）',
+        );
+      }
       return;
     }
     // 正常停止（核心发起或插件自己 exit 0）一律是 stopped，不是 failed。
@@ -1257,6 +1340,85 @@ class PluginBus {
       'disabled',
       reason: stoppedByCore ? 'UI 插件已停止' : 'UI 插件进程已退出（exit=$code）',
     );
+    // 插件自己 exit 0（关掉最后一个窗口）同样允许核心收尾；核心发起的停止不走这里。
+    if (!stoppedByCore) {
+      _maybeRequestUiExit(
+        reason: 'UI 插件 ${config.id} 的最后一个窗口已退出（exit=$code）',
+      );
+    }
+  }
+
+  /// 所有 UI 窗口归零后，向核心上层排一次“可以退出了”的请求。
+  ///
+  /// 这里只做去抖与排期；真正的四道闸门在 [_fireUiExitIfIdle]。去抖窗口里任何
+  /// 一条事实变了（新窗口起来、插件开始重启、核心开始关闭），请求就作废。
+  void _maybeRequestUiExit({required String reason}) {
+    if (_closing || _uiExitRequested) return;
+    _uiExitTimer?.cancel();
+    _uiExitTimer = Timer(uiExitGrace, () => _fireUiExitIfIdle(reason));
+  }
+
+  /// 新窗口正在拉起 ⇒ 撤销已经排上的退出请求。
+  void _cancelPendingUiExit() {
+    _uiExitTimer?.cancel();
+    _uiExitTimer = null;
+  }
+
+  void _fireUiExitIfIdle(String reason) {
+    _uiExitTimer = null;
+    if (_closing || _uiExitRequested) return;
+    // 还有窗口在“路上”（拉起未完成）：现在归零只是假象。
+    if (_uiSpawning > 0) return;
+    if (_hasLiveUiWindow()) return;
+    // 已摘出窗口表、但进程还没确认退出的那一批同样算“界面还在”。
+    if (_uiExitingHosts.any((UiHost host) => !host.isClosed)) return;
+    // 从没收到过 ui.hello ⇒ 界面从未真正可用，保留核心现场（日志 / loader）。
+    if (!_uiEverHello) {
+      log?.call('UI 窗口已全部退出，但本次核心从未收到过 ui.hello ⇒ 保持运行');
+      return;
+    }
+    // 全部停用 / 卸载 ⇒ 没有启用的 UI 条目，核心必须留着给 loader 开引导页。
+    if (!_hasEnabledUiPlugin()) {
+      log?.call(
+        'UI 窗口已全部退出，但配置里没有启用的 UI 插件 ⇒ 保持运行（引导页模式）',
+      );
+      return;
+    }
+    // 正在重启 / 正在拉起的新一世还没落定：不能把“换窗口”当成“退出应用”。
+    if (_hasUiLifecycleTransition()) return;
+    _uiExitRequested = true;
+    log?.call('所有 UI 插件进程已退出（$reason）⇒ 请求核心退出');
+    onAllUiExited?.call(reason);
+  }
+
+  bool _hasLiveUiWindow() {
+    for (final Map<String, UiHost> windows in _uiWindows.values) {
+      for (final UiHost host in windows.values) {
+        if (!host.isClosed) return true;
+      }
+    }
+    return false;
+  }
+
+  bool _hasEnabledUiPlugin() {
+    load();
+    if (!enabled) return false;
+    return _configs.any(
+      (PluginConfig config) =>
+          config.enabled && config.runtimeKind == PluginRuntimeKind.ui,
+    );
+  }
+
+  bool _hasUiLifecycleTransition() {
+    for (final PluginConfig config in _configs) {
+      if (config.runtimeKind != PluginRuntimeKind.ui) continue;
+      final PluginLifecycleState state = lifecycleOf(config.id);
+      if (state == PluginLifecycleState.booting ||
+          state == PluginLifecycleState.restarting) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// 推一条 plugin_status 增量（前端按 plugin_id + scope 合并）。
@@ -5835,6 +5997,9 @@ class PluginBus {
 
   /// 关闭全部实例与心跳定时器（幂等）。
   Future<void> close() async {
+    // 退出流程自身不能再触发“UI 归零 ⇒ 请求核心退出”（否则会自我递归）。
+    _closing = true;
+    _cancelPendingUiExit();
     _watchdogTimer?.cancel();
     _watchdogTimer = null;
     for (final String pluginId in <String>{
@@ -5846,6 +6011,19 @@ class PluginBus {
       await _disconnect(pluginId);
       if (pluginConfig != null) _emitStatus(pluginConfig, 'destroyed');
     }
+    // `closeAllUiWindows` 已经把宿主摘出窗口表，但它们可能还在退出路上。
+    // 核心要走了，这批进程不能因为“表里没有”而变成孤儿。
+    for (final UiHost host in _uiExitingHosts.toList(growable: false)) {
+      try {
+        await host.close(waitForExit: false);
+      } catch (error) {
+        log?.call('核心退出时关闭 UI 窗口 ${host.windowId} 失败：$error');
+      }
+      if (!host.isClosed) {
+        host.kill('核心退出 ⇒ 收掉正在退出的 UI 窗口');
+      }
+    }
+    _uiExitingHosts.clear();
     // **核心自己要退了 ⇒ 在这里收尸**（不留孤儿进程）。这不是时长判死：依据是
     // “父进程即将离开”这个事实，而快照池本来就随核心内存一起消失（D4），再等它
     // 转储毫无意义。这里也不 `await exited`：一个赖着不退的插件不该拖住整个退出。

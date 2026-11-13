@@ -36,6 +36,7 @@
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；embedding 已被 DN-9 消费） | 待新任务（JEV 待产线主控） | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
 | **L UI 圆角化** | RND-UI-1 + S1~S4 已落地（UI 插件 `f208763`；版本随发版车道 D） | 已完成 | 真机视觉验收（深/浅、240px 窄栏、tab 溢出） | [ui-roundness-visual-upgrade-recon.md](pluginization/ui-roundness-visual-upgrade-recon.md) §4 |
+| **M 核心与 UI 生命周期** | 最后一个 UI 进程退出 ⇒ 核心收尾剩余插件并退出；全部停用/卸载/从未连上 ⇒ 保持引导页模式 | 已完成 | 真机 E2E-14（托盘退出 / 直接结束 UI 进程 / 全部停用） | [ui-pluginization.md](pluginization/ui-pluginization.md) §4.1.1 ＋ `ui-pluginization_acceptance.md` D-13/E-16/E2E-14 |
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
 `B`、`E`、`G` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。

@@ -49,20 +49,23 @@ void main() {
     }
   }
 
-  String uiEntry(String id) => '''
+  String uiEntry(String id, {bool enabled = true}) => '''
   - id: $id
     name: $id
     command: "$dartBin"
     args: ["$probe", "hold"]
     runtime: ui
-    enabled: true''';
+    enabled: $enabled''';
 
-  ({PluginBus bus, List<String> logs}) createBus() {
+  ({PluginBus bus, List<String> logs}) createBus({
+    Duration uiExitGrace = const Duration(seconds: 1),
+  }) {
     final File config = File(p.join(root.path, 'plugins.yaml'));
     final List<String> logs = <String>[];
     final PluginBus bus = PluginBus(
       configFile: config.path,
       uiHelloWindow: const Duration(seconds: 10),
+      uiExitGrace: uiExitGrace,
       heartbeatInterval: const Duration(seconds: 30),
       log: logs.add,
     );
@@ -71,14 +74,23 @@ void main() {
     return (bus: bus, logs: logs);
   }
 
-  Future<({PluginBus bus, List<String> logs})> startBus(String entries) async {
-    final ({PluginBus bus, List<String> logs}) ctx = createBus();
+  Future<({PluginBus bus, List<String> logs})> startBus(
+    String entries, {
+    Duration uiExitGrace = const Duration(seconds: 1),
+  }) async {
+    final ({PluginBus bus, List<String> logs}) ctx = createBus(
+      uiExitGrace: uiExitGrace,
+    );
     File(
       p.join(root.path, 'plugins.yaml'),
     ).writeAsStringSync('enabled: true\nplugins:\n$entries\n');
     await ctx.bus.start();
     addTearDown(ctx.bus.close);
     return ctx;
+  }
+
+  Future<void> letExitGracePass() async {
+    await Future<void>.delayed(const Duration(milliseconds: 250));
   }
 
   Map<String, Map<String, dynamic>> snapshotInstances(PluginBus bus) =>
@@ -184,6 +196,166 @@ ${uiEntry('ui.two')}''');
     expect(snapshotInstances(bus)['ui.one']!['status'], 'disabled');
     expect(snapshotInstances(bus)['ui.two']!['status'], 'registered');
     expect(bus.lifecycleOf('ui.one').wire, 'stopped');
+  });
+
+  test('最后一个 UI 窗口退出：通知核心自动退出（只一次）', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      uiEntry('ui.one'),
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 1);
+    ctx.bus.noteUiHello('ui.one');
+    Process.killPid(ctx.bus.uiWindows().single['pid'] as int);
+    await waitFor(
+      () => exits.isNotEmpty,
+      reason: '最后一个 UI 进程退出后应请求核心退出',
+    );
+    expect(exits, hasLength(1));
+    await letExitGracePass();
+    expect(exits, hasLength(1), reason: '一个核心进程只请求一次');
+  });
+
+  test('仍有其它 UI 窗口在跑：不请求核心退出', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      '${uiEntry('ui.one')}\n${uiEntry('ui.two')}',
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 2);
+    ctx.bus.noteUiHello('ui.one');
+    ctx.bus.noteUiHello('ui.two');
+    final Map<String, dynamic> one = ctx.bus.uiWindows().firstWhere(
+      (Map<String, dynamic> w) => w['plugin_id'] == 'ui.one',
+    );
+    Process.killPid(one['pid'] as int);
+    await letExitGracePass();
+    expect(exits, isEmpty);
+    expect(ctx.bus.uiWindows(), hasLength(1));
+  });
+
+  test('UI 主动关闭全部窗口：最后一批退干净后才请求核心退出', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      '${uiEntry('ui.one')}\n${uiEntry('ui.two')}',
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 2);
+    ctx.bus.noteUiHello('ui.one');
+    ctx.bus.noteUiHello('ui.two');
+
+    await ctx.bus.closeAllUiWindows('ui.one');
+    await letExitGracePass();
+    expect(exits, isEmpty, reason: '另一个 UI 插件的窗口还在跑');
+
+    await ctx.bus.closeAllUiWindows('ui.two');
+    await waitFor(
+      () => exits.isNotEmpty,
+      reason: '所有 UI 窗口都关闭后应请求核心退出',
+    );
+    expect(exits, hasLength(1));
+  });
+
+  test('UI 从未 ui.hello：窗口退出也不请求核心退出', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      uiEntry('ui.one'),
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 1);
+    Process.killPid(ctx.bus.uiWindows().single['pid'] as int);
+    await letExitGracePass();
+    expect(exits, isEmpty, reason: '界面从未真正连上，核心要保留现场');
+    expect(
+      ctx.logs.any((String line) => line.contains('从未收到过 ui.hello')),
+      isTrue,
+    );
+  });
+
+  test('全部停用：关窗口是管理动作，不请求核心退出', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      uiEntry('ui.one'),
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 1);
+    ctx.bus.noteUiHello('ui.one');
+    File(p.join(root.path, 'plugins.yaml')).writeAsStringSync(
+      'enabled: true\nplugins:\n${uiEntry('ui.one', enabled: false)}\n',
+    );
+    await ctx.bus.applyConfigs();
+    await letExitGracePass();
+    expect(exits, isEmpty, reason: '全部停用后核心要留着开引导页');
+    expect(ctx.bus.uiWindows(), isEmpty);
+  });
+
+  test('重启 UI 插件：换窗口不等于退出应用', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      uiEntry('ui.one'),
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 1);
+    ctx.bus.noteUiHello('ui.one');
+    await ctx.bus.restart('ui.one');
+    await waitFor(
+      () => ctx.bus.uiWindows().length == 1,
+      reason: '重启后应有一个新窗口',
+    );
+    await letExitGracePass();
+    expect(exits, isEmpty);
+  });
+
+  test('核心自身 close：不会再请求一次核心退出', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      uiEntry('ui.one'),
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> exits = <String>[];
+    ctx.bus.onAllUiExited = exits.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 1);
+    ctx.bus.noteUiHello('ui.one');
+    await ctx.bus.close();
+    await letExitGracePass();
+    expect(exits, isEmpty);
+  });
+
+  test('核心接线：UI 全部退出 → onShutdownRequested', () async {
+    final ({PluginBus bus, List<String> logs}) ctx = await startBus(
+      uiEntry('ui.one'),
+      uiExitGrace: const Duration(milliseconds: 80),
+    );
+    final List<String> requests = <String>[];
+    final CoreServer server = await CoreServer.start(
+      pluginBus: ctx.bus,
+      dataDir: root.path,
+      enableHeartbeat: false,
+    );
+    addTearDown(server.close);
+    server.onShutdownRequested = requests.add;
+
+    await waitFor(() => ctx.bus.uiWindows().length == 1);
+    ctx.bus.noteUiHello('ui.one');
+    await ctx.bus.closeAllUiWindows('ui.one');
+    await waitFor(
+      () => requests.isNotEmpty,
+      reason: '核心应收到生命周期退出请求',
+    );
+    expect(requests, hasLength(1));
+    expect(requests.single, contains('UI 主动关闭全部窗口'));
   });
 
   test('窗口上限与非 UI 插件都给可读拒绝', () async {
