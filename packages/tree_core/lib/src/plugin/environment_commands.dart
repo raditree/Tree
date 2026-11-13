@@ -27,7 +27,7 @@ typedef EnvironmentSnapshot = Map<String, String>? Function();
 ///   时才把整份环境带回去（默认不带：`PATH` 之外的东西多数时候只为排障）。
 ///
 /// 归属闸门：本族**不要求 team**——环境是整机一份，团队归属在这里没有对应的资源，
-/// 要一个 team_id 只会变成假 rigor。命令白名单（点位表）与插件身份校验仍照旧。
+/// 要一个团队 id 只会变成假 rigor。命令白名单（点位表）与插件身份校验仍照旧。
 class EnvironmentCommands {
   EnvironmentCommands({
     this.load,

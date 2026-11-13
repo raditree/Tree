@@ -25,6 +25,9 @@ env:
   FLUTTER_SDK: '3.47.5'
   PLUGIN_REPO: raditree/tree-plugins
   PLUGIN_REF: master
+  # 跨仓门禁的强制开关：本流水线已检出 plugins/，缺目录必须失败。
+  # 本地/远端单仓环境没有插件仓时，跨仓门禁用「可见 skip」而不是变红。
+  TREE_REQUIRE_PLUGIN_REPO: '1'
 
 jobs:
   protocol:

@@ -315,6 +315,10 @@ raditree/tree-plugins（插件仓，本地挂在桌面仓 plugins/）
   并加 `expect(dir.existsSync(), isTrue, reason: 'UI 源码目录不存在：迁移没搬完或路径漂了')`。
 - 理由：当前 `protocol_completeness_test` 对缺失 `lib/` 是 `continue`，迁移后会**静默变绿**，
   这是门禁类代码最不能接受的失败方式。
+- **2026-11-13 修订（用户反馈）**：远端/单仓环境没有插件仓时，"缺目录即红"会让整包测试
+  长期红且难归因。口径改为：**缺目录 ⇒ 该条跨仓门禁可见跳过（skip）**；同时新增
+  `TREE_REQUIRE_PLUGIN_REPO=1` 强制开关，桌面仓 CI 已设（它本来就会检出 `plugins/`），
+  保证"有仓的环境必须真扫"。涉及 5 个测试文件，见 `docs/work-log.md` 2026-11-13 行。
 
 ### D8 CI：桌面仓 `app` job → 插件仓 `ui` job
 - **推荐**：

@@ -24,6 +24,11 @@ import 'package:tree_protocol/tree_protocol.dart';
 void main() {
   final Directory repoRoot = Directory('../..');
 
+  /// 插件仓是**独立 git 仓**（raditree/tree-plugins）：没检出时跨仓门禁跳过
+  /// （可见 skip），不让整包测试因缺外部仓变红；`TREE_REQUIRE_PLUGIN_REPO=1`
+  /// 时缺目录仍然失败（CI 用它保证"有仓就必须真扫"）。
+  final String? pluginRepoSkip = _pluginRepoSkipReason(repoRoot);
+
   /// 被扫描的源码面（协议**两端**都要扫，只扫核心等于没门）。
   ///
   /// `plugins` = 插件仓（raditree/tree-plugins，装在桌面仓的 plugins/ 下）：
@@ -112,7 +117,7 @@ void main() {
           '—— 扩协议请进 tree_protocol 的 PluginRpcMethods（并同步基线计数），'
           '属于别的协议（如 tree_tunnel_protocol）请登记并写明原因',
     );
-  });
+  }, skip: pluginRepoSkip);
 
   test('核心侧（协议生产端）不再出现 method 字面量', () {
     // 这两份文件是核心 → 插件帧的唯一生产处；这里保留字面量就等于把漂移写在源头。
@@ -203,7 +208,7 @@ void main() {
           '以下条目已无出现处，应从 nonProtocolPluginMethodLiterals 删除：'
           '${stale.toList()..sort()}',
     );
-  });
+  }, skip: pluginRepoSkip);
 
   test('登记表每项都写了原因，且原因不能是空话', () {
     nonProtocolPluginMethodLiterals.forEach((String key, String why) {
@@ -234,4 +239,15 @@ void main() {
       isEmpty,
     );
   });
+}
+
+/// 跨仓门禁前置：插件仓不在时给出**可见 skip 原因**（`TREE_REQUIRE_PLUGIN_REPO=1`
+/// 时仍然失败，保证有仓的环境必须真扫）。
+String? _pluginRepoSkipReason(Directory repoRoot) {
+  if (Directory('${repoRoot.path}/plugins').existsSync()) return null;
+  if (Platform.environment['TREE_REQUIRE_PLUGIN_REPO'] == '1') {
+    fail('插件仓不存在：plugins/ —— TREE_REQUIRE_PLUGIN_REPO=1 要求必须扫描插件仓');
+  }
+  return '未检出插件仓（plugins/，独立仓 raditree/tree-plugins）：跨仓门禁跳过；'
+      '设 TREE_REQUIRE_PLUGIN_REPO=1 可强制要求';
 }

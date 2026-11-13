@@ -24,6 +24,12 @@ void main() {
   final Directory repoRoot = Directory('../..');
   final Directory pluginRepo = Directory('${repoRoot.path}/plugins');
 
+  /// 插件仓是**独立 git 仓**：没检出时整组合同门禁**可见地跳过**（不再把整包
+  /// 测试打成红）；`TREE_REQUIRE_PLUGIN_REPO=1` 时缺目录仍然失败（CI 已设）。
+  final String? pluginRepoSkip = _pluginRepoSkipReason(pluginRepo);
+  void crossRepoTest(String description, void Function() body) =>
+      test(description, body, skip: pluginRepoSkip);
+
   List<Directory> pluginDirs() {
     expect(
       pluginRepo.existsSync(),
@@ -58,7 +64,7 @@ void main() {
     }
   });
 
-  test('插件仓至少有一个插件，且 _kit / release 都不是插件', () {
+  crossRepoTest('插件仓至少有一个插件，且 _kit / release 都不是插件', () {
     expect(
       manifests,
       isNotEmpty,
@@ -81,7 +87,7 @@ void main() {
     );
   });
 
-  test('tree.agent 依赖 local_executor（执行器是 agent 的必需依赖）', () {
+  crossRepoTest('tree.agent 依赖 local_executor（执行器是 agent 的必需依赖）', () {
     final Map<String, dynamic>? manifest = manifests.cast<Map<String, dynamic>?>().firstWhere(
       (Map<String, dynamic>? m) => m?['id'] == 'tree.agent',
       orElse: () => null,
@@ -100,7 +106,7 @@ void main() {
     expect(dep!['optional'], isNot(true), reason: '执行器依赖不能是 optional');
   });
 
-  test('每个 plugin.json 都过字段纪律（与 plugins/README.md 的表逐条对齐）', () {
+  crossRepoTest('每个 plugin.json 都过字段纪律（与 plugins/README.md 的表逐条对齐）', () {
     final Set<String> seenIds = <String>{};
     final Set<String> seenCommands = <String>{};
     for (final Map<String, dynamic> manifest in manifests) {
@@ -183,7 +189,7 @@ void main() {
     }
   });
 
-  test('Dart 形态的插件都有入口（构建脚本按约定找它）', () {
+  crossRepoTest('Dart 形态的插件都有入口（构建脚本按约定找它）', () {
     final List<String> missing = <String>[];
     for (final Map<String, dynamic> manifest in manifests) {
       final String id = _str(manifest['id']);
@@ -203,7 +209,7 @@ void main() {
     );
   });
 
-  test('声明了 app_version_define 的插件，那个键名必须真出现在它的源码里', () {
+  crossRepoTest('声明了 app_version_define 的插件，那个键名必须真出现在它的源码里', () {
     // 钉的是“注到了东西”而不是“注对了”：键名写错（多一个字母、拿成另一个插件的键）
     // 会静默地注不上，而插件拿着 `defaultValue` 自报一个假版本——目标机驻留目录按
     // 版本命名 ⇒ 每次装都当新版重推，面板上那一行版本号也是假的。
@@ -231,7 +237,7 @@ void main() {
     );
   });
 
-  test('骨架那张方法名表逐个已登记（插件自带常量表不能漂）', () {
+  crossRepoTest('骨架那张方法名表逐个已登记（插件自带常量表不能漂）', () {
     final File kit = File('${pluginRepo.path}/_kit/plugin_kit.dart');
     expect(kit.existsSync(), isTrue);
     final String src = kit.readAsStringSync();
@@ -265,7 +271,7 @@ void main() {
     );
   });
 
-  test('插件源码不得 import 核心包（插件仓可独立编译）', () {
+  crossRepoTest('插件源码不得 import 核心包（插件仓可独立编译）', () {
     // 为什么钉死：插件仓可能被第三方单独 clone；一旦出现
     // `package:tree_core/` / `package:tree_protocol/`，那边直接编不出来。
     // 复用核心能力只能走「平台内置站（日志/存储/租约）」或「其它插件的自建执行站」。
@@ -298,6 +304,18 @@ void main() {
           '${offenders.join('\n')}',
     );
   });
+}
+
+/// 跨仓合同门禁前置：插件仓不在时给出**可见 skip 原因**，而不是把整包测试打红
+/// （远端/本地单仓环境本来就可能没有插件仓）；`TREE_REQUIRE_PLUGIN_REPO=1` 时
+/// 缺目录仍然失败，保证"有仓就必须真扫"。
+String? _pluginRepoSkipReason(Directory pluginRepo) {
+  if (pluginRepo.existsSync()) return null;
+  if (Platform.environment['TREE_REQUIRE_PLUGIN_REPO'] == '1') {
+    fail('插件仓不存在：plugins/ —— TREE_REQUIRE_PLUGIN_REPO=1 要求必须扫描插件仓');
+  }
+  return '未检出插件仓（plugins/，独立仓 raditree/tree-plugins）：跨仓合同门禁跳过；'
+      '设 TREE_REQUIRE_PLUGIN_REPO=1 可强制要求';
 }
 
 String _base(String path) {

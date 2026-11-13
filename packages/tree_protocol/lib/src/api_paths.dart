@@ -39,6 +39,19 @@ abstract final class ApiPaths {
   static const String models = '/api/models';
   static const String model = '/api/models/{modelId}';
 
+  // ── Provider 池（`tree.agent` 承接，D7）──────────────────────────────
+  /// Provider 列表 / 新建（GET / POST）。
+  static const String providers = '/api/providers';
+
+  /// 单个 Provider（GET / PATCH / DELETE）。
+  static const String provider = '/api/providers/{providerId}';
+
+  /// 重新拉取该 Provider 的 `/models` 并写缓存（POST）。
+  static const String providerRefresh = '/api/providers/{providerId}/refresh';
+
+  /// Provider 的模型目录缓存（GET）。
+  static const String providerModels = '/api/providers/{providerId}/models';
+
   // ── 会话 / 历史 / spec ────────────────────────────────────────────────
   static const String conversations = '/api/conversations/{agentId}';
 
@@ -332,6 +345,9 @@ abstract final class ApiPaths {
   static const String productionAudit =
       '/api/production/lines/{lineId}/audit';
 
+  /// 旧产线迁到全局作用域（POST，幂等；迁移旧团队目录）。
+  static const String productionMigrate = '/api/production/migrate';
+
   // ── 运行中工具（"工具卡住"的可见面）────────────────────────────────────
 
   /// 正在执行的工具快照（GET，**只读**）：`{runs:[{handle, agent_id, session_id,
@@ -459,10 +475,10 @@ abstract final class ApiPaths {
   /// 若将来需要登记「无承接方的插件面」，另建语义明确的集合，不要复用本名。
   static const Set<String> pendingHandoffRoutes = <String>{};
 
-  /// **契约中归插件的全部方法路由：71 条。**
+  /// **契约中归插件的全部方法路由：79 条。**
   ///
-  /// agent 37（34 存量 + 2 新增上行改委派 + 1 消息详情）+ spec 2 + mcp 3 + files 13
-  /// + 生产线 16（§10.2 读 8 / 写 8）。
+  /// agent 44（37 存量 + 2 新增上行改委派 + 1 消息详情 + **7 Provider 池**）+ spec 2
+  /// + mcp 3 + files 13 + 生产线 17（§10.2 读 8 / 写 8 / **旧产线迁移 1**）。
   /// **git 3 已按用户决定删除**（2026-10-25）。L-28 起它不是运行期白名单：
   /// 放行由 [delegationPatternError] 的命名空间规则 + 归属表冲突检测决定；
   /// 本集合只用于契约自检与 G-1 对照。
@@ -488,6 +504,14 @@ abstract final class ApiPaths {
     'POST $models',
     'PATCH $model',
     'DELETE $model',
+    // Provider 池（7，D7）：tree.agent 承接
+    'GET $providers',
+    'POST $providers',
+    'GET $provider',
+    'PATCH $provider',
+    'DELETE $provider',
+    'POST $providerRefresh',
+    'GET $providerModels',
     // 会话 / 历史（9）
     'GET $conversations',
     'GET $agentMessageDetail',
@@ -521,7 +545,7 @@ abstract final class ApiPaths {
     'GET $mcpServices',
     'POST $mcpServices',
     'DELETE $mcpService',
-    // 生产线（16）：tree.production.line 承接（§10.2，读 + 写）。
+    // 生产线（17）：tree.production.line 承接（§10.2，读 + 写；含旧产线迁移）。
     'GET $productionLines',
     'POST $productionLines',
     'GET $productionLine',
@@ -538,6 +562,7 @@ abstract final class ApiPaths {
     'GET $productionRuns',
     'GET $productionArtifacts',
     'GET $productionAudit',
+    'POST $productionMigrate',
     // files（13）
     'GET $files',
     'DELETE $fileDelete',
@@ -554,7 +579,7 @@ abstract final class ApiPaths {
     'POST $fileRename',
   };
 
-  /// 契约全集（106 = [coreOwned] 35 + [delegated] 71）。
+  /// 契约全集（114 = [coreOwned] 35 + [delegated] 79）。
   static final Set<String> contractRoutes = <String>{
     ...coreOwned,
     ...delegated,
@@ -629,6 +654,10 @@ abstract final class ApiPaths {
     teammateMessage,
     models,
     model,
+    providers,
+    provider,
+    providerRefresh,
+    providerModels,
     conversations,
     agentMessageDetail,
     agentSessions,
@@ -699,6 +728,7 @@ abstract final class ApiPaths {
     productionRuns,
     productionArtifacts,
     productionAudit,
+    productionMigrate,
     toolsRunning,
     toolsRunningClose,
     agentSubagents,

@@ -31,13 +31,15 @@ void main() {
   });
 
   test('每个模块 README 都有「不变量（assertions）」与「测试」两节', () {
-    const List<String> modules = <String>[
+    // UI 源码已迁入插件仓（S2/S3）：README 跟着搬。插件仓是独立 git 仓，
+    // 没检出时这一项**不参与**（跨仓文件不在本仓，不能让本仓门禁变红）。
+    final List<String> modules = <String>[
       'packages/tree_protocol/README.md',
       'packages/tree_local_exec/README.md',
       'packages/tree_core/README.md',
       'packages/tree_core_cli/README.md',
-      // UI 源码已迁入插件仓（S2/S3）：README 跟着搬，门禁跨仓检查同一套约定。
-      'plugins/tree.ui.default/lib/README.md',
+      if (Directory('$repo/plugins/tree.ui.default/lib').existsSync())
+        'plugins/tree.ui.default/lib/README.md',
     ];
     for (final String rel in modules) {
       final File file = File('$repo/$rel');
@@ -139,6 +141,9 @@ void main() {
   test('文档集合里的相对链接都能解析到真实的文件或目录', () {
     final List<String> docs = docSet();
     expect(docs.length, greaterThan(10), reason: '文档集合不应当为空（检查扫描逻辑）');
+    // 插件仓（独立 git 仓）没检出时，历史里指向插件仓的链接（含 UI 迁移前的
+    // lib/ 等路径）无法核对：只放行这一类，其余链接照常检查（不整体跳过门禁）。
+    final bool pluginRepoPresent = Directory('$repo/plugins').existsSync();
     for (final String rel in docs) {
       final String base = rel.contains('/') ? rel.substring(0, rel.lastIndexOf('/')) : '';
       bool inFence = false;
@@ -176,10 +181,15 @@ void main() {
               (File('$repo/plugins/tree.ui.default/$resolved').existsSync() ||
                   Directory('$repo/plugins/tree.ui.default/$resolved')
                       .existsSync());
+          // 插件仓没检出 ⇒ 指向插件仓的链接（含 UI 迁移前的 lib/ 等）无法核对：放行。
+          final bool crossRepoLinkUnavailable =
+              !pluginRepoPresent &&
+              (uiOwned || resolved.startsWith('plugins/'));
           expect(
             File('$repo/$resolved').existsSync() ||
                 Directory('$repo/$resolved').existsSync() ||
-                movedUiFile,
+                movedUiFile ||
+                crossRepoLinkUnavailable,
             isTrue,
             reason: '$rel 里的链接指向不存在的路径：$target',
           );

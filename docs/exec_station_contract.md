@@ -298,6 +298,14 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | 插件 | `bad_base64` | 12 | base64 非法 |
 | 插件 | `lease_unknown` | 12 | 两侧共用（旧名 `local_lease_unknown` / `ssh_lease_unknown` 已归并，片 5）：重登记后**只重试一次** |
 | 插件 | `backend_unreachable` | 12 | 隧道/远端 agent 不可用（`建立 SSH 隧道失败…`） |
+| 插件 | `decision_error` | 12 | `tree.agent` 决策类模型调用失败：按 `error` 修正后可重试 |
+| 插件 | `embedding_error` | 12 | `tree.agent` embedding 调用失败：可重试（有界）或改走非向量路径 |
+| 插件 | `no_embedding_model` / `not_embedding_model` | 12 | 配置问题：**不重试**，先在模型池里配好 embedding 模型 |
+| 插件 | `graph_required` | 12 | `tree.docnorm` 检索需要先建图：**不重试**，先跑 `graph.build` |
+| 插件 | `scan_error` | 12 | `tree.docnorm` 扫描失败：按 `error` 修正输入后重试 |
+| 插件 | `unknown_command` | 12 | **插件内部**命令分发不认识：看 `error` 的命令表，不重试（与核心层 `command_unknown` 分属两层） |
+| 插件 | `production_error` | 12 | `tree.production.line` 业务状态/前置不满足：按 `error` 处理，不重试 |
+| 插件 | `settings_error` / `storage_error` | 12 | 插件设置 / 存储命令失败：按 `error` 处理，不重试 |
 | 兜底 | `unknown` | 任何没给码的失败 | 只能当"可读原因、不可编程分支"处理 |
 
 > 命名规则：`<对象>_<状态>`，不带族前缀（`file_` / `ssh_` 不带）。

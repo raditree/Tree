@@ -69,6 +69,42 @@ abstract final class ExecStationErrorCodes {
   /// 隧道 / 远端 agent 不可用。
   static const String backendUnreachable = 'backend_unreachable';
 
+  // ── 插件（能力域：tree.agent / tree.docnorm / 产线 / 设置 / 存储）──────
+  //
+  // 这些码由**插件自己的执行器**产生（它们不 import 核心包，按同一张码表手抄）：
+  // 核心只把它们原样透传，调用方按 error 处理；`unknown_command` 与核心/站点层的
+  // [commandUnknown] 分属两层——前者是"插件内部命令分发不认识"，后者是"核心命令表不认识"。
+
+  /// 决策类模型调用失败（`tree.agent` decision client）：按 `error` 修正后可重试。
+  static const String decisionError = 'decision_error';
+
+  /// embedding 调用失败（`tree.agent`）：可重试（有界），或改用非向量路径。
+  static const String embeddingError = 'embedding_error';
+
+  /// 没配 embedding 模型（配置问题）：**不重试**，先在模型池里配一个。
+  static const String noEmbeddingModel = 'no_embedding_model';
+
+  /// 选中的模型不是 embedding 类型：**不重试**，换模型。
+  static const String notEmbeddingModel = 'not_embedding_model';
+
+  /// docnorm 检索需要先建图：**不重试**，先跑 `graph.build`。
+  static const String graphRequired = 'graph_required';
+
+  /// 代码/文档扫描失败（docnorm）：按 `error` 修正输入后重试。
+  static const String scanError = 'scan_error';
+
+  /// 插件内部的命令分发不认识这个名字：看 `error` 里的命令表，**不重试**。
+  static const String unknownCommand = 'unknown_command';
+
+  /// 产线命令失败（业务状态不符 / 前置未满足）：按 `error` 处理，**不重试**。
+  static const String productionError = 'production_error';
+
+  /// 插件设置服务命令失败：按 `error` 处理，**不重试**。
+  static const String settingsError = 'settings_error';
+
+  /// 插件存储命令失败：按 `error` 处理，**不重试**。
+  static const String storageError = 'storage_error';
+
   // ── 兜底 ────────────────────────────────────────────────────────────
   /// 任何没给码的失败：只能当"可读原因、不可编程分支"处理。
   static const String unknown = 'unknown';
@@ -92,6 +128,16 @@ abstract final class ExecStationErrorCodes {
     leaseUnknown,
     leaseDenied,
     backendUnreachable,
+    decisionError,
+    embeddingError,
+    noEmbeddingModel,
+    notEmbeddingModel,
+    graphRequired,
+    scanError,
+    unknownCommand,
+    productionError,
+    settingsError,
+    storageError,
     unknown,
   };
 

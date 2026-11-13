@@ -16,6 +16,11 @@ import 'package:tree_protocol/tree_protocol.dart';
 void main() {
   final Directory repoRoot = Directory('../..');
 
+  /// 插件仓是**独立 git 仓**（raditree/tree-plugins）：本地/远端没检出它时，
+  /// 跨仓门禁**可见地跳过**（不允许把整包测试因缺外部仓打成红）；需要强制时设
+  /// `TREE_REQUIRE_PLUGIN_REPO=1`（CI 用它保证"有仓就必须真扫"）。
+  final String? pluginRepoSkip = _pluginRepoSkipReason(repoRoot);
+
   // ── 扫描面 ──────────────────────────────────────────────────────────
 
   /// 契约 §5 第 1 条的扫描面：核心插件运行层 + 整个插件仓。
@@ -56,6 +61,16 @@ void main() {
     'leaseUnknown': ExecStationErrorCodes.leaseUnknown,
     'leaseDenied': ExecStationErrorCodes.leaseDenied,
     'backendUnreachable': ExecStationErrorCodes.backendUnreachable,
+    'decisionError': ExecStationErrorCodes.decisionError,
+    'embeddingError': ExecStationErrorCodes.embeddingError,
+    'noEmbeddingModel': ExecStationErrorCodes.noEmbeddingModel,
+    'notEmbeddingModel': ExecStationErrorCodes.notEmbeddingModel,
+    'graphRequired': ExecStationErrorCodes.graphRequired,
+    'scanError': ExecStationErrorCodes.scanError,
+    'unknownCommand': ExecStationErrorCodes.unknownCommand,
+    'productionError': ExecStationErrorCodes.productionError,
+    'settingsError': ExecStationErrorCodes.settingsError,
+    'storageError': ExecStationErrorCodes.storageError,
     'unknown': ExecStationErrorCodes.unknown,
   };
 
@@ -146,7 +161,7 @@ void main() {
           '—— 新增码请先进 tree_protocol 的码表（并写清"谁产生、是否可重试"），'
           '插件仓的码由执行器自己写、也必须是同一张表里的值',
     );
-  });
+  }, skip: pluginRepoSkip);
 
   test('码表与成员登记表双向一致（加常量必须同步门禁）', () {
     expect(
@@ -315,7 +330,7 @@ void main() {
       isEmpty,
       reason: '插件侧异常类缺码（契约 §4）：$offenders',
     );
-  });
+  }, skip: pluginRepoSkip);
 
   // ── 第 5 条：消费端不许嗅探消息文本 ─────────────────────────────────
 
@@ -353,5 +368,20 @@ void main() {
           '—— 请改成 `error is StationCommandFailure && error.code == ...`'
           '（或骨架侧的 `CmdFailureException.code`）',
     );
-  });
+  }, skip: pluginRepoSkip);
+}
+
+/// 跨仓门禁的前置：插件仓不在时给出一条**可见的 skip 原因**。
+///
+/// 为什么不再"缺目录就红"：插件仓是独立仓（raditree/tree-plugins），远端/本地
+/// 单仓环境本来就可能没有它；缺外部仓导致整包测试红，既掩盖真正的失败，也让人
+/// 以为代码坏了。需要**强制**时设 `TREE_REQUIRE_PLUGIN_REPO=1`（CI 已设）：那时
+/// 缺目录仍然当场失败，保证"有仓就必须真扫"。
+String? _pluginRepoSkipReason(Directory repoRoot) {
+  if (Directory('${repoRoot.path}/plugins').existsSync()) return null;
+  if (Platform.environment['TREE_REQUIRE_PLUGIN_REPO'] == '1') {
+    fail('插件仓不存在：plugins/ —— TREE_REQUIRE_PLUGIN_REPO=1 要求必须扫描插件仓');
+  }
+  return '未检出插件仓（plugins/，独立仓 raditree/tree-plugins）：跨仓门禁跳过；'
+      '设 TREE_REQUIRE_PLUGIN_REPO=1 可强制要求';
 }
