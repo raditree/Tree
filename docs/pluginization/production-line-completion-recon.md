@@ -342,6 +342,25 @@
 但企业级稳定看的是**失败时是否越界、是否丢状态、是否假 done、是否可恢复、是否可审计**。
 这些不能靠 Agent 自觉，必须由控制面提供（PC-10）。
 
+### 4.14 任务拆分只是一次 LLM 自由发挥：没有校验、尺寸与批次
+
+现状 `parseScopeJson` 只收 `id/title/kind/depends_on/read_scope/write_scope/acceptance/estimated_files`，
+`_validatePlan` 只查「依赖必须在计划里 + id 不冲突 + 验收非空」：
+
+| 要求 | 现状 | 证据 |
+| --- | --- | --- |
+| 环检测 | 不查；A→B→A 也能落档 | `_validatePlan` 只做存在性检查（[preparation_service.dart:739-768](../../plugins/tree.production.line/lib/src/preparation_service.dart#L739-L768)） |
+| 写域交叠 | 不查；两个任务可并行写同一文件 | 无交集检测 |
+| 尺寸预算 | `estimated_files` 默认 1，未使用；没有行数/包/时间限制 | `intOf(map['estimated_files'], 1)`（[preparation.dart:401](../../plugins/tree.production.line/lib/src/preparation.dart#L401)） |
+| 任务类型 | 只有 `conventional/special`；没有 code/test/docs/spike/integration | `kind` 解析（[preparation.dart:389-391](../../plugins/tree.production.line/lib/src/preparation.dart#L389-L391)） |
+| 任务级门控 | 没有 `gate` 字段；验收是自然语言，不能直接判定 | `PlanTaskSpec` 字段（[preparation.dart:294-324](../../plugins/tree.production.line/lib/src/preparation.dart#L294-L324)） |
+| 集成任务 | 没有「多任务功能必须集成验收」的约束 | 无 |
+| 计划版本 | 一次性落档，改计划没有版本/diff | 无 |
+
+**影响**：模型容易给出「实现 XX 功能」巨型任务、按文件切碎、伪造依赖链、写域交叠、
+单任务全绿但功能不可用。需要 **PC-3E 任务拆分器**（DAG 校验 + 尺寸/交叠/集成规则 + 批次）
+和 **PC-5D 计划审阅 UI**，把「拆得对」变成可校验、可修改、可版本化的流程。
+
 ---
 
 ## 5. 产品形态定稿（建议）
@@ -510,6 +529,7 @@
 | **PC-2A 摘要 + 双查询检索** | `production.prepare.understand|status`；**LLM #1** 总结需求/附件/关键词（`digest_ms` 单独计）→ **两次 embed**（原文 + 关键词，合计 ≤5s）→ 双查询图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）→ RRF 合并 → 上下文包（`evidence_id`/配额/裁剪）→ **LLM #2**；召回门控（`recall_gap`/`single_query` 不补第三轮）；证据校验；理解缓存与预 warm；检索 10s 硬超时出 partial | PC-2 + PC-2B | 单测/基准：摘要调用发生且无附件也跑；两次 embed 有独立超时与合计 ≤5s 预算；双查询都贡献、RRF 去重；检索 P95 ≤10s（不含两次 LLM）；冷启动/单路失败出 `partial/recall_gap/degraded`；结论引用 `evidence_id`；缓存命中 0 摘要/0 检索/0 模型 |
 | **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
 | **PC-3C 文档维护边界** | 代码任务默认不写 `docs/`；计划可单独列文档任务（`write_scope` 只含目标文档、与同文档代码任务串行）；执行站写域校验；不自动改 work-log/project-status/known-issues；文档任务验收/台账 | PC-3 | 单测：代码任务越界写 docs 被拒；文档任务只写目标文档；同文档任务不并行；项目文档未被自动修改 |
+| **PC-3E 任务拆分器** | 扩展 `goal/task_type/conflicts_with/serial_group/gate/risk/contract/rationale`；DAG 校验（环/跨计划依赖/写域交叠/尺寸/门控/集成任务）；确定性修正（超限拆分、微任务合并、交叠串行、去伪依赖）；批次计算；计划版本 `plan-vN` | PC-3 | 单测：环被拒；无门控/无验收/缺集成被拒；写域交叠不能同批；超大任务被拆；微任务合并；批次与 `max_parallel` 一致；改计划生成新版本 |
 | **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input/日期目录 → .input/production_lines/<line>/tasks/<task>/attachments/` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除；首版允许只存（known-issues #51） | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
 | **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
 | **PC-3D 附件理解边界** | LLM #1 总结附件（文本摘要/图片视觉总结/关键词）；关键词并入查询 B；图片预处理（像素上限/EXIF 剥离/长边 360–1024/动图首帧/透明/去重/最多 4 张/总 ≤12MB）；非视觉 `image_manual_reference`；MIME 嗅探、路径校验、base64 不入包/日志、SVG 禁脚本；LLM #2 默认读摘要，必要时附图 | PC-3A/3B + PC-2A | 单测：文本附件摘要/关键词进查询 B；视觉模型总结图片、非视觉不伪造；超大图降采样/拒绝；损坏图 unreadable；重复图去重；>4 张截断；EXIF 不残留；base64 不出现在上下文包/日志 |
@@ -519,10 +539,11 @@
 | **PC-5 准备阶段 UI** | 五栏表单、问题卡（默认/推荐/后果）、窗口提示、落档预览与摘要、开始执行（理解卡见 PC-5A） | PC-2 | UI 单测：空泛词提示、未答禁止落档、全部按推荐、落档后任务可见；`flutter analyze` 0 |
 | **PC-5B 就绪门 UI** | 产线头「初始化中」、清单/进度/重新检测、开任务按钮禁用、`409` 文案翻译、完成后自动刷新；「查看构建日志」 | PC-2B | UI 单测：缺项逐条显示、按钮禁用、补齐后自动放行、stale 后重新显示阻塞；`flutter analyze` 0 |
 | **PC-5C 归一化预览 UI** | 归一化文件列表、diff 查看、动作/rewrite 警告、应用/取消、写入进度、失败回滚提示、运行记录 | PC-2C | UI 单测：plan 不写盘、diff 正确、rewrite 需二次确认、apply 后刷新就绪门、失败显示回滚结果；`flutter analyze` 0 |
+| **PC-5D 计划审阅 UI** | 任务 DAG/列表、尺寸与风险、写域交叠/无门控/缺集成警告、批次预览、拆分/合并/改依赖/改门控、锁定与计划版本 diff | PC-3E | UI 单测：警告逐条可见、拆分/合并后重算批次、未解决警告禁止落档、锁定后生成 plan-vN；`flutter analyze` 0 |
 | **PC-5A 理解卡 UI** | 「开始理解」→ LLM #1 摘要进度 → 10s 检索倒计时 →「上下文已就绪」→ LLM #2 单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A + PC-5B | UI 单测：摘要阶段可见、10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用摘要+上下文、重新理解生成新 id；`flutter analyze` 0 |
 | **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、右栏任务详情页（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
-| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-5C/PC-6/PC-7/PC-9/PC-10 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
+| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-5C/PC-5D/PC-6/PC-7/PC-9/PC-10 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
 
 ### 8.1 实施导航（文件级）
 
@@ -579,6 +600,7 @@
 | TC-PL-C24 | 附件理解：LLM #1 总结文本/图片并产出关键词；关键词进入查询 B；非视觉 `image_manual_reference`；超大/动图/透明/损坏/重复/超量按 §5.2.10；上下文包/日志无 base64 |
 | TC-PL-C25 | 关键词质量：摘要输出含 terms/synonyms/entities/files/apis 与附件关键词；空关键词/摘要失败按 `digest_fallback` 或重试，不用原文静默替代 |
 | TC-PL-C26 | 稳定性控制面：重复派发只执行一次；过期租约写被拒；杀进程/断网/部分写后恢复不丢不重；执行者改门控结果被拒；换模型黄金任务通过；恢复耗时 SLO |
+| TC-PL-C27 | 任务拆分：环/跨计划依赖被拒；无门控/无验收/缺集成任务不能落档；写域交叠不能同批；超大任务拆分、微任务合并；批次与 max_parallel 一致；改计划生成 plan-vN |
 
 ---
 
