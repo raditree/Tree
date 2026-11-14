@@ -18,6 +18,8 @@
    `设置服务 > 环境变量 > 插件 config > schema 默认` 合并（与 D28 同口径）。
 4. **secret 只写不读**：schema 的 `secret` 类型永远不回显，只回 `has_value`。
 5. **v1 只做 team 作用域**：设置按团队隔离；全局设置仍归现有核心设置页，不混进来。
+   **v2 增量（2026-11-14）**：新增 `binding: plugin` 全局库，插件级/机器级配置不再按团队切碎；
+   `binding: team` 保留为显式团队覆盖能力，缺省仍是 `team`（兼容旧调用）。
 6. **可选依赖**：需要 UI 设置的插件才 `requires: tree.settings`；没有它时插件退回
    `.docnorm/config.json` 一类自有配置，不阻塞启动。
 7. **不依赖 `tree.storage`**：`tree.settings` 自己一个 Sembast 库，K 车道不被 I 车道阻塞。
@@ -60,12 +62,17 @@
 ## 4. 数据模型
 
 ```text
-<data_root>/settings/<team_id>/settings.semdb
+<data_root>/settings/<team_id>/settings.semdb   # team 绑定（默认）
   schemas   key = "<owner_plugin_id>"            value = {schema...}
   values    key = "<owner_plugin_id>|<key>"      value = {value, updated_at}
+<data_root>/plugin_settings/settings.semdb      # plugin 绑定（全局，不要求 team_id）
+  schemas / values 同上
 ```
 
-- `team_id` 从核心解析的 `scope` 取，不从调用方 payload 取；取不到 ⇒ 拒绝。
+- 所有 `settings.*` 命令接受可选 `binding: team | plugin`（缺省 `team`）。
+- `team`：`team_id` 从核心解析的 `scope` 取，取不到 ⇒ `team_required`。
+- `plugin`：忽略 team/agent/session，owner 仍只认 `meta.source_plugin_id`；回包带 `binding`（plugin 时 `team_id` 为空串）。
+- 设置页与仓库内调用方默认使用 `binding: plugin`；团队覆盖仍可通过显式 `binding: team` 读写。
 - 每个插件一个 `owner_plugin_id`；调用方只能写自己的 key（核心 `meta.source_plugin_id`）。
 - schema 版本：`schema_version` 单调递增；同版本重复注册幂等，低版本拒绝覆盖高版本。
 - 值的类型由 schema 决定；写入前按类型/范围校验；`secret` 只存值、不回显。
@@ -138,8 +145,9 @@
 | POST | `/api/plugin-settings/reset` | `{plugin_id, keys:[...]}` |
 | POST | `/api/plugin-settings/apply` | 请求插件重新读取并热应用（可选） |
 
-**`team_id` 必须放在 query**：核心只从 query 透传 `scope.team_id`；缺 ⇒ 400
-`team_required`（不落公共库）。UI 卡片必须把当前 Agent / 团队 id 作为 `team_id` 传入。
+**`team_id` 只在 team 绑定时必须放在 query**：核心只从 query 透传 `scope.team_id`；缺 ⇒ 400
+`team_required`（不落公共库）。`binding=plugin` 时不需要 `team_id`，设置页直接编辑全局值。
+UI 卡片默认按全局加载；需要团队覆盖时显式传 `team_id` 且不带 `binding=plugin`。
 
 写入类路由（PATCH / reset）先确认 `plugin_id` 已有 schema，未注册 ⇒ 404
 `unknown_plugin`（不接受给陌生 owner 写覆盖值）。

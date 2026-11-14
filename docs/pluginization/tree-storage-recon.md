@@ -57,15 +57,23 @@
 ## 4. 数据布局与生命周期
 
 ```text
-<data_root>/storage/<team_id>/<plugin_id>/data.semdb   # 运行时真源（每团队 × 每插件一个库）
+<data_root>/storage/<team_id>/<plugin_id>/data.semdb   # 团队绑定（默认）
 <data_root>/storage/<team_id>/<plugin_id>/export/      # 导出快照（可删，可重建）
   <collection>/<UTC>/data.ndjson                        # 单文件全量（当前实现，见 §7 偏离说明）
-  <collection>/<UTC>/manifest.json                      # format/version/team/namespace/schema/count/sha256/created_at
+  <collection>/<UTC>/manifest.json                      # format/version/binding/team/namespace/schema/count/sha256/created_at
+<data_root>/plugin_storage/<plugin_id>/data.semdb      # plugin 绑定（全局，不要求 team_id）
 ```
 
+**绑定维度**：所有 `storage.*` 命令接受可选 `binding: team | plugin`（缺省 `team`，兼容旧调用）。
+
+- `team`：`team_id` 只从核心解析的 `scope` 取，取不到 ⇒ `team_required`。
+- `plugin`：忽略 team/agent/session，库只按 `namespace` 落盘；`namespace` 缺省 = 调用方 `plugin_id`。响应带 `binding`（team 时同时回 `team_id`，plugin 为空串）。
+- `plugin_storage/` 是独立顶层目录，不与合法 team 名冲突，也不需要迁移旧数据。
+
 **实例粒度**：`plugin.json` 用 `granularity: team`（与 `tree.agent` / 执行器同口径）。
-平台会为每个 team 起一个实例，**路径必须带 team_id**，否则多团队实例会打开同一个库文件。
-`team_id` 只从核心解析的 `scope` 取，不从调用方 payload 取；取不到 ⇒ 拒绝（fail-closed）。
+team 绑定的路径必须带 team_id；plugin 绑定走独立目录，不随团队分库。所有访问都经
+storage 执行站单进程，插件级库不会被多个调用方进程同时打开。
+`team_id` 只从核心解析的 `scope` 取，不从调用方 payload 取；team 绑定取不到 ⇒ 拒绝（fail-closed）。
 
 - 目录与文件名走 `safeSegment` 同口径（只允许 `[A-Za-z0-9_.-]`）。
 - 插件启动时打开自己的库；停止/热重启前 `close()`；崩溃后由 Sembast 自身追加日志恢复。

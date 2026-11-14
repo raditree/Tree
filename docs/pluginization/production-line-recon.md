@@ -681,6 +681,62 @@ Agent 侧工具白名单（`tree.agent` 增量，未新增核心点位）：
 **准备阶段完成的判据**：`recon.md` 四节齐全 + 每条 `Q` 都已由用户 `answered`（**没有 assumed**）
 + `plan.md` 每个任务都有验收判据 + 队列状态可重建。未满足时任务停在 `awaiting_user`。
 
+### 8.7 P6+ 逻辑去重（Embedding 预筛）
+
+> 实施记录（2026-11-14，插件 `0.10.0`）。目标：在 FNV 精确去重之外补一条「语义/逻辑
+> 相似」召回链；**不改变** `production.audit.run` 与 `AuditReport` schema。
+
+#### 8.7.1 命令与 REST
+
+- `production.dedup.run {line_id, mode?: incremental|rebuild, limit?}`：推进一个有界批次
+  （scan → embed → compare → finalize），返回 `{run_id, mode, done, percent, progress,
+  model, dimensions, degraded, reasons}`。
+- `production.dedup.status {line_id}`：只读 `dedup_meta` + 已落盘结果，不跑 git、
+  不发 embedding。
+- `GET /api/production/lines/{lineId}/dedup`（零成本）/ `POST .../dedup`（显式付费动作）。
+- 错误码：`git_required` / `git_unavailable` / `git_timeout` / `storage_unavailable` /
+  `dedup_in_progress` / `head_moved` / `embedding_failed`；无 embedding 模型时
+  `mode=unavailable`、`degraded=true`，FNV 链不受影响。
+
+#### 8.7.2 数据与缓存（`tree.storage` 的 `binding=plugin`）
+
+| 集合 | key | 说明 |
+| --- | --- | --- |
+| `dedup_files` | `<repo>#file:<path>` | 文件内容哈希 + `chunk_ids`（删/改名反查） |
+| `dedup_chunks` | `<repo>#chunk:<id>` | 函数块（path/scope/signature/hash/text/vec_key/vector_ok） |
+| `dedup_vectors` | `<repo>#vec:<vecKey>` | 内容寻址向量；`vecKey` 含 chunk 全字节哈希 + 模型 + 分块/settings 版本 + seed=42 + 归一化/池化/前缀 + 维度 |
+| `dedup_results` | `<repo>#result:<chunkId>` | 每个源块一条 top-k 命中（score / exact） |
+| `dedup_meta` | `<repo>#meta` | `baseline_sha` + 最近一轮统计（`pipeline_version` 每轮记录） |
+
+- 只处理 `git ls-files` 跟踪的代码文件（dart/py/go/rs/ts/tsx/js/jsx/vue）；
+- 分块：类/impl 作用域 + 函数声明，字符状态机找闭合；失败整文件 `(file)` fallback；
+  `chunk id = path + scope + 内容哈希`，不含行号；
+- 增量：`git diff --name-status -M`；删除/改名按 file→chunk 清理，finalize 统一 GC
+  孤儿向量；`mode=rebuild` 清空 `<repo>#` 后全量重建；
+- 比对：新/变更 chunk 与全库索引做 top-k（`threshold` / `top_k` 可配），不只在变更集内互比。
+
+#### 8.7.3 设置（`tree.settings` 的 `binding=plugin`）
+
+`dedup_enabled / dedup_model / dedup_similarity_threshold / dedup_top_k /
+dedup_embed_batch / dedup_instruction_prefix / dedup_normalize / dedup_pooling /
+dedup_max_file_bytes / dedup_files_per_request / dedup_compare_per_request /
+dedup_max_index_chunks`；优先级 `settings > TREE_PL_DEDUP_* > 默认`。改阈值/top-k
+只重算比对；改模型/前缀/归一化/维度/分块版本会使 `vecKey` 失效并重嵌。
+
+#### 8.7.4 验收
+
+- 首轮全量基线；无变更二次运行 embedding 请求 **0**；
+- 改一个函数只重嵌新 chunk；改名内容不变 0 次新 embedding；
+- 删除/改名后旧 chunk 清理；新 chunk 能命中另一个未变更文件里的同内容函数；
+- `mode=rebuild` 幂等；seed=42 与确定性排序保证结果可复现。
+
+#### 8.7.5 边界与已知限制
+
+- Embedding 只做逻辑相似预筛，不承诺字节完全相同；`exact=true` 由 chunk 哈希二次确认；
+- 未跟踪文件不参与（需先 `git add`）；
+- 全局索引暴力比对，`dedup_max_index_chunks` 超限会截断并在 `reasons` 里说明；
+- 状态文件在插件数据 `<line>/dedup_state.json`（含 10 分钟陈旧锁），缓存与结果在 storage。
+
 ---
 
 ## 9. 细化与执行阶段
