@@ -61,6 +61,27 @@ L5 产品验收门（PS / TC）
 - `blocked` 表示前置门未过；`fail` 表示门控执行了但没达标。
 - 所有 `evidence.path` 相对产线资产目录，写入后只读。
 
+### 2.1 `- [ ]` 勾选语义
+
+本文件所有门控项都以 `- [ ]` 出现；这是逐条核对/确认的唯一格式：
+
+```markdown
+- [ ] LG-01 结构报告 fresh，high=0 或逐项豁免
+  evidence: structure.json / findings.json / waivers.json
+- [x] TG-11 出口清单全部勾选且有 evidence
+  evidence: tasks/T1/gates/run-03/gate.json
+- [ ] SG-03 杀进程后恢复不丢不重
+  waived: owner=user reason=本机无故障注入环境 expires_at=2026-12-31
+```
+
+规则：
+
+- **未勾选 = 不通过**，不允许“默认通过”。
+- **勾选但没有 `evidence:` = 不通过**；`[x]` 只是人工确认，最终以 gate runner 的 `gate.json` 为准。
+- `waived` 只允许结构门 high 项；必须写 owner/原因/到期，到期自动回到未通过。
+- 每个门控项都要能定位到 `evidence` 路径；没有证据路径的门控项不得写入计划。
+- UI 把 `- [ ]` 渲染成逐行核对表；计划/任务/批次三层都可复制同一份清单。
+
 ---
 
 ## 3. L0 产线就绪门
@@ -149,6 +170,7 @@ organizing（只允许 cleanup 任务）
 
 | ID | 门控 | 判据 | 失败码 |
 | --- | --- | --- | --- |
+| PG-00 | 计划 7 块完整 | 方案设计/不变量账本/任务 DAG/出口门禁/追踪矩阵/风险与未知/变更控制齐全 | `plan_incomplete` |
 | PG-01 | 原始需求编号 | 每条需求有 `REQ-xx`，保留原文 | `plan_requirement_missing` |
 | PG-02 | 需求→门控 | 每条 `REQ-xx` 至少映射一个任务与一个 `- [ ]` 门控 | `plan_traceability_gap` |
 | PG-03 | 依赖图 | 无环；依赖都在本次计划或已存在任务中 | `plan_cycle` / `plan_dependency_missing` |
@@ -370,6 +392,169 @@ R1 起草 → R2 批判（只出 findings）→ R3 修正（打补丁）
 | PC-5D/5E | PG-01~10 UI |
 | PC-10 稳定性控制面 | SG-01~06 |
 | PC-8 真模型 E2E | BG-09~12、AG-01~11 |
+
+---
+
+## 附录 A：全量门控核对清单（复制到计划 / 任务 / 批次）
+
+> 用法：计划阶段复制 L0/L1；每个任务复制 L2；每批复制 L3/L4；验收复制 L5。
+> 每项必须有 `evidence:`，否则视为未通过。
+
+### A.1 L0 产线就绪门
+
+```markdown
+- [ ] LG-01 结构报告 fresh；high=0 或逐项豁免；包职责覆盖全部包；公共 API 清单冻结；依赖环=0；分层违规=0；重复/大文件/文档缺口/TODO 已分类
+  evidence: structure.json / findings.json / waivers.json
+- [ ] LG-02 docnorm 的 doc_state 已生成；归一化产物落盘；无文档时 no_docs 明确
+  evidence: docnorm/state.json
+- [ ] LG-03 pkg_index 就绪且 stale=false
+  evidence: graph/pkg_index.json
+- [ ] LG-04 graph_* 与 doc_state 指纹一致
+  evidence: graph/graph_meta.json
+- [ ] LG-05 dedup_chunks/dedup_vectors 与 baseline_sha 一致
+  evidence: dedup/index_meta.json
+- [ ] LG-06 test/ ↔ lib/ 映射已生成
+  evidence: graph/test_map.json
+- [ ] LG-07 LG-01~06 全过，且 graph_version 固定
+  evidence: line/ready.json
+```
+
+### A.2 L1 计划门
+
+```markdown
+- [ ] PG-00 方案设计/不变量账本/任务 DAG/出口门禁/追踪矩阵/风险与未知/变更控制 7 块齐全
+  evidence: plans/plan-vN/plan.json
+- [ ] PG-01 每条原始需求有 REQ-xx，且原文保留
+  evidence: plans/plan-vN/requirements.json
+- [ ] PG-02 每条 REQ-xx 至少映射一个任务与一个 - [ ] 门控，且门控有 evidence 位
+  evidence: plans/plan-vN/traceability.json
+- [ ] PG-03 依赖无环；依赖都在本次计划或已存在任务中
+  evidence: plans/plan-vN/dag.json
+- [ ] PG-04 每任务 1–5 文件、≤300 改动行、≤1 包；超限有拆分理由
+  evidence: plans/plan-vN/size.json
+- [ ] PG-05 同批任务写域不相交；交叠已串行或拆文件
+  evidence: plans/plan-vN/batches.json
+- [ ] PG-06 每任务至少一个可执行门控（命令/检查 + 期望）
+  evidence: plans/plan-vN/gates/
+- [ ] PG-07 多任务功能有 integration 任务，依赖全部代码任务
+  evidence: plans/plan-vN/tasks.json
+- [ ] PG-08 公共 API/schema/权限/UX 变更均有 DEC-xx 与对应门控
+  evidence: decisions/DEC-xx.json
+- [ ] PG-09 迁移计划先有基线冻结与契约冻结任务
+  evidence: baseline-v1 / contract.md
+- [ ] PG-10 至少一轮起草→批判→修正；high findings 已关闭或显式未决
+  evidence: plans/plan-vN/findings.json
+```
+
+### A.3 L2 任务门（每任务复制一份）
+
+```markdown
+- [ ] TG-01 brief 或 intake.goal 非空；acceptance ≥1；附件 sha256 与登记一致
+  evidence: tasks/T1/input.json
+- [ ] TG-02 depends_on 全部 done 且证据在
+  evidence: tasks/T1/deps.json
+- [ ] TG-03 写域不与在途任务交叠；租约可获取
+  evidence: tasks/T1/lease.json
+- [ ] TG-04 未超 token/时间预算；并行槽位可用
+  evidence: tasks/T1/budget.json
+- [ ] TG-05 LG-07 通过
+  evidence: line/ready.json
+- [ ] TG-06 LG-01 通过；非 cleanup 任务不在 organizing 阶段
+  evidence: line/structure.json
+- [ ] TG-07 每次写前 realpath ⊆ write_scope；越界拒绝
+  evidence: tasks/T1/gates/run-*/scope.log
+- [ ] TG-08 写入带当前 fencing token；过期 token 拒绝
+  evidence: tasks/T1/gates/run-*/lease.log
+- [ ] TG-09 token/时间未超；到点软停
+  evidence: tasks/T1/usage.json
+- [ ] TG-10 未授权改公共 API/schema/权限 → 阻断
+  evidence: tasks/T1/gates/run-*/api.diff
+- [ ] TG-11 出口清单全部勾选，且每项有 evidence
+  evidence: tasks/T1/gates/run-*/gate.json
+- [ ] TG-12 命令、退出码、stdout/stderr 哈希、时间戳齐全
+  evidence: tasks/T1/gates/run-*/
+- [ ] TG-13 changed_files ⊆ write_scope
+  evidence: tasks/T1/gates/run-*/scope.diff
+- [ ] TG-14 公共 API/schema/权限/错误码未变，或 DEC-xx 已批准
+  evidence: tasks/T1/gates/run-*/api.diff / schema.sha256
+- [ ] TG-15 回滚脚本/步骤存在且演练通过
+  evidence: tasks/T1/gates/run-*/rollback.log
+- [ ] TG-16 契约/README/工作日志与代码一致（如任务涉及）
+  evidence: tasks/T1/gates/run-*/docs.log
+```
+
+### A.4 L3 批次门（每批复制一份）
+
+```markdown
+- [ ] BG-01 本批 changed_files ⊆ 计划写域并集
+  evidence: batches/B1/gates/scope.diff
+- [ ] BG-02 公共 API 集合与冻结清单一致，或 DEC-xx 已批
+  evidence: batches/B1/gates/api.diff
+- [ ] BG-03 schema checksum 与基线一致，或迁移单已批
+  evidence: batches/B1/gates/schema.sha256
+- [ ] BG-04 golden 输出 diff=0（或约定容差内）
+  evidence: batches/B1/gates/golden.diff
+- [ ] BG-05 依赖图无新增环、无分层违规、无跨包私有引用
+  evidence: batches/B1/gates/dependency.diff
+- [ ] BG-06 迁移前后行数/校验和/不变量对账通过
+  evidence: batches/B1/gates/data_reconcile.json
+- [ ] BG-07 契约/README/决策记录与代码一致
+  evidence: batches/B1/gates/doc.diff
+- [ ] BG-08 每个 diff 能映射到任务/需求
+  evidence: batches/B1/gates/traceability.json
+- [ ] BG-09 integration 任务完成，依赖全部代码任务
+  evidence: tasks/T-int/gates/run-*/gate.json
+- [ ] BG-10 每条 REQ-xx 的验收场景通过
+  evidence: batches/B1/gates/acceptance.json
+- [ ] BG-11 全量测试 + 关键路径 smoke 通过
+  evidence: batches/B1/gates/regression.log
+- [ ] BG-12 性能预算与兼容窗口达标
+  evidence: batches/B1/gates/nonfunctional.json
+```
+
+### A.5 L4 稳定性门
+
+```markdown
+- [ ] SG-01 同一任务同时只有一个有效租约；重复派发只执行一次
+  evidence: stability/lease_fencing.json
+- [ ] SG-02 重复命令不重复建任务/不重复写
+  evidence: stability/idempotency.json
+- [ ] SG-03 杀进程/断网/部分写后恢复不丢不重
+  evidence: stability/recovery.json
+- [ ] SG-04 执行者改 gate.json/证据被拒
+  evidence: stability/gate_tamper.json
+- [ ] SG-05 黄金任务在新模型下通过
+  evidence: stability/model_swap.json
+- [ ] SG-06 恢复耗时在 SLO 内；blocked/retry 指标可查
+  evidence: stability/slo.json
+```
+
+### A.6 L5 产品验收门
+
+```markdown
+- [ ] AG-01 PS-0 / TC-PL-C19：摘要 + 双查询；两次 embed ≤5s；检索 P95 ≤10s
+  evidence: acceptance/AG-01.json
+- [ ] AG-02 PS-10 / TC-PL-C20：LLM #2 结论均有 evidence_id；无证据进未知
+  evidence: acceptance/AG-02.json
+- [ ] AG-03 PS-11 / TC-PL-C21：就绪门未过时开任务全部 409
+  evidence: acceptance/AG-03.json
+- [ ] AG-04 PS-12 / TC-PL-C22：归一化预检写入、幂等、回滚
+  evidence: acceptance/AG-04.json
+- [ ] AG-05 PS-13 / TC-PL-C23：项目文档默认只读；文档任务串行
+  evidence: acceptance/AG-05.json
+- [ ] AG-06 PS-14 / TC-PL-C24：附件摘要/图片边界正确
+  evidence: acceptance/AG-06.json
+- [ ] AG-07 PS-15 / TC-PL-C26：稳定性控制面失败语义
+  evidence: acceptance/AG-07.json
+- [ ] AG-08 PS-16 / TC-PL-C27：任务拆分、批次、计划版本
+  evidence: acceptance/AG-08.json
+- [ ] AG-09 PS-17/18 / TC-PL-C28：计划迭代、追踪矩阵、漂移哨兵
+  evidence: acceptance/AG-09.json
+- [ ] AG-10 PS-19 / TC-PL-C29：项目整理硬前置
+  evidence: acceptance/AG-10.json
+- [ ] AG-11 TC-PL-C15：真模型端到端
+  evidence: acceptance/AG-11.json
+```
 
 ---
 
