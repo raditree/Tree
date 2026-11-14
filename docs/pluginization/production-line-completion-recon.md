@@ -43,10 +43,10 @@
    产物只列路径文本、不能点开
    （[:1193-1210](../../plugins/tree.ui.default/lib/ui/widgets/production_line_workbench.dart#L1193-L1210)）。
    `pack.json`、门控输出、员工问答、专家调用这些最需要看的东西，UI 一个都没有展示入口。
-6. **核心差异还没落地：没有「单次图谱搜索 + 一次 LLM」的 10 秒检索**。当前侦查已经是
+6. **核心差异还没落地：没有「先摘要关键词 + 双查询检索 + 一次 LLM」的理解链**。当前侦查已经是
    `docnorm.query` → `llm.call` 的单次调用（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)），
-   方向对，但只查文档：没有代码/包/测试/风险聚合，没有一次性上下文包与 `evidence_id`，
-   没有单次召回门控，也没有「检索 ≤10s（不含 LLM）」的预算/缓存（§4.9）。
+   但只查一次文档、没有关键词、没有附件摘要：既没有 LLM #1 总结需求/附件/关键词，
+   也没有「原文 + 关键词」两次 embed 与 RRF 合并，更没有 `evidence_id` 与检索门控（§4.9）。
 7. **补齐的正确姿势是「接产品闭环」**：新增准备阶段 REST、10s 检索/上下文包服务、任务详情/编辑 REST、
    事件广播、驱动补洞与工作台三段式 UI；后端已有能力全部复用。
 8. **阶段口径冲突**：当前是「稳定性迭代（只修缺陷、补测试）」且明确「新能力一律不入本期」
@@ -256,27 +256,26 @@
   （[project-status.md:34](../project-status.md#L34)）。所有单测都是假 LLM，真实模型下的
   提示词质量、JSON 合法性、工具调用与预算尚未验证。
 
-### 4.9 核心差异缺位：没有「单次图谱搜索 + 一次 LLM」的 10 秒检索
+### 4.9 核心差异缺位：没有「先摘要关键词 + 双查询检索 + 一次 LLM」的理解链
 
-产品要的是「一次图谱搜索召回全部所需上下文 → 一次性拼装背景（≤10s，不含 LLM）→
-一次 LLM 直接进入语义对齐」。当前实现方向相同（一次 `docnorm.query` + 一次 `llm.call`），
-但上下文不完整、无门控、无检索预算：
+产品要的是「LLM #1 总结用户要求/附件/关键词 → 原文与关键词两次 embed（合计 ≤5s）→
+双查询图谱检索 + RRF 合并 → 上下文包 → LLM #2 直接进入语义对齐」。当前实现方向相同
+（一次 `docnorm.query` + 一次 `llm.call`），但只有单查询、无摘要、无附件、无门控：
 
 | 要求 | 现状 | 证据 |
 | --- | --- | --- |
-| 检索 10s SLO（不含 LLM） | 无检索预算/超时/partial；LLM 慢则整体慢，检索慢也没有门控点 | `production.prepare.recon` 顺序执行 `_queryDocs` → `_callLlm` → `parseReconJson`（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)） |
-| 单次搜索门控 | 只查文档；没有代码/包/测试/风险聚合；没有召回门槛 | `_queryDocs` 只调 `docnorm.query`；`reconUserPrompt` 吃 `memory` 字符串（[preparation.dart:806-825](../../plugins/tree.production.line/lib/src/preparation.dart#L806-L825)） |
-| 代码图谱 | `docnorm` GraphRAG **只对文档建图**；代码块索引在 dedup，但没有查询命令 | `query.dart` 只读 `graph_chunks`（文档）；`dedup_chunks/dedup_vectors` 只有 compare（[dedup_store.dart:18-19](../../plugins/tree.production.line/lib/src/dedup_store.dart#L18-L19)） |
-| 包结构 | 有 `pkg_index`，但没有面向需求的快速聚合查询 | `docnorm.scan` / `baseline` 写 `pkg_index`；产线未消费 |
-| 一次性上下文包 | 没有；模型只看 docnorm 返回的文档块 + 需求文本 | 无 `evidence_id` / 配额 / 裁剪口径 |
+| LLM #1 摘要/关键词 | 没有；需求原文直接拼进 prompt | `reconUserPrompt` 只吃需求 + `memory`（[preparation.dart:806-825](../../plugins/tree.production.line/lib/src/preparation.dart#L806-L825)） |
+| 双查询 | 只有一次 `docnorm.query`；没有关键词查询与 RRF | `_queryDocs` 单次调用（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)） |
+| 附件摘要 | 没有附件输入（PC-3A/3D 才加），更无图片总结 | `task.attachments` 未实现 |
+| 两次 embed ≤5s | 无 embed 预算/并行/超时降级 | 无 embed 调度 |
+| 一次性上下文包 | 没有；模型只看文档块 + 需求文本 | 无 `evidence_id` / 配额 / 裁剪口径 |
 | 证据与覆盖 | 侦查 JSON 是模型自述，没有逐条证据强制、没有覆盖读数 | `parseReconJson` 只校验四块结构（[preparation.dart](../../plugins/tree.production.line/lib/src/preparation.dart)） |
-| 理解缓存 / 预 warm | 无；每次重跑都重新查/重新调模型 | 无 `understanding` 缓存目录 |
-| 重试/重新理解口径 | 没有区分「同一上下文包重试」与「重新搜索 + 再调模型」 | 一次调用即全部 |
+| 检索 10s / 缓存 | 无检索预算、无 partial、无理解缓存 | 无 `understanding` 服务 |
 
-**影响**：LLM 不是问题（本来就需要），问题是**单次搜索召回不全、上下文没有打包、没有门控**，
-导致模型只能基于半份事实编理解。这一项必须单独立切片（PC-2A/PC-5A）：
-把检索扩成全维图谱、把上下文打成带 `evidence_id` 的包、加召回门控与「检索 ≤10s」预算，
-仍然只调一次 LLM（LLM 耗时单独记录，不计入 10s）。
+**影响**：LLM 不是问题，问题是**没有先摘要就检索、单查询召回不全、上下文不打包、没有门控**，
+导致召回可能跟需求无关，模型只能基于半份事实编理解。这一项必须单独立切片（PC-2A/PC-5A）：
+先 LLM #1 摘要/关键词，再双查询（两次 embed ≤5s）+ RRF，检索阶段 ≤10s，
+仍只调 LLM #2；附件摘要由 PC-3D 接入。
 
 ### 4.10 没有前置就绪门：文档归一化/索引未完成也能开任务
 
@@ -324,13 +323,13 @@
 
 **影响**：用户上传设计稿/截图后，理解卡完全看不到图；或者实现时把 base64 塞进 JSON、
 把动图/超大图直接送模型，导致超时/超 token/隐私问题。需要单列 **PC-3D 附件理解边界**，
-把「附件作为显式 evidence + 图片预处理 + 同一次 LLM 多模态」钉死（§5.2.9 口径）。
+把「LLM #1 先总结附件摘要/关键词 → 关键词进入查询 B → 图片预处理与安全」钉死（§5.2.10 口径）。
 
 ---
 
 ## 5. 产品形态定稿（建议）
 
-> 最终产品形态（10s 图谱检索 + 一次 LLM、默认落地页、准备四步、任务看板与右栏详情页、复盘工具、状态文案）见
+> 最终产品形态（先摘要关键词 + 双查询检索 + 一次 LLM、默认落地页、准备四步、任务看板与右栏详情页、复盘工具、状态文案）见
 > [production-line-product-form.md](production-line-product-form.md)；本节只给补齐所需的最小骨架。
 
 ### 5.1 工作台三段式
@@ -392,7 +391,7 @@
 | GET | `.../prepare` | `production.prepare.status` | 窗口/读取计数/侦查摘要/未答问题 |
 | POST | `.../prepare/window/open` / `close` | `production.prepare.window.*` | 跨日续答 |
 | POST | `.../prepare/finalize` | `production.prepare.finalize` | 落档 + 建子任务 + 返回摘要 |
-| POST | `.../tasks/{taskId}/understand` | `production.prepare.understand` | **单次图谱搜索 + 一次 LLM**：返回 `understanding_id/retrieval_ms/llm_ms/partial/recall_gap/coverage/evidence`；`reuse_context_id` 可复用上下文包重试 |
+| POST | `.../tasks/{taskId}/understand` | `production.prepare.understand` | **LLM #1 摘要 + 双查询 + LLM #2**：返回 `understanding_id/digest_ms/retrieval_ms/llm_ms/partial/recall_gap/degraded/coverage/evidence`；`reuse_context_id` 可复用上下文包与摘要重试 |
 | GET | `.../tasks/{taskId}/understand/{understandingId}` | `production.prepare.understand.status` | 进度 / 结果 / 证据（流式或轮询） |
 | GET | `/api/production/lines/{id}/graph` | `production.graph.status` | 包图/文档图/代码块索引的新鲜度与覆盖 |
 | GET | `/api/production/lines/{id}/ready` | `production.line.ready` | **前置就绪门**：`{ready, phase, progress, missing[], graph_version, checked_at}` |
@@ -491,18 +490,18 @@
 | **PC-2 准备阶段 REST** | `prepare/*` 六条写路由 + `GET prepare`；错误码映射；`agent_id` 透传 | PC-1 | 插件单测：intake→recon→answer→finalize 全链路；REST 形状测试；契约路由基线同步 |
 | **PC-2B 前置就绪门** | `production.line.ready` + `graph.rebuild`；文档归一化（`doc_state`/`no_docs`）+ 包图 + 文档图 + 代码索引 + 测试映射的完成判定；`line.ready` 固定 `graph_version`；`understand/task.create/task.attach/queue.dispatch/start/tick` 统一门控；HEAD/stale 自动失效 | PC-2 | 单测：任一项缺失时上述命令全部 `409 line_not_ready` 且带 `missing[]`；补齐后自动放行；stale 后重新阻塞；无文档 `no_docs` 可放行；无 force 参数 |
 | **PC-2C 归一化预检写入** | `production.normalize.plan/apply/rollback/status`；复用 `docnorm` `commit=false` 的 diff 与 `commit=true` 写入；写前 `before_sha256` + 备份/补丁；只追加/索引、不新建；`rewrite` 需 allowlist + 二次确认；失败回滚；幂等；不自动 commit；写入期间任务全禁 | PC-2B | 单测：plan 0 写盘且有 diff；apply 后文件内容与 diff 一致；重复 apply 0 写盘；写入失败回滚到原文；rewrite 未授权拒绝；路径穿越/符号链接拒绝；`graph_version` 含文档内容 hash |
-| **PC-2A 10s 单次检索** | `production.prepare.understand|status`；**一次**图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）→ 上下文包（`evidence_id`/配额/裁剪）→ **一次 LLM**；召回门控（`recall_gap` 不补第二轮）；证据校验；理解缓存与预 warm；**检索 10s 硬超时**（不含 LLM，`llm_ms` 单独记录）出 partial | PC-2 + PC-2B | 单测/基准：检索 P95 ≤ 10s（不含 LLM）；冷启动/门控不过出 `partial/recall_gap`；超时不空屏仍只调一次 LLM；结论引用 `evidence_id`；无 embedding 标 `degraded`；缓存命中 0 次检索/0 次模型调用 |
+| **PC-2A 摘要 + 双查询检索** | `production.prepare.understand|status`；**LLM #1** 总结需求/附件/关键词（`digest_ms` 单独计）→ **两次 embed**（原文 + 关键词，合计 ≤5s）→ 双查询图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）→ RRF 合并 → 上下文包（`evidence_id`/配额/裁剪）→ **LLM #2**；召回门控（`recall_gap`/`single_query` 不补第三轮）；证据校验；理解缓存与预 warm；检索 10s 硬超时出 partial | PC-2 + PC-2B | 单测/基准：摘要调用发生且无附件也跑；两次 embed 有独立超时与合计 ≤5s 预算；双查询都贡献、RRF 去重；检索 P95 ≤10s（不含两次 LLM）；冷启动/单路失败出 `partial/recall_gap/degraded`；结论引用 `evidence_id`；缓存命中 0 摘要/0 检索/0 模型 |
 | **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
 | **PC-3C 文档维护边界** | 代码任务默认不写 `docs/`；计划可单独列文档任务（`write_scope` 只含目标文档、与同文档代码任务串行）；执行站写域校验；不自动改 work-log/project-status/known-issues；文档任务验收/台账 | PC-3 | 单测：代码任务越界写 docs 被拒；文档任务只写目标文档；同文档任务不并行；项目文档未被自动修改 |
 | **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input/日期目录 → .input/production_lines/<line>/tasks/<task>/attachments/` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除；首版允许只存（known-issues #51） | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
 | **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
-| **PC-3D 附件理解边界** | 理解阶段把附件作为显式 evidence 注入上下文包；文本 ≤4k/个；图片预处理（像素上限/EXIF 剥离/长边 360–1024/动图首帧/透明/去重/最多 4 张/总 ≤12MB）；同一次 LLM 携带 image part；非视觉 `image_manual_reference`；MIME 嗅探、路径校验、base64 不入包/日志、SVG 禁脚本 | PC-3A/3B + PC-2A | 单测：文本 evidence 可引用；视觉模型收到图、非视觉不送图；超大图降采样/拒绝；损坏图 unreadable；重复图去重；>4 张截断；EXIF 不残留；base64 不出现在上下文包/日志 |
+| **PC-3D 附件理解边界** | LLM #1 总结附件（文本摘要/图片视觉总结/关键词）；关键词并入查询 B；图片预处理（像素上限/EXIF 剥离/长边 360–1024/动图首帧/透明/去重/最多 4 张/总 ≤12MB）；非视觉 `image_manual_reference`；MIME 嗅探、路径校验、base64 不入包/日志、SVG 禁脚本；LLM #2 默认读摘要，必要时附图 | PC-3A/3B + PC-2A | 单测：文本附件摘要/关键词进查询 B；视觉模型总结图片、非视觉不伪造；超大图降采样/拒绝；损坏图 unreadable；重复图去重；>4 张截断；EXIF 不残留；base64 不出现在上下文包/日志 |
 | **PC-9 记忆端口** | `tree.agent` 新增 `agent.memory.get/record`（`.self/memory.md` + 压缩摘要；未来升级只改 agent）；产线只加 `MemoryPort`（prepare/pack/run 三处注入）与终态回写；run 台账记 `memory_hash/sources`；项目文档收敛为一个 `projectContext` helper | PC-3 + tree.agent | 单测：记忆块进提示词、`pack.json` 无记忆正文、记忆变化不使 pack 失效、记忆不可用任务仍完成；契约测试钉住 `get/record` 形状 |
 | **PC-4 事件广播** | `broadcast.task_state`（seq）+ 写点 + REST 快照对齐；UI 订阅 + 3s 轮询兜底 | PC-1/PC-3 | 插件单测：seq 单调、重连去重；UI 单测：推送更新、断线轮询、断线横幅 |
 | **PC-5 准备阶段 UI** | 五栏表单、问题卡（默认/推荐/后果）、窗口提示、落档预览与摘要、开始执行（理解卡见 PC-5A） | PC-2 | UI 单测：空泛词提示、未答禁止落档、全部按推荐、落档后任务可见；`flutter analyze` 0 |
 | **PC-5B 就绪门 UI** | 产线头「初始化中」、清单/进度/重新检测、开任务按钮禁用、`409` 文案翻译、完成后自动刷新；「查看构建日志」 | PC-2B | UI 单测：缺项逐条显示、按钮禁用、补齐后自动放行、stale 后重新显示阻塞；`flutter analyze` 0 |
 | **PC-5C 归一化预览 UI** | 归一化文件列表、diff 查看、动作/rewrite 警告、应用/取消、写入进度、失败回滚提示、运行记录 | PC-2C | UI 单测：plan 不写盘、diff 正确、rewrite 需二次确认、apply 后刷新就绪门、失败显示回滚结果；`flutter analyze` 0 |
-| **PC-5A 理解卡 UI** | 「开始理解」→ 10s 检索倒计时/进度 →「上下文已就绪」→ 模型单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A + PC-5B | UI 单测：10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用上下文、重新理解生成新 id；`flutter analyze` 0 |
+| **PC-5A 理解卡 UI** | 「开始理解」→ LLM #1 摘要进度 → 10s 检索倒计时 →「上下文已就绪」→ LLM #2 单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A + PC-5B | UI 单测：摘要阶段可见、10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用摘要+上下文、重新理解生成新 id；`flutter analyze` 0 |
 | **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、右栏任务详情页（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
 | **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-5C/PC-6/PC-7/PC-9 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
@@ -513,11 +512,11 @@
 | --- | --- | --- |
 | 驱动 | `plugins/tree.production.line/tree.production.line_plugin.dart` | manual dispatch 后 `_scheduleEventTick`；finalize 回调；`start` |
 | 驱动 | `lib/src/orchestrator_service.dart` | 定时 tick 条件、状态计算、`consecutive_failures` 恢复 |
-| 理解（新） | `lib/src/understanding.dart` / `lib/src/understanding_service.dart` | 单次图谱聚合、上下文包/证据、召回门控、一次 LLM、证据校验、**10s 检索超时（不含 LLM）**、缓存与预 warm |
+| 理解（新） | `lib/src/understanding.dart` / `lib/src/understanding_service.dart` | LLM #1 摘要/关键词、两次 embed、双查询检索+RRF、上下文包/证据、召回门控、LLM #2、证据校验、检索 10s 超时、缓存与预 warm |
 | 就绪门（新） | `lib/src/readiness.dart` / `lib/src/readiness_service.dart` | 文档归一化/包图/文档图/代码索引/测试映射完成判定、`line.ready`、`graph_version`、HEAD/stale 失效、开任务命令统一门控 |
 | 归一化写入（新） | `lib/src/normalization.dart` / `lib/src/normalization_service.dart` | 复用 `docnorm` plan/apply；diff、备份/补丁、`before_sha256`、回滚、幂等、写入期任务冻结 |
 | 文档边界（新） | `lib/src/docs_guard.dart` | 项目文档默认只读、文档任务写域/串行校验、禁止自动改 work-log/project-status/known-issues |
-| 附件理解（新） | `lib/src/attachment_context.dart` | 文本 evidence、图片预处理/限额/安全、多模态 part、非视觉降级、base64 不入包 |
+| 附件理解（新） | `lib/src/attachment_context.dart` | 附件摘要/关键词（交 LLM #1）、图片预处理/限额/安全、多模态 part、非视觉降级、base64 不入包 |
 | 理解检索 | `lib/src/dedup_store.dart`（复用） / `tree.docnorm` `docnorm.query` | 代码块/向量 top-k、文档 BM25/hybrid、`pkg_index` 读取 |
 | REST | `lib/src/api.dart` | 新增 prepare/understand/ready/graph.rebuild/normalize/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
 | 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、附件复制与哈希、理解缓存、run 读取、保留策略 |
@@ -554,12 +553,13 @@
 | TC-PL-C16 | 任务内容/验收/附件可保存；缺内容或验收不能入队；保存草稿可后补 |
 | TC-PL-C17 | 文本附件可读、图片按视觉能力处理、PDF/Office 标不可读；附件越界/超限/改后重打包均符合 §6.0 |
 | TC-PL-C18 | 记忆块进准备/打包/执行提示词；`pack.json` 无记忆正文；记忆升级后产线零改动；记忆不可用时任务仍完成并记 `memory_unavailable` |
-| TC-PL-C19 | 单次检索：P95 ≤ 10s（**不含 LLM**）；冷启动/无 embedding 出 `partial/degraded`；`recall_gap` 不触发第二次检索；检索超时不空屏且仍只调一次 LLM；`llm_ms` 单独记录 |
-| TC-PL-C20 | LLM 结论均引用存在的 `evidence_id`；无证据项进「未知」；覆盖读数与图谱实际一致；「重新理解」生成新 id、 `reuse_context_id` 不重新检索 |
+| TC-PL-C19 | 摘要 + 双查询：LLM #1 无附件也跑；两次 embed 合计 ≤5s；两路查询都贡献并 RRF 去重；单路失败标 `single_query`；检索 P95 ≤10s（不含两次 LLM） |
+| TC-PL-C20 | LLM #2 结论均引用存在的 `evidence_id`；无证据项进「未知」；覆盖读数与图谱实际一致；「重新理解」生成新 id、 `reuse_context_id` 不重新摘要/检索 |
 | TC-PL-C21 | 前置就绪门：文档归一化/包图/文档图/代码索引/测试映射任一缺失时，理解/建任务/附件/派发/启动/tick 全部 `409 line_not_ready`；补齐后自动放行；HEAD 变化后重新阻塞；无 force 开关 |
 | TC-PL-C22 | 归一化预检写入：plan 0 写盘并返回 diff；apply 内容与 diff 一致；重复 apply 0 写盘；失败回滚；rewrite 未授权拒绝；写入期间任务全禁 |
 | TC-PL-C23 | 文档维护边界：代码任务越界写 `docs/` 被拒；文档任务只写目标文档且与同文档任务串行；work-log/project-status/known-issues 不被自动修改 |
-| TC-PL-C24 | 附件理解：文本附件进 evidence；视觉模型图片随同一次 LLM 读取；非视觉 `image_manual_reference`；超大/动图/透明/损坏/重复/超量按 §5.2.9；上下文包/日志无 base64 |
+| TC-PL-C24 | 附件理解：LLM #1 总结文本/图片并产出关键词；关键词进入查询 B；非视觉 `image_manual_reference`；超大/动图/透明/损坏/重复/超量按 §5.2.10；上下文包/日志无 base64 |
+| TC-PL-C25 | 关键词质量：摘要输出含 terms/synonyms/entities/files/apis 与附件关键词；空关键词/摘要失败按 `digest_fallback` 或重试，不用原文静默替代 |
 
 ---
 
