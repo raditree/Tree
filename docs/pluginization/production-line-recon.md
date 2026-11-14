@@ -737,6 +737,19 @@ dedup_max_index_chunks`；优先级 `settings > TREE_PL_DEDUP_* > 默认`。改�
 - 全局索引暴力比对，`dedup_max_index_chunks` 超限会截断并在 `reasons` 里说明；
 - 状态文件在插件数据 `<line>/dedup_state.json`（含 10 分钟陈旧锁），缓存与结果在 storage。
 
+### 8.8 整理报告落盘与增量重扫
+
+> 实施记录（2026-11-14，插件 `0.11.0`）。目标：点「整理报告」不再每次全量读文件。
+
+- **报告缓存**：扫描完成后把 `AuditReport` + 每文件结果（`size` / `mtime` / `digest` / `todos` / `large` / `skipped`）写入插件数据 `<line>/audit_cache.json`，同时记录文档清单；断点状态升到 v2（按文件条目存，旧状态自动丢弃）。
+- **普通查询（`refresh=false`）**：只做目录遍历 + `stat` 比对
+  - 无变化 ⇒ 直接回缓存，**0 次文件读取**；
+  - 有变化 ⇒ 回缓存并标 `stale:true` / `changed:N`，UI 显示「检测到 N 个文件有变化」，不自动重扫。
+- **重扫（`refresh=true`）**：按缓存做增量，只读新增/变更文件，未变文件复用条目；删掉的文件从条目里消失。首次扫描或缓存版本/工作空间不匹配时才全量。
+- **产物排除**：`<asset_dir>/<line>/audit.md` 不计入候选，避免写完报告下一次就判「有变化」。
+- **REST**：`GET /api/production/lines/{lineId}/audit?refresh=true`；响应新增 `cached` / `stale` / `changed` / `cache_generated_at`。
+- 分批续扫保留：增量时 `limit` 约束的是「本次待扫的变更文件数」，进度与 `audit_scan.json` 继续生效。
+
 ---
 
 ## 9. 细化与执行阶段
