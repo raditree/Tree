@@ -43,9 +43,13 @@
    产物只列路径文本、不能点开
    （[:1193-1210](../../plugins/tree.ui.default/lib/ui/widgets/production_line_workbench.dart#L1193-L1210)）。
    `pack.json`、门控输出、员工问答、专家调用这些最需要看的东西，UI 一个都没有展示入口。
-6. **补齐的正确姿势是「接产品闭环」，不是重写后端**：新增准备阶段 REST、任务详情/编辑 REST、
+6. **核心差异还没落地：没有「10 秒图谱理解」**。当前侦查是 `docnorm.query` → `llm.call`
+   同步出 JSON（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)），
+   LLM 在关键路径上、没有延迟预算、没有理解缓存、没有代码图谱聚合，也没有「证据覆盖率」；
+   与产品要的「10s 内真实全面地理解并进入对齐」不是一回事（§4.9）。
+7. **补齐的正确姿势是「接产品闭环」**：新增准备阶段 REST、10s 理解服务、任务详情/编辑 REST、
    事件广播、驱动补洞与工作台三段式 UI；后端已有能力全部复用。
-7. **阶段口径冲突**：当前是「稳定性迭代（只修缺陷、补测试）」且明确「新能力一律不入本期」
+8. **阶段口径冲突**：当前是「稳定性迭代（只修缺陷、补测试）」且明确「新能力一律不入本期」
    （[project-status.md:6](../project-status.md#L6)）。本项属于**新能力补齐**，需拍板切阶段
    或单开一条不占本期发布窗口的车道（§10 P1）。
 
@@ -252,11 +256,30 @@
   （[project-status.md:34](../project-status.md#L34)）。所有单测都是假 LLM，真实模型下的
   提示词质量、JSON 合法性、工具调用与预算尚未验证。
 
+### 4.9 核心差异缺位：没有 10 秒图谱理解
+
+产品要的是「需求提交后 10s 内给出真实全面的理解卡，立刻进入语义对齐」；
+当前实现是**一次同步 LLM 侦查**，两者差距是结构性的：
+
+| 要求 | 现状 | 证据 |
+| --- | --- | --- |
+| 10s 硬 SLO | 无预算、无超时、无部分结果；LLM 慢就整体慢 | `production.prepare.recon` 顺序执行 `_queryDocs` → `_callLlm` → `parseReconJson`（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)） |
+| 图谱先于模型 | LLM 在关键路径；图谱只用来喂一段文本 | 同上；`reconUserPrompt` 吃 `memory` 字符串（[preparation.dart:806-825](../../plugins/tree.production.line/lib/src/preparation.dart#L806-L825)） |
+| 代码图谱 | `docnorm` GraphRAG **只对文档建图**；代码块索引在 dedup，但没有查询命令 | `query.dart` 只读 `graph_chunks`（文档）；`dedup_chunks/dedup_vectors` 只有 compare（[dedup_store.dart:18-19](../../plugins/tree.production.line/lib/src/dedup_store.dart#L18-L19)） |
+| 包结构 | 有 `pkg_index`，但没有面向需求的快速聚合查询 | `docnorm.scan` / `baseline` 写 `pkg_index`；产线未消费 |
+| 证据与覆盖 | 侦查 JSON 是模型自述，没有逐条 `path:line` 强制、没有覆盖读数 | `parseReconJson` 只校验四块结构（[preparation.dart](../../plugins/tree.production.line/lib/src/preparation.dart)） |
+| 理解缓存 / 预 warm | 无；每次重跑都重新查/重新调模型 | 无 `understanding` 缓存目录 |
+| 深化与首版分离 | 没有「先出可对齐版本、后台深化」的机制 | 一次调用即全部 |
+
+**影响**：即使把 REST/UI 接上，准备阶段仍然是「等模型慢慢侦查」，
+与「10s 图谱理解」的核心卖点不一致；「全面」也无法证明（没有覆盖率与证据约束）。
+这一项必须单独立切片（PC-2A/PC-5A），不能混在普通 prepare REST 里。
+
 ---
 
 ## 5. 产品形态定稿（建议）
 
-> 最终产品形态（默认落地页、准备四步、任务看板与详情抽屉、复盘工具、状态文案）见
+> 最终产品形态（10s 图谱理解、默认落地页、准备四步、任务看板与右栏详情页、复盘工具、状态文案）见
 > [production-line-product-form.md](production-line-product-form.md)；本节只给补齐所需的最小骨架。
 
 ### 5.1 工作台三段式
@@ -318,6 +341,10 @@
 | GET | `.../prepare` | `production.prepare.status` | 窗口/读取计数/侦查摘要/未答问题 |
 | POST | `.../prepare/window/open` / `close` | `production.prepare.window.*` | 跨日续答 |
 | POST | `.../prepare/finalize` | `production.prepare.finalize` | 落档 + 建子任务 + 返回摘要 |
+| POST | `.../tasks/{taskId}/understand` | `production.prepare.understand` | **10s 图谱理解**：图谱检索 + 证据组装 + 首轮问题；返回 `latency_ms/partial/coverage/evidence` |
+| GET | `.../tasks/{taskId}/understand/{understandingId}` | `production.prepare.understand.status` | 进度 / 深化结果 / 新增证据 |
+| POST | `.../tasks/{taskId}/understand/{understandingId}/deepen` | `production.prepare.understand.deepen` | 后台深化（不计 10s SLO） |
+| GET | `/api/production/lines/{id}/graph` | `production.graph.status` | 包图/文档图/代码块索引的新鲜度与覆盖 |
 | PATCH | `/api/production/lines/{id}/tasks/{taskId}`（扩展） | 新 `production.task.update` | 非终态任务可改 `title/brief/kind/priority/depends_on/read_scope/write_scope/acceptance/references`；终态只读 |
 | POST/DELETE | `.../tasks/{taskId}/attachments` | `production.task.attach/detach` | 附件登记/移除；来源限 `.input/` 或本线资产目录，复制进项目资产并记 `sha256/size/type` |
 | POST | `/api/production/lines/{id}/tasks`（扩展） | `production.task.create` | 建任务可带 `brief/acceptance/depends_on/references/attachment_sources` |
@@ -406,15 +433,17 @@
 | --- | --- | --- | --- |
 | **PC-1 驱动补洞** | `finalize` 后启动、手动派发后事件 tick、定时 tick 认 `queued`、产线状态计算、`start` 路由 | — | 插件单测：首任务自动起步、跑完自动 continue、暂停后不派发、状态计算真值表；自检新增 3 场景 |
 | **PC-2 准备阶段 REST** | `prepare/*` 六条写路由 + `GET prepare`；错误码映射；`agent_id` 透传 | PC-1 | 插件单测：intake→recon→answer→finalize 全链路；REST 形状测试；契约路由基线同步 |
+| **PC-2A 10s 图谱理解** | `production.prepare.understand|status|deepen`；图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）；模板化理解卡；预 warm 与理解缓存；10s 硬超时出部分结果；六维覆盖读数 | PC-2 | 单测/基准：热缓存 P95 ≤ 10s、冷启动出 `partial`、超时不空屏；每条结论有 `path:line`；无 embedding 标 `degraded`；缓存命中 0 次模型调用 |
 | **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
 | **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input/日期目录 → .input/production_lines/<line>/tasks/<task>/attachments/` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除；首版允许只存（known-issues #51） | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
 | **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
 | **PC-9 记忆端口** | `tree.agent` 新增 `agent.memory.get/record`（`.self/memory.md` + 压缩摘要；未来升级只改 agent）；产线只加 `MemoryPort`（prepare/pack/run 三处注入）与终态回写；run 台账记 `memory_hash/sources`；项目文档收敛为一个 `projectContext` helper | PC-3 + tree.agent | 单测：记忆块进提示词、`pack.json` 无记忆正文、记忆变化不使 pack 失效、记忆不可用任务仍完成；契约测试钉住 `get/record` 形状 |
 | **PC-4 事件广播** | `broadcast.task_state`（seq）+ 写点 + REST 快照对齐；UI 订阅 + 3s 轮询兜底 | PC-1/PC-3 | 插件单测：seq 单调、重连去重；UI 单测：推送更新、断线轮询、断线横幅 |
 | **PC-5 准备阶段 UI** | 五栏表单、四块侦查、问题卡（默认/推荐/后果）、窗口提示、落档预览与摘要、开始执行 | PC-2 | UI 单测：空泛词提示、未答禁止落档、全部按推荐、落档后任务可见；`flutter analyze` 0 |
+| **PC-5A 理解卡 UI** | 「开始理解」→ 10s 倒计时/进度 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；证据点开文件或文档；深化/重新理解；partial/degraded/stale 徽标 | PC-2A | UI 单测：P95 内可交互、超时显示部分结果、证据跳转正确、已答问题不被深化覆盖；`flutter analyze` 0 |
 | **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、右栏任务详情页（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
-| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-6/PC-7/PC-9 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
+| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-6/PC-7/PC-9 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
 
 ### 8.1 实施导航（文件级）
 
@@ -422,15 +451,17 @@
 | --- | --- | --- |
 | 驱动 | `plugins/tree.production.line/tree.production.line_plugin.dart` | manual dispatch 后 `_scheduleEventTick`；finalize 回调；`start` |
 | 驱动 | `lib/src/orchestrator_service.dart` | 定时 tick 条件、状态计算、`consecutive_failures` 恢复 |
-| REST | `lib/src/api.dart` | 新增 prepare/task update/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
-| 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、附件复制与哈希、run 读取、保留策略 |
+| 理解（新） | `lib/src/understanding.dart` / `lib/src/understanding_service.dart` | 图谱聚合、证据/覆盖、模板化理解卡、10s 超时、缓存、预 warm、深化 |
+| 理解检索 | `lib/src/dedup_store.dart`（复用） / `tree.docnorm` `docnorm.query` | 代码块/向量 top-k、文档 BM25/hybrid、`pkg_index` 读取 |
+| REST | `lib/src/api.dart` | 新增 prepare/understand/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
+| 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、附件复制与哈希、理解缓存、run 读取、保留策略 |
 | 记忆 | `tree.agent` / `plugins/tree.production.line/lib/src/memory_port.dart`（新） | agent 侧 `memory.get/record`；产线只做端口适配与三处注入，不读 `.self/memory.md` |
 | 事件 | `tree.production.line_plugin.dart` / `lib/src/service.dart` | 注册广播站、状态迁移写点 |
 | UI API | `plugins/tree.ui.default/lib/io/api_service.dart` | 新增 prepare/task update/pack/messages/budget/run detail/start 方法 |
 | UI 工作台 | `lib/ui/widgets/production_line_workbench.dart` | 三段式布局、准备阶段、任务看板、右栏详情页、轮询/订阅 |
 | UI 配置 | `lib/ui/widgets/create_production_line_dialog.dart` | `limits/policy/docs` 三组 |
-| UI 新组件 | `lib/ui/widgets/production_*` | 建议拆：准备面板、右栏任务详情页、事件客户端（避免单文件继续膨胀） |
-| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
+| UI 新组件 | `lib/ui/widgets/production_*` | 建议拆：准备面板、**理解卡**、右栏任务详情页、事件客户端（避免单文件继续膨胀） |
+| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`understanding_test`（含 10s 基准）、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
 | 测试 | `plugins/tree.ui.default/test/` | 扩充 `production_line_panel_test`；新增准备阶段/详情/事件用例 |
 
 ---
@@ -457,6 +488,8 @@
 | TC-PL-C16 | 任务内容/验收/附件可保存；缺内容或验收不能入队；保存草稿可后补 |
 | TC-PL-C17 | 文本附件可读、图片按视觉能力处理、PDF/Office 标不可读；附件越界/超限/改后重打包均符合 §6.0 |
 | TC-PL-C18 | 记忆块进准备/打包/执行提示词；`pack.json` 无记忆正文；记忆升级后产线零改动；记忆不可用时任务仍完成并记 `memory_unavailable` |
+| TC-PL-C19 | 10s 图谱理解：热缓存 P95 ≤ 10s；冷启动/无 embedding 出 `partial/degraded`；超时不空屏且可进入对齐 |
+| TC-PL-C20 | 理解卡每条影响面/复用/约定/风险都有 `path:line` 或文档锚点；未覆盖维度进「未知」；覆盖读数与图谱实际一致 |
 
 ---
 
