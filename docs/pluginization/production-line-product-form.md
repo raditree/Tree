@@ -63,14 +63,14 @@
    └─ 中栏：产线工作台（唯一主界面）
       ├─ 今日（默认）
       ├─ 准备（未完成时常驻入口）
-      ├─ 执行（任务看板 + 内联详情抽屉）
+      ├─ 执行（任务看板；点行在右栏打开详情页）
       └─ 工具（台账 / 产物 / 整理报告 / 逻辑去重）
-   └─ 右栏窗口：文件浏览、设置、插件管理等既有窗口（不新增专用窗口）
+   └─ 右栏窗口：文件浏览、任务详情、设置、插件管理等（任务详情为产线新增窗口）
 ```
 
 - **不新增第五个活动栏项**，沿用现有第 4 项「生产线」。
-- **任务详情不占右栏窗口**：它属于当前产线的上下文，用中栏内联抽屉，
-  避免和文件窗/设置窗抢焦点（见 §6.2）。
+- **任务详情放右栏详情页**：点任务行在右栏打开「任务详情」窗口（复用 `RightPanelHost`，
+  `preferredWidth ≈ 520`），与文件窗、设置窗同一套窗口切换；中栏不再做内联抽屉。
 - **左栏只选产线**，不放任务列表；所有任务操作在中栏。
 
 ---
@@ -211,7 +211,7 @@ T2 会话列表测试         依赖 T1   写域 test/                          
 | `write_scope` | 否 | 默认 `**`（整个工作空间，串行、禁区照拦） |
 | `read_scope` | 否 | 参考范围；添加 `references` 时自动并入 |
 | `references` | 否 | 工作空间内已有文件路径（不复制）；自动并入 `read_scope` |
-| `attachments` | 否 | 上传到项目资产的只读输入（设计稿/文档/图片） |
+| `attachments` | 否 | 上传到 `.input` 的只读输入（设计稿/文档/图片） |
 | `depends_on` | 否 | 依赖任务 id；未 `done` 不派发 |
 | `priority` | 否 | 默认 50；队列排序 |
 | `kind` | 否 | `conventional / special`；影响提示词措辞 |
@@ -263,13 +263,15 @@ T2 会话列表测试         依赖 T1   写域 test/                          
 - 只接受普通文件，拒绝目录、符号链接与工作空间外路径；
 - 同名文件自动加 `-1/-2` 后缀，不覆盖已有附件；
 - 图片内联沿用项目既有约束（长边 360–1024、单请求体上限），超限走引用而不是硬塞。
+- **首版允许「只存不读」**：PDF/Office/其它二进制与非视觉模型下的图片只落盘与预览，
+  不抽取正文、不伪造描述；该取舍登记为 known-issues #51，抽取能力后续单独立项。
 
 #### 6.0.4 存储与上传流程
 
-**存储位置**（项目资产，人可见、可提交）：
+**存储位置**（工作空间 `.input`，不进项目资产、不随 git 提交；用户 2026-11-14 拍板）：
 
 ```text
-<workspace>/<docs.asset_dir>/<line_id>/tasks/<task_id>/attachments/<name>
+<workspace>/.input/production_lines/<line_id>/tasks/<task_id>/attachments/<name>
 ```
 
 `task.yaml.attachments` 记录元数据：
@@ -277,7 +279,7 @@ T2 会话列表测试         依赖 T1   写域 test/                          
 ```yaml
 attachments:
   - name: design.png
-    path: docs/production_lines/pl_.../tasks/T3/attachments/design.png
+    path: .input/production_lines/pl_.../tasks/T3/attachments/design.png
     size: 245760
     type: png
     sha256: 9f2c...
@@ -290,8 +292,8 @@ attachments:
    落点仍是 `.input/{yyyymmdd}/...`；拿到工作空间相对路径。
 2. UI 调 `production.task.attach`（或建任务时带 `attachment_sources`），传 **工作空间相对路径**；
    插件校验来源必须在 `.input/` 或本线资产目录内。
-3. 插件复制到 `tasks/<task_id>/attachments/`，计算 `sha256/size/type`，写回 `task.yaml`，
-   删除 `.input/` 临时件；返回完整任务。
+3. 插件复制到 `.input/production_lines/<line>/tasks/<task>/attachments/`，计算 `sha256/size/type`，写回 `task.yaml`，
+   删除 `.input/{yyyymmdd}/` 临时件；返回完整任务。
 4. 失败（超限/越界/文件名非法）在表单内就地报错，已上传的临时件由插件清理。
 
 > 不把本机绝对路径交给插件：即使当前是本地工作空间，也保持与 SSH 工作空间一致的
@@ -335,6 +337,12 @@ attachments:
 - docs/project-status.md
 - lib/ui/widgets/agent_list.dart
 
+项目文档（docs.memory_manifest 摘要）：
+<projectContext>
+
+记忆（agent.memory.get 返回，原样）：
+<memory.text>
+
 写域：lib/ui/widgets/agent_list.dart
 读域：lib/ui/, docs/project-status.md
 ```
@@ -363,13 +371,14 @@ attachments:
 | `production.task.create/update` | 接受上述字段；`update` 按 §6.0.7 状态边界校验 |
 | 新命令 `production.task.attach/detach` | 登记/移除附件；来源限 `.input/` 或本线资产目录 |
 | REST | `POST/DELETE /api/production/lines/{id}/tasks/{taskId}/attachments`；建任务接受 `attachment_sources` |
-| 提示词 | `packerUserPrompt` / `executorUserPrompt` 增任务内容、附件、引用段 |
+| 提示词 | `packerUserPrompt` / `executorUserPrompt` 增任务内容、附件、引用、项目文档与记忆段 |
+| 记忆 | `tree.agent` 新增 `agent.memory.get/record`；产线只加 `MemoryPort` 适配器与 run 台账 `memory_hash/sources` |
 | `pack.json` | 增 `attachments[{path,sha256,size,type}]` 快照 |
 | `tree.agent` | `agent.worker.run` 增可选 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道 |
 
 #### 6.0.9 验收
 
-1. 新建任务填内容 + 2 条验收 + 1 张图 + 1 个 md，附件立即出现在表单，保存后落到项目资产。
+1. 新建任务填内容 + 2 条验收 + 1 张图 + 1 个 md，附件立即出现在表单，保存后落到 `.input`；
 2. 只填标题保存可建草稿，但「加入队列/开始」被拒并指出缺内容/验收。
 3. 文本附件能被打包模型 `read`；图片在支持视觉的模型下进入多模态，非视觉模型有预检警告。
 4. PDF/Office 附件有「不可直接读取」标识，不伪造内容。
@@ -392,7 +401,10 @@ T7  blocked    门控失败 · dart analyze 2 errors      [恢复] [取消]
 - 「按计划派发」先调 `queue/plan`，弹出可并行批次确认，不直接批量打出去。
 - 手动派发与批量派发都遵守依赖/并行/写域护栏；被拒时行内说明原因。
 
-### 6.2 任务详情抽屉（中栏内联，右侧 420px，可拖动）
+### 6.2 任务详情（右栏详情页）
+
+点任务行 → 右栏自动切到「任务详情」窗口；关窗口不清选中，再次点同一行重新打开。
+窗口与文件/设置共享右栏宿主，窄于 360px 时按宿主规则折叠。
 
 ```text
 T2 会话列表按项目过滤                      [恢复] [重试] [取消]
@@ -402,15 +414,15 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 
 | 页签 | 内容 |
 | --- | --- |
-| 概览 | 状态、`blocked_reason`、`last_error`、重试/提问、最近决策 |
+| 概览 | 状态、`blocked_reason`、`last_error`、重试/提问、最近决策、记忆来源/hash/是否截断 |
 | 计划 | 任务内容（Markdown 可编辑）、需求五栏、验收、依赖、读写域、优先级、`kind`、附件与引用；非终态可编辑 |
 | 打包 | `pack.json` 摘要（文件数/字节/基线命令/风险点）、`pack.md` 打开 |
 | 执行与门控 | 改动文件、diff 摘要、门控命令与输出（截断+完整路径）、重试历史 |
 | 消息与专家 | 打包/执行之间的消息线程、专家调用（问题/结论/依据/未决） |
-| 台账 | 该任务全部 `runs`：角色、模型、token、耗时、工具调用 |
+| 台账 | 该任务全部 `runs`：角色、模型、token、耗时、工具调用、`memory_hash` |
 
-- 抽屉不遮挡产线头与「待你决定」；宽度可拖，窄于 360px 自动折叠为全宽详情。
-- `done/cancelled` 只读；在途任务只允许改优先级/依赖；改计划字段需二次确认。
+- 详情页只读/可编辑边界按 §6.0.7；编辑保存后就地刷新中栏对应任务行。
+- 切换产线时关闭该窗口并清掉选中任务，避免把 A 线任务详情留在 B 线上下文。
 
 ### 6.3 主控条与暂停
 
@@ -418,6 +430,84 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 - `暂停产线` 立即停止自动派发；已经 `running` 的任务继续跑完，不强制中断。
 - `恢复` 写回执行中并立即决策一次。
 - 连续 3 次决策失败自动暂停，首屏显示「主控连续失败，已暂停」+ 原因 + 恢复按钮。
+
+### 6.4 记忆与项目知识（直接套 agent）
+
+**结论：直接复用 `tree.agent` 的记忆，不在产线里自建第二套。**
+产线只做「消费方」：读记忆走 agent 的端口，写记忆也走 agent 的端口；
+产线不读 `.self/memory.md`、不缓存记忆正文、不做自己的记忆裁剪/排序。
+
+#### 6.4.1 三个概念分开
+
+| 概念 | 归属 | 说明 |
+| --- | --- | --- |
+| **Agent 记忆** | `tree.agent` | 当前 MVP = `.self/memory.md` + 会话压缩摘要；后续升级为结构化/向量记忆也只改 agent |
+| **项目文档** | 产线 `line.yaml.docs.memory_manifest` | 明确列出的项目文档（project-status/work-log/known-issues…），是「资料」不是「记忆」 |
+| **任务输入** | 产线 `task.yaml` | `brief / acceptance / references / attachments`，只属于本任务 |
+
+> `docs.memory_manifest` 保留原名以兼容存量，但 UI 标为「项目文档」；产线不再把它叫记忆，
+> 也不在产线里实现第二套记忆存储。
+
+#### 6.4.2 记忆端口（`tree.agent` 执行站）
+
+| 命令 | 入参 | 回包 | 用途 |
+| --- | --- | --- | --- |
+| `agent.memory.get` | `{agent_id, purpose: prepare\|pack\|run, budget_chars, kind?}` | `{text, sources[], hash, version, truncated}` | 取**已由 agent 裁剪/排序/格式化**的记忆块 |
+| `agent.memory.record` | `{agent_id, source: production_line, line_id, task_id, status, summary, artifacts[], at}` | `{accepted, id?}` | 把任务结果作为记忆候选交给 agent，由 agent 决定是否吸收 |
+
+- `agent_id` 取 `line.yaml.executor.agent_id`（员工身份），不是「谁点了派发」。
+- `text` 是 agent 渲染好的 Markdown；产线**不解析、不二次裁剪**，只原样注入提示词。
+- `sources` / `hash` / `truncated` 只用于台账与 UI 展示，不落产线数据。
+- `version` 供未来记忆升级时做兼容判断；产线不按内部结构分支。
+- 记忆不可用（命令缺失/超时）⇒ 空块 + 台账记 `memory_unavailable`，任务继续，不 fail-closed。
+
+#### 6.4.3 注入点与预算
+
+| 场景 | 是否注入 | `purpose` | 默认预算 |
+| --- | --- | --- | --- |
+| 准备阶段侦查 | ✅ | `prepare` | 4 000 字 |
+| 打包（packer） | ✅ | `pack` | 6 000 字 |
+| 执行（executor） | ✅ | `run` | 6 000 字 |
+| 主控 tick | ❌（v1） | — | — |
+
+- 主控保持「快照决策」，不把记忆塞进每 tick，避免成本与漂移；后续需要时再单列开关。
+- 预算由调用方传入，**裁剪由 agent 完成**；产线只显示 `truncated`。
+- 同一次任务里打包与执行各自取最新记忆；不把记忆正文写进 `pack.json`。
+
+#### 6.4.4 写入路径
+
+- 任务进入终态（`done / blocked / cancelled`）后，产线调用一次 `agent.memory.record`
+  （fire-and-forget，失败只记日志，不影响任务结果）。
+- 记录内容只放**结果摘要**：任务标题、状态、改动文件、门控结果、决策动作；
+  不放完整对话、不放代码全文、不放附件正文。
+- 当前 MVP 由 agent 写入自己的候选队列（agent 自有存储）；**产线不写 `.self/memory.md`**。
+  后续 agent 记忆升级时，由 agent 消费候选队列并决定合并策略。
+
+#### 6.4.5 保证「逻辑只存一次」
+
+1. 记忆读取、裁剪、排序、格式化只在 `tree.agent` 的 memory 实现里；
+   产线只有一个 `MemoryPort` 适配器（`get/record` 两个方法）。
+2. 产线不读 `.self/memory.md`、不存记忆副本、不写记忆文件。
+3. 提示词里只有**一个**「## 记忆」段，准备/打包/执行共用，不按角色各写一套格式。
+4. `pack.json` / run 台账只存 `memory_hash` 与 `sources`，不存正文。
+5. 项目文档读取收敛为一个共享 `projectContext` helper（准备/打包/执行共用），
+   与 agent 记忆彻底分开，避免两套「记忆」并行。
+6. 未来 agent 记忆升级只改 `tree.agent` 实现；`agent.memory.get/record` 的命令与回包形状保持稳定，
+   产线零改动（契约测试钉住形状）。
+
+#### 6.4.6 记忆与任务输入的区别
+
+- 附件/内容变化 ⇒ 旧 `pack` 失效（任务输入变了）。
+- 记忆变化 ⇒ **不**让 `pack` 失效；执行用最新记忆，台账同时记录打包与执行两个 `memory_hash`。
+- 记忆不是事实真源：状态机、验收、写域仍以 `task.yaml` 为准，记忆只影响提示词。
+
+#### 6.4.7 UI 与验收
+
+- 任务详情「概览」显示：记忆来源数、字数、是否截断、`memory_hash` 前 8 位；
+  展开可看 `sources`（路径/章节），不显示全文。
+- 台账每条 run 带 `memory_hash` 与 `memory_sources`，便于复盘「当时用了哪份记忆」。
+- 验收：同一任务打包/执行提示词都出现记忆块；`pack.json` 无记忆正文；
+  agent 记忆升级后产线无需改动即可继续工作；记忆不可用时任务仍能完成并留下原因。
 
 ---
 
@@ -520,7 +610,8 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 - 产线是活动栏第 4 项，与 Agent 并列；切页用 `IndexedStack` 保持会话与工作台状态
   （现有实现已如此）。
 - 中栏是工作台唯一承载区；折叠中栏时沿用现有 chevron 机制。
-- 右栏继续承载文件窗、设置、插件管理等既有窗口；任务详情不新增右栏窗口。
+- 右栏继续承载文件窗、设置、插件管理与**任务详情**；任务详情是 `RightPanelEntry`（id `productionTask`，
+  `autoOpenOnSelection`），不新增中栏抽屉或第三套详情容器。
 - 视觉沿用 `AppRadius`、主题 token、字重/字号设置；状态色用 `ColorScheme`
   的 primary/tertiary/error/secondary，不新增硬编码色值。
 - UI 只经 REST/站点与插件通信，不读插件数据目录；产物打开走 files 插件。
@@ -563,8 +654,9 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 | --- | --- |
 | 产线头真实状态 / 自动起步 / 暂停恢复 | PC-1 |
 | 准备四步（需求/侦查/对齐/计划） | PC-2 + PC-5 |
-| 任务看板 / 详情抽屉 / 批量派发 | PC-3 + PC-6 |
+| 任务看板 / 右侧详情页 / 批量派发 | PC-3 + PC-6 |
 | 任务内容 / 附件 / 引用 / 编辑预检 | PC-3 + PC-3A（图像视觉 PC-3B） |
+| 记忆注入 / 结果回写 / 台账 hash | PC-9 |
 | 今日实时刷新 / 断线恢复 | PC-4 |
 | 工具（台账/产物/整理/去重）与配置页 | PC-7 |
 | 真模型全链路与异常路径 | PC-8 |
@@ -576,13 +668,14 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 | # | 问题 | 建议 |
 | --- | --- | --- |
 | PF-1 | 默认落地页 | 「今日」决定优先；准备/执行作为阶段入口 |
-| PF-2 | 任务详情形态 | 中栏内联抽屉（不新增右栏窗口） |
+| PF-2 | 任务详情形态 | **已拍板（2026-11-14）：右栏详情页**，复用 `RightPanelHost`，不做中栏抽屉 |
 | PF-3 | 准备阶段形态 | 线性四步；不做自由聊天 |
 | PF-4 | 拍板/回答文案 | 统一「待你决定」，标签区分准备/运行 |
 | PF-5 | 整理报告与去重位置 | 收进「工具」，不占首屏 |
 | PF-6 | 异常提醒 | 左栏产线健康点 + 工作台首屏；不做系统级通知 |
 | PF-7 | 批量派发 | 先展示 `queue/plan` 批次再确认 |
 | PF-8 | 今日摘要导出 | 首版提供「复制摘要」文本，不做文件导出 |
-| PF-9 | 附件落点 | 项目资产 `docs/production_lines/<line>/tasks/<task>/attachments/`（可提交）；先上传 `.input/` 再登记复制 |
-| PF-10 | 文档抽取范围 | 首版支持文本/代码/Markdown/图片；PDF/Office 只存与预览，不自动抽取正文 |
-| PF-11 | 非视觉模型的图片 | 预检警告并需确认「仅作人工参考」，不静默忽略也不伪造描述 |
+| PF-9 | 附件落点 | **已拍板（2026-11-14）：`.input/production_lines/<line>/tasks/<task>/attachments/`**，不进项目资产；先上传再登记复制；首版允许只存不读的类别记入 known-issues #51 |
+| PF-10 | 文档抽取范围 | **已拍板（2026-11-14）：首版允许只存**；文本/代码/Markdown/图片支持读取，PDF/Office 只存与预览，抽取后续立项 |
+| PF-11 | 非视觉模型的图片 | **已拍板（2026-11-14）：预检警告 + 需确认「仅作人工参考」**，不静默忽略也不伪造描述 |
+| PF-12 | 记忆归属 | **已拍板（2026-11-14）：直接套 `tree.agent`**；产线只做 `agent.memory.get/record` 消费方，不读/不存/不裁剪记忆 |
