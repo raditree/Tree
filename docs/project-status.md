@@ -3,8 +3,8 @@
 > 只回答三件事：**现在什么阶段**、**几条车道在跑**、**每条车道下一步做什么**。
 > 过去式 → [work-log.md](work-log.md)；文档索引 → [README.md](README.md)。
 
-**当前：稳定性迭代**（只修缺陷、补测试；产线与模型池 9 项问题先侦查后修）｜ 版本线 `1.0.7+1`
-**出口**：P0/P1 清零 + 全量测试 / E2E / 真机清单通过 → 发版窗口（新能力一律不入本期）
+**当前：快速迭代**（按切片交付新能力；本期主线 PL-COMPLETE 生产线功能补齐）｜ 版本线 `1.0.7+1`
+**出口**：PC-1~PC-8 切片全合入 + 全量测试绿 + 无阻塞缺陷 → 稳定性迭代 / 发版窗口
 
 ---
 
@@ -31,7 +31,7 @@
 | **D 发版** | REL-1.0.7 | 已完成（桌面 `v1.0.7+1` / 插件 `v1.0.6`，GitHub + Gitee 资产已传） | 覆盖安装验证 | [work-log.md](work-log.md)（2026-11-10 REL-1.0.7） |
 | **E 稳定性** | STAB-PL-1~9 产线与模型池问题侦查 + 落地（D1~D7 全部完成，含 D7-5 数据副本回归） | 进行中 | 真机验收产线文件窗 / 角色配置 | [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | D6-O O1~O5 已落码；**PL-COMPLETE 侦查已完成（2026-11-14），三分口径已定** | 进行中（O6 待真模型联调；4 条驱动/护栏缺陷可先修，其余待 P1） | 先修 4 条驱动/护栏缺陷（缺陷口径）；准备阶段 UI 等按 PC 车道立项后再排 PC-1~PC-8 | [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) ＋ [production-line-orchestrator-loop-plan.md](pluginization/production-line-orchestrator-loop-plan.md) |
+| **H 标准开发流生产线** | PL-COMPLETE 侦查与三分口径已完成；**PC-1 驱动补洞待开工**（含 4 条驱动/护栏缺陷） | 进行中（已切快速迭代；O6 随 PC-8） | PC-1 → PC-2/3（prepare/task REST）→ PC-4（事件）→ PC-5/6/7（工作台）→ PC-8（真模型 E2E） | [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) ＋ [production-line-orchestrator-loop-plan.md](pluginization/production-line-orchestrator-loop-plan.md) |
 | **I 存储插件 tree.storage** | — | 已完成（ST-1~ST-6；docnorm 已接入） | 待新任务 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；embedding 已被 DN-9 消费） | 待新任务（JEV 待产线主控） | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
@@ -49,9 +49,8 @@ P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalizat
 `DN-4` 前需 `I ST-1~ST-3`（已完成）；`DN-9` 前需 `J MP-5`（已完成）；`P3` 前需 `J MP-6`（已完成）与 P8 golden set。
 `H` 只新增 `tree.production.line` 插件与 UI 面，不改核心面 35 条基线；`I`/`J` 同样不新增核心点位。
 `H` 的 **PL-COMPLETE 功能补齐**按三分口径处理（[§2.3](pluginization/production-line-completion-recon.md#L76-L98)）：
-其中 4 条驱动/护栏（手动派发后不 tick、定时 tick 跳过 queued、`line.status` 恒 idle、手动派发绕过护栏）
-属**缺陷**，可在稳定性迭代内先修；准备阶段 UI、任务编辑、配置面、事件推送属**欠交付/新能力**，
-未拍板阶段口径（P1）前不改码。
+4 条驱动/护栏属**缺陷**（PC-1 先修）；准备阶段 UI、任务编辑、配置面、事件推送属**欠交付/新能力**，按 PC-2~PC-7 交付。
+**P1 已拍板（2026-11-14）：切快速迭代，按 PC-1~PC-8 推进。**
 `K`（`tree.settings`）与 `I`/`J` 无依赖，可并行；`H` 的设置项在 K 落地前用 `.docnorm/config.json` + env，不阻塞。
 
 ## 并行规则
@@ -66,5 +65,6 @@ P0 的语义、切片与拍板项见 [doc-normalization-recon.md](doc-normalizat
 
 | 日期 | 变更 | 依据 |
 | --- | --- | --- |
+| 2026-11-14 | **稳定性迭代 → 快速迭代**；主线切到 PL-COMPLETE 生产线功能补齐，按 PC-1~PC-8 切片交付 | 用户 2026-11-14 拍板「切到快速迭代」；方案与三分口径见 [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) §2.3/§8 |
 | 2026-11-12 | **大版本迭代 → 稳定性迭代**；车道 E 接产线与模型池 9 项问题，先出侦查文档 | 用户 2026-11-12 拍板：本期只侦察、只修缺陷；证据见 [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | 2026-11-08 | 建立本文件；判定为**大版本迭代** | 跨仓/契约/路由收窄同时进行 |
