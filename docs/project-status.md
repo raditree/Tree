@@ -31,7 +31,7 @@
 | **D 发版** | REL-1.0.7 | 已完成（桌面 `v1.0.7+1` / 插件 `v1.0.6`，GitHub + Gitee 资产已传） | 覆盖安装验证 | [work-log.md](work-log.md)（2026-11-10 REL-1.0.7） |
 | **E 稳定性** | STAB-PL-1~9 产线与模型池问题侦查 + 落地（D1~D7 全部完成，含 D7-5 数据副本回归） | 进行中 | 真机验收产线文件窗 / 角色配置 | [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | PL-PRODUCT 已规划（**10s 图谱理解**、右栏详情页、附件落 `.input`、直接套 agent 记忆）；PC-1 驱动补洞待开工 | 进行中（已切快速迭代；O6 随 PC-8） | PC-1 → PC-2 → **PC-2A（10s 理解）** → PC-3/3A/3B → PC-9 → PC-4 → PC-5/**5A**/6/7 → PC-8 | [production-line-product-form.md](pluginization/production-line-product-form.md) ＋ [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) |
+| **H 标准开发流生产线** | PL-PRODUCT 已规划（**单次图谱搜索 + 一次 LLM 的 10s 理解**、右栏详情页、附件落 `.input`、直接套 agent 记忆）；PC-1 驱动补洞待开工 | 进行中（已切快速迭代；O6 随 PC-8） | PC-1 → PC-2 → **PC-2A（10s 单次理解）** → PC-3/3A/3B → PC-9 → PC-4 → PC-5/**5A**/6/7 → PC-8 | [production-line-product-form.md](pluginization/production-line-product-form.md) ＋ [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) |
 | **I 存储插件 tree.storage** | — | 已完成（ST-1~ST-6；docnorm 已接入） | 待新任务 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；embedding 已被 DN-9 消费） | 待新任务（JEV 待产线主控） | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
