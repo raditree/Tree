@@ -318,7 +318,9 @@
 | GET | `.../prepare` | `production.prepare.status` | 窗口/读取计数/侦查摘要/未答问题 |
 | POST | `.../prepare/window/open` / `close` | `production.prepare.window.*` | 跨日续答 |
 | POST | `.../prepare/finalize` | `production.prepare.finalize` | 落档 + 建子任务 + 返回摘要 |
-| PATCH | `/api/production/lines/{id}/tasks/{taskId}`（扩展） | 新 `production.task.update` | 非终态任务可改 `title/kind/priority/depends_on/read_scope/write_scope/acceptance`；终态只读 |
+| PATCH | `/api/production/lines/{id}/tasks/{taskId}`（扩展） | 新 `production.task.update` | 非终态任务可改 `title/brief/kind/priority/depends_on/read_scope/write_scope/acceptance/references`；终态只读 |
+| POST/DELETE | `.../tasks/{taskId}/attachments` | `production.task.attach/detach` | 附件登记/移除；来源限 `.input/` 或本线资产目录，复制进项目资产并记 `sha256/size/type` |
+| POST | `/api/production/lines/{id}/tasks`（扩展） | `production.task.create` | 建任务可带 `brief/acceptance/depends_on/references/attachment_sources` |
 | POST | `/api/production/lines/{id}/queue/plan` | `production.queue.dispatch` | 只读派发计划（依赖/写域/槽位） |
 | POST | `/api/production/lines/{id}/start` | `line.status=working` + tick | 准备落档后的显式启动 |
 | GET | `.../tasks/{taskId}/pack` | 读 `pack.json` | 片段清单、基线命令、风险点（大块走 `result_path`？见 §6.5） |
@@ -404,10 +406,12 @@
 | --- | --- | --- | --- |
 | **PC-1 驱动补洞** | `finalize` 后启动、手动派发后事件 tick、定时 tick 认 `queued`、产线状态计算、`start` 路由 | — | 插件单测：首任务自动起步、跑完自动 continue、暂停后不派发、状态计算真值表；自检新增 3 场景 |
 | **PC-2 准备阶段 REST** | `prepare/*` 六条写路由 + `GET prepare`；错误码映射；`agent_id` 透传 | PC-1 | 插件单测：intake→recon→answer→finalize 全链路；REST 形状测试；契约路由基线同步 |
-| **PC-3 任务编辑与详情 REST** | `production.task.update`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start` | PC-1 | 单测：终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
+| **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
+| **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input → 项目资产` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除 | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
+| **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
 | **PC-4 事件广播** | `broadcast.task_state`（seq）+ 写点 + REST 快照对齐；UI 订阅 + 3s 轮询兜底 | PC-1/PC-3 | 插件单测：seq 单调、重连去重；UI 单测：推送更新、断线轮询、断线横幅 |
 | **PC-5 准备阶段 UI** | 五栏表单、四块侦查、问题卡（默认/推荐/后果）、窗口提示、落档预览与摘要、开始执行 | PC-2 | UI 单测：空泛词提示、未答禁止落档、全部按推荐、落档后任务可见；`flutter analyze` 0 |
-| **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、详情抽屉（pack/改动/门控/消息/专家/usage）、批量派发 | PC-3/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
+| **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、详情抽屉（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
 | **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-6/PC-7 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
 
@@ -417,14 +421,14 @@
 | --- | --- | --- |
 | 驱动 | `plugins/tree.production.line/tree.production.line_plugin.dart` | manual dispatch 后 `_scheduleEventTick`；finalize 回调；`start` |
 | 驱动 | `lib/src/orchestrator_service.dart` | 定时 tick 条件、状态计算、`consecutive_failures` 恢复 |
-| REST | `lib/src/api.dart` | 新增 prepare/task update/pack/messages/budget/runs/{id}/queue plan/start 路由 |
-| 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、run 读取、保留策略 |
+| REST | `lib/src/api.dart` | 新增 prepare/task update/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
+| 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、附件复制与哈希、run 读取、保留策略 |
 | 事件 | `tree.production.line_plugin.dart` / `lib/src/service.dart` | 注册广播站、状态迁移写点 |
 | UI API | `plugins/tree.ui.default/lib/io/api_service.dart` | 新增 prepare/task update/pack/messages/budget/run detail/start 方法 |
 | UI 工作台 | `lib/ui/widgets/production_line_workbench.dart` | 三段式布局、准备阶段、任务看板、详情抽屉、轮询/订阅 |
 | UI 配置 | `lib/ui/widgets/create_production_line_dialog.dart` | `limits/policy/docs` 三组 |
 | UI 新组件 | `lib/ui/widgets/production_*` | 建议拆：准备面板、任务详情抽屉、事件客户端（避免单文件继续膨胀） |
-| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`task_update_test`、`driver_test`、`events_test` |
+| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
 | 测试 | `plugins/tree.ui.default/test/` | 扩充 `production_line_panel_test`；新增准备阶段/详情/事件用例 |
 
 ---
@@ -448,6 +452,8 @@
 | TC-PL-C13 | 主控连续 3 次决策失败 → 产线 `paused`，UI 显示原因并可恢复 |
 | TC-PL-C14 | 缺模型 / 缺 `tree.docnorm` / 缺 `local_executor` 时，准备或执行在入口处给出缺失项，不进入半途 |
 | TC-PL-C15 | 真模型 E2E：准备 → 打包 → 执行 → 门控 → done；其中至少一次 ask/answer 闭环 |
+| TC-PL-C16 | 任务内容/验收/附件可保存；缺内容或验收不能入队；保存草稿可后补 |
+| TC-PL-C17 | 文本附件可读、图片按视觉能力处理、PDF/Office 标不可读；附件越界/超限/改后重打包均符合 §6.0 |
 
 ---
 
