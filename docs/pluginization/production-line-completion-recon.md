@@ -380,6 +380,22 @@
 最后返工。需要 **PC-3F 计划迭代与漂移防护**（方案/不变量/追踪矩阵/`- [ ]` 门禁解析/漂移哨兵/
 变更控制）和 **PC-5E 计划审查 UI**；「零返工」明确为「零漂移返工」，真实新发现走变更单。
 
+### 4.16 项目整理只是建议报告，不是硬前置
+
+现有 `audit` 已经能产出 `audit.md/json`，但只是只读建议：
+
+| 要求 | 现状 | 证据 |
+| --- | --- | --- |
+| 结构报告 | 只有 docs/todos/duplicates/large_files；没有包职责映射、公共 API 清单、依赖环/分层 | `AuditReport` 字段（[audit.dart:141-199](../../plugins/tree.production.line/lib/src/audit.dart#L141-L199)） |
+| 硬门 | `audit` 是可选动作；不整理也能建任务/派发 | 无 `structure.ready` |
+| 阶段 | 没有 `organizing` 阶段，不能只允许 cleanup | 无 |
+| 清理任务 | 报告不能生成 cleanup 任务；不能逐项豁免 | 无 |
+| 结构不变量 | 没有 PKG/API/DEP/SIZE，迁移可随手改包边界 | 无 |
+
+**影响**：项目结构混杂时，迁移一定跨边界，门控再多也挡不住漂移。需要 **PC-2D 结构整理硬门**
+（结构报告 + `organizing` 只允许 cleanup + 重审/豁免）和 **PC-5F 结构整理 UI**；
+这正是「产线保证稳定、但限制灵活」的取舍——用户已拍板接受。
+
 ---
 
 ## 5. 产品形态定稿（建议）
@@ -544,6 +560,7 @@
 | **PC-1 驱动补洞** | `finalize` 后启动、手动派发后事件 tick、定时 tick 认 `queued`、产线状态计算、`start` 路由 | — | 插件单测：首任务自动起步、跑完自动 continue、暂停后不派发、状态计算真值表；自检新增 3 场景 |
 | **PC-2 准备阶段 REST** | `prepare/*` 六条写路由 + `GET prepare`；错误码映射；`agent_id` 透传 | PC-1 | 插件单测：intake→recon→answer→finalize 全链路；REST 形状测试；契约路由基线同步 |
 | **PC-2B 前置就绪门** | `production.line.ready` + `graph.rebuild`；文档归一化（`doc_state`/`no_docs`）+ 包图 + 文档图 + 代码索引 + 测试映射的完成判定；`line.ready` 固定 `graph_version`；`understand/task.create/task.attach/queue.dispatch/start/tick` 统一门控；HEAD/stale 自动失效 | PC-2 | 单测：任一项缺失时上述命令全部 `409 line_not_ready` 且带 `missing[]`；补齐后自动放行；stale 后重新阻塞；无文档 `no_docs` 可放行；无 force 参数 |
+| **PC-2D 结构整理硬门** | 复用 `audit`，补结构报告（包职责映射/公共 API 清单/依赖环/分层/重复/规模/文档/TODO）；`structure.ready`；`organizing` 阶段只允许 `cleanup` 任务；清理后重审；high 项逐项豁免（owner/原因/到期）；结构不变量 PKG/API/DEP/SIZE | PC-2B | 测试：结构未通过时非 cleanup 任务全部 `409 structure_not_ready`；cleanup 任务可建可跑；清理后重审放行；high 项未豁免不放行；豁免可见且到期失效 |
 | **PC-2C 归一化预检写入** | `production.normalize.plan/apply/rollback/status`；复用 `docnorm` `commit=false` 的 diff 与 `commit=true` 写入；写前 `before_sha256` + 备份/补丁；只追加/索引、不新建；`rewrite` 需 allowlist + 二次确认；失败回滚；幂等；不自动 commit；写入期间任务全禁 | PC-2B | 单测：plan 0 写盘且有 diff；apply 后文件内容与 diff 一致；重复 apply 0 写盘；写入失败回滚到原文；rewrite 未授权拒绝；路径穿越/符号链接拒绝；`graph_version` 含文档内容 hash |
 | **PC-2A 摘要 + 双查询检索** | `production.prepare.understand|status`；**LLM #1** 总结需求/附件/关键词（`digest_ms` 单独计）→ **两次 embed**（原文 + 关键词，合计 ≤5s）→ 双查询图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）→ RRF 合并 → 上下文包（`evidence_id`/配额/裁剪）→ **LLM #2**；召回门控（`recall_gap`/`single_query` 不补第三轮）；证据校验；理解缓存与预 warm；检索 10s 硬超时出 partial | PC-2 + PC-2B | 单测/基准：摘要调用发生且无附件也跑；两次 embed 有独立超时与合计 ≤5s 预算；双查询都贡献、RRF 去重；检索 P95 ≤10s（不含两次 LLM）；冷启动/单路失败出 `partial/recall_gap/degraded`；结论引用 `evidence_id`；缓存命中 0 摘要/0 检索/0 模型 |
 | **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
@@ -561,10 +578,11 @@
 | **PC-5C 归一化预览 UI** | 归一化文件列表、diff 查看、动作/rewrite 警告、应用/取消、写入进度、失败回滚提示、运行记录 | PC-2C | UI 单测：plan 不写盘、diff 正确、rewrite 需二次确认、apply 后刷新就绪门、失败显示回滚结果；`flutter analyze` 0 |
 | **PC-5D 计划审阅 UI** | 任务 DAG/列表、尺寸与风险、写域交叠/无门控/缺集成警告、批次预览、拆分/合并/改依赖/改门控、锁定与计划版本 diff | PC-3E | UI 单测：警告逐条可见、拆分/合并后重算批次、未解决警告禁止落档、锁定后生成 plan-vN；`flutter analyze` 0 |
 | **PC-5E 计划审查 UI** | 方案设计、不变量账本、追踪矩阵、每任务 `- [ ]` 门禁清单、findings（high/med/low）、plan diff、未解决项确认、变更单入口 | PC-3F | UI 单测：7 块齐全才可锁定；findings 分级显示；追踪断链高亮；门禁清单勾选与证据联动；plan diff 可查看；`flutter analyze` 0 |
+| **PC-5F 结构整理 UI** | 结构报告（包职责/API/依赖环/重复/规模/文档）、high/med/low 分级、生成 cleanup 任务、逐项豁免（owner/原因/到期）、清理后重审、`409 structure_not_ready` 文案 | PC-2D | UI 单测：未通过时只显示 cleanup 入口；报告逐项可见；豁免需理由；清理后重审自动刷新；`flutter analyze` 0 |
 | **PC-5A 理解卡 UI** | 「开始理解」→ LLM #1 摘要进度 → 10s 检索倒计时 →「上下文已就绪」→ LLM #2 单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A + PC-5B | UI 单测：摘要阶段可见、10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用摘要+上下文、重新理解生成新 id；`flutter analyze` 0 |
 | **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、右栏任务详情页（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
-| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-5C/PC-5D/PC-5E/PC-6/PC-7/PC-9/PC-10 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
+| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-2D/PC-5/PC-5A/PC-5B/PC-5C/PC-5D/PC-5E/PC-5F/PC-6/PC-7/PC-9/PC-10 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
 
 ### 8.1 实施导航（文件级）
 
@@ -623,6 +641,7 @@
 | TC-PL-C26 | 稳定性控制面：重复派发只执行一次；过期租约写被拒；杀进程/断网/部分写后恢复不丢不重；执行者改门控结果被拒；换模型黄金任务通过；恢复耗时 SLO |
 | TC-PL-C27 | 任务拆分：环/跨计划依赖被拒；无门控/无验收/缺集成任务不能落档；写域交叠不能同批；超大任务拆分、微任务合并；批次与 max_parallel 一致；改计划生成 plan-vN |
 | TC-PL-C28 | 计划迭代/防漂移：7 块缺失不能落档；critic findings 分级与修复闭环；`- [ ]` 门禁可解析；追踪断链阻断；越界/API/schema/golden/依赖图/数据漂移被哨兵拦截；零漂移返工指标可算 |
+| TC-PL-C29 | 结构整理硬门：结构未通过时非 cleanup 任务全部 `409 structure_not_ready`；cleanup 可跑；重审后放行；high 项未修复/未豁免不放行；豁免可见且到期失效 |
 
 ---
 
