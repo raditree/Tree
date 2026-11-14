@@ -2950,7 +2950,7 @@ Tree 的 agent shell 里 `gh` 之类仍然找不到；只有整套重启才可�
 
 ## #51 产线附件首版只存不读：PDF/Office/非视觉图片不进入模型上下文
 
-**状态**：已知取舍（2026-11-14，用户拍板「首版允许只存」）。
+**状态**：**设计性限制（非缺陷）**（2026-11-14，用户拍板「首版允许只存」）。
 
 ### 现象
 
@@ -2979,4 +2979,73 @@ Tree 的 agent shell 里 `gh` 之类仍然找不到；只有整套重启才可�
 ### 临时替代
 
 把关键内容转成 Markdown/txt 附件，或用 `references` 指向工作空间里的文本文件。
+
+## #52 生产线 Task 1~11 收口前的三条旧口径问题：selftest 红 / `graph_version` 不看内容 hash / 附件只登记元数据
+
+**状态**：**全部已修复 / 已实现（2026-11-14）**。
+
+### 现象
+
+1. 插件 `--selftest` 有失败用例、退出码非 0（Task 11 收口前）。
+2. `line.ready` 的 `graph_version` 只随就绪指纹 / HEAD 变化；文档经归一化重新写入但未提交 git 时，
+   旧就绪快照不会 `stale`，可能带着旧文档图开任务。
+3. Task 6 的附件只把名称 / 大小等元数据登记进 `task.yaml`，文件没有落到产线自己的 `.input`；
+   打包与执行无法稳定读取，重启或上游清理后引用失真。
+
+### 根因
+
+1. 自检场景仍按旧口径断言（就绪指纹、附件仅有元数据），新链路（结构 / 就绪门、附件落盘）加入后
+   预期未同步，导致 selftest 红。
+2. `graph_version` 只取就绪指纹，不含归一化文档内容；git 工作区改动不产生 HEAD 变化。
+3. 附件切片首版只有元数据登记，没有复制与哈希步骤。
+
+### 修复 / 实现
+
+1. 自检用例与当前实现对齐（结构 / 就绪门 + 附件场景），恢复全绿。
+2. `normalizationVersionOf`（`plugins/tree.production.line/lib/src/normalization.dart`）把归一化的
+   `runId:state:<docHash>` 并入 `graph_version`；`docHash` 是文档 `path + sha256` 的稳定聚合
+   （`_docContentHash`），文档被改而 git 未提交时同样 `stale`（`readiness_service.dart` LG-07）。
+3. 新增 `ProductionAttachmentService`（`plugins/tree.production.line/lib/src/attachment_service.dart`）：
+   工作空间相对路径校验 → 复制到 `.input/production_lines/<line>/tasks/<task>/attachments/` →
+   登记 `path / sha256 / size / type / kind / name / added_at / readable`；同 `sha256` 去重并标
+   `deduplicated`；`task.yaml` 仍只登记元数据、不写附件内容。
+
+### 验证
+
+- `tree.production.line`：`dart analyze` 0、`dart test` **307+** 全绿、`--selftest` **123/0**；
+- `tree.ui.default`：`flutter analyze` 0、`flutter test` **~1011**；
+- `docs_contract` **7/7**。
+
+### 遗留
+
+- 真模型 E2E 仍需有模型池 / 密钥的环境（见 #53）。
+
+## #53 生产线真模型 E2E 需要模型池配置：确定性 E2E 只用假模型
+
+**状态**：**已知限制（非缺陷，2026-11-14）**。
+
+### 现象
+
+`AG-11` / `TC-PL-C15` 要求「真模型一次性跑通准备 → 打包 → 执行 → 决策 → ask/answer → done」。
+本机没有可用模型池 / 密钥时，该门无法执行，只能跑确定性 E2E。
+
+### 影响
+
+真模型 E2E 是产品验收的最后一项证据；未执行前，模型侧的提示词、上下文预算与视觉通道只由
+假模型 + 单测覆盖，不能宣称端到端已真机验证。
+
+### 为什么
+
+真模型调用需要外部端点与密钥，不能进 CI，也不应把凭据写进仓库；确定性 E2E 用假模型可以
+稳定覆盖全链路与异常五路径（依赖未完成、写域越界、门控失败、预算到顶、崩溃恢复）。
+
+### 替代 / 证据
+
+- 确定性 E2E 已覆盖全链路与异常五路径（`tree.production.line` 单测 + 自检 123/0）；
+- 真模型前置条件与证据留存（截图 / 台账 / `gate.json`）见
+  `plugins/tree.production.line/tool/e2e_real_model.md`。
+
+### 后续
+
+在有模型池 / 密钥的环境执行一次 AG-11 / TC-PL-C15，留存截图与台账，然后把本条目降级为历史记录。
 

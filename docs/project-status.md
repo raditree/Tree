@@ -4,7 +4,7 @@
 > 过去式 → [work-log.md](work-log.md)；文档索引 → [README.md](README.md)。
 
 **当前：快速迭代**（按切片交付新能力；本期主线 PL-COMPLETE 生产线功能补齐）｜ 版本线 `1.0.7+1`
-**出口**：PC-1~PC-8 切片全合入 + 全量测试绿 + 无阻塞缺陷 → 稳定性迭代 / 发版窗口
+**出口**：PC-1~PC-10 切片全合入 + 全量测试绿 + 无阻塞缺陷（真模型 E2E 待有模型池环境）→ 稳定性迭代 / 发版窗口
 
 ---
 
@@ -31,12 +31,22 @@
 | **D 发版** | REL-1.0.7 | 已完成（桌面 `v1.0.7+1` / 插件 `v1.0.6`，GitHub + Gitee 资产已传） | 覆盖安装验证 | [work-log.md](work-log.md)（2026-11-10 REL-1.0.7） |
 | **E 稳定性** | STAB-PL-1~9 产线与模型池问题侦查 + 落地（D1~D7 全部完成，含 D7-5 数据副本回归） | 进行中 | 真机验收产线文件窗 / 角色配置 | [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
-| **H 标准开发流生产线** | PL-PRODUCT 已规划且**方案冻结**（**两条硬保证：1 分钟记录+理解；迁移/重构零漂移返工**；**项目整理硬前置：结构不干净只允许 cleanup**；企业级稳定 = 交付契约 + 控制面；文档归一化/索引就绪门；归一化预检写入；项目文档默认只读；先摘要 + 双查询；附件摘要 + 图片边界；任务拆分协议；计划多轮自迭代 + 不变量/追踪矩阵/`- [ ]` 门禁/漂移哨兵；右栏详情页；附件落 `.input`）；门控规范 [production-line-gates.md](pluginization/production-line-gates.md) 已冻结；PC-1 驱动补洞待开工 | 进行中（已切快速迭代；O6 随 PC-8） | PC-1 → PC-2 → **PC-2B** → **PC-2D（结构硬门）** → **PC-2C** → **PC-2A** → PC-3 → **PC-3C** → **PC-3E** → **PC-3F** → PC-3A/3B/3D → PC-9 → PC-4 → PC-5 → **PC-5B** → **PC-5F** → **PC-5C** → **PC-5D** → **PC-5E** → **PC-5A** → PC-6/7 → **PC-10** → PC-8 | [production-line-product-form.md](pluginization/production-line-product-form.md) ＋ [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) ＋ [production-line-gates.md](pluginization/production-line-gates.md) |
+| **H 标准开发流生产线** | **Task 1~11 全部落地，PC-1~10 功能完整**：执行驱动与状态真值、结构硬门、归一化预检写入 + 复合就绪门、1 分钟理解（LLM #1 摘要 + 双查询 + RRF + `evidence_id` + 60s partial）、任务输入/附件（`.input` 落盘 + sha256 + 图片边界 + 视觉/非视觉 + PDF/Office 只存）、记忆端口（`agent.memory.get/record`，产线只存 hash/sources）、任务拆分器（PG-03~07 + plan-vN）、计划 7 块 + REQ 追踪 + 起草/批判/修正 + DEC + BG-01~08、UI 四入口 + 准备四步 + 计划审查 + 右栏 `productionTask` + 结构/归一化页 + `broadcast.task_state`（单调 seq + 3s 轮询）、稳定性（租约/fencing、幂等、事件日志/对账、独立 gate runner + `gate.json` 封签、SLO 指标） | 进行中（功能完整，PC-1~10 全部落地；剩余仅真模型 E2E） | 在有模型池/密钥的环境执行真模型 E2E（AG-11 / TC-PL-C15）；确定性 E2E 已覆盖全链路与异常五路径，前置与证据留存见 `plugins/tree.production.line/tool/e2e_real_model.md` | [production-line-product-form.md](pluginization/production-line-product-form.md) ＋ [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) ＋ [production-line-gates.md](pluginization/production-line-gates.md) |
 | **I 存储插件 tree.storage** | — | 已完成（ST-1~ST-6；docnorm 已接入） | 待新任务 | [tree-storage-recon.md](pluginization/tree-storage-recon.md) §7 |
 | **J 模型池 kind/protocol** | — | 已完成（MP-1~MP-7；embedding 已被 DN-9 消费） | 待新任务（JEV 待产线主控） | [model-pool-kinds-recon.md](pluginization/model-pool-kinds-recon.md) §7 |
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
 | **L UI 圆角化** | RND-UI-1 + S1~S4 已落地（UI 插件 `f208763`；版本随发版车道 D） | 已完成 | 真机视觉验收（深/浅、240px 窄栏、tab 溢出） | [ui-roundness-visual-upgrade-recon.md](pluginization/ui-roundness-visual-upgrade-recon.md) §4 |
 | **M 核心与 UI 生命周期** | 最后一个 UI 进程退出 ⇒ 核心收尾剩余插件并退出；全部停用/卸载/从未连上 ⇒ 保持引导页模式 | 已完成 | 真机 E2E-14（托盘退出 / 直接结束 UI 进程 / 全部停用） | [ui-pluginization.md](pluginization/ui-pluginization.md) §4.1.1 ＋ `ui-pluginization_acceptance.md` D-13/E-16/E2E-14 |
+
+**车道 H 门控覆盖**（冻结版 [production-line-gates.md](pluginization/production-line-gates.md)）：
+LG-01~07 就绪门（结构 / 文档归一化 / 包图 / 文档图 / 代码索引 / 测试映射 / 复合就绪）；
+PG-00~10 计划门（7 块 / REQ 追踪 / 依赖 / 尺寸 / 写域 / 任务门控 / 集成 / 契约变更 / 迁移前置）；
+TG-01~16 任务门（输入 / 依赖 / 写域 / 预算 / 就绪 / 围栏 / 租约 / 出口）；
+BG-01~12 批次门（范围 / API / schema / golden / 依赖图 / 数据 / 文档 / 追踪 / 集成）；
+SG-01~06 稳定性门（单执行者 / 幂等 / 崩溃恢复 / 门控防篡改 / 换模型回归 / 恢复 SLO）；
+AG-01~10 已由确定性 E2E 覆盖，AG-11（真模型端到端）待有模型池环境执行。
+**已知限制**：① 真模型 E2E 需本机模型池 / 密钥（见 [known-issues.md](known-issues.md) #53）；
+② PDF / Office / 非视觉图片附件首版只存不读（设计性限制，见 [known-issues.md](known-issues.md) #51）。
 
 **车道依赖**：`A：1 → 2 → 3 → 4 → 5`；`C` 必须等 `A` 的 S6 之后（行为改造不污染移仓回滚点）；
 `B`、`E`、`G` 与 `A` 无依赖，可并行；`D` 需阶段切到发版窗口。
