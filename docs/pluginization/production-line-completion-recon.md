@@ -361,6 +361,25 @@
 单任务全绿但功能不可用。需要 **PC-3E 任务拆分器**（DAG 校验 + 尺寸/交叠/集成规则 + 批次）
 和 **PC-5D 计划审阅 UI**，把「拆得对」变成可校验、可修改、可版本化的流程。
 
+### 4.15 计划一次生成、无迭代无防漂移：迁移/重构无法保证不跑偏
+
+当前 plan 是 `llm.call` 一次输出 JSON，直接 `parseScopeJson` 落档；没有方案设计、不变量账本、
+追踪矩阵、每任务 `- [ ]` 门禁，也没有批判/修正轮次与漂移哨兵：
+
+| 要求 | 现状 | 证据 |
+| --- | --- | --- |
+| 方案设计 | 只有 `in/out/not_doing + tasks`；没有架构/数据流/迁移/回滚/替代方案 | `ScopePlan` 字段（[preparation.dart:327-349](../../plugins/tree.production.line/lib/src/preparation.dart#L327-L349)） |
+| 不变量账本 | 没有；任务不声明 preserves/changes | `PlanTaskSpec` 无 invariants |
+| 追踪矩阵 | 没有；需求→设计→任务→门禁断链不可见 | 无 |
+| 每任务出口门禁 | `acceptance` 是自然语言数组，不是可解析清单 | `acceptance` 字段（[preparation.dart:382-388](../../plugins/tree.production.line/lib/src/preparation.dart#L382-L388)） |
+| 多轮自我迭代 | 一次生成即落档；没有 critic/repair | `_planFor` 单次 LLM |
+| 漂移哨兵 | 没有越界/API/schema/golden/依赖图/数据对账检查 | 无 |
+| 变更控制 | 没有 plan 版本/变更单；改计划不可追踪 | 无 |
+
+**影响**：大规模迁移/重构最怕的「语义漂移」无法防：每步门控可能绿，但契约/行为/架构已变味，
+最后返工。需要 **PC-3F 计划迭代与漂移防护**（方案/不变量/追踪矩阵/`- [ ]` 门禁解析/漂移哨兵/
+变更控制）和 **PC-5E 计划审查 UI**；「零返工」明确为「零漂移返工」，真实新发现走变更单。
+
 ---
 
 ## 5. 产品形态定稿（建议）
@@ -530,6 +549,7 @@
 | **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
 | **PC-3C 文档维护边界** | 代码任务默认不写 `docs/`；计划可单独列文档任务（`write_scope` 只含目标文档、与同文档代码任务串行）；执行站写域校验；不自动改 work-log/project-status/known-issues；文档任务验收/台账 | PC-3 | 单测：代码任务越界写 docs 被拒；文档任务只写目标文档；同文档任务不并行；项目文档未被自动修改 |
 | **PC-3E 任务拆分器** | 扩展 `goal/task_type/conflicts_with/serial_group/gate/risk/contract/rationale`；DAG 校验（环/跨计划依赖/写域交叠/尺寸/门控/集成任务）；确定性修正（超限拆分、微任务合并、交叠串行、去伪依赖）；批次计算；计划版本 `plan-vN` | PC-3 | 单测：环被拒；无门控/无验收/缺集成被拒；写域交叠不能同批；超大任务被拆；微任务合并；批次与 `max_parallel` 一致；改计划生成新版本 |
+| **PC-3F 计划迭代与漂移防护** | 计划 7 块（设计/不变量/任务/出口门禁/追踪矩阵/风险/变更控制）；起草→批判→修正循环（最多 3 轮，findings 分级）；`- [ ]` 门禁解析；不变量 preserves/changes；追踪矩阵断链阻断；漂移哨兵（越界/API/schema/golden/依赖图/数据/文档）；变更单与 plan 版本 | PC-3E | 测试：无设计/不变量/追踪断链不能落档；critic 修复后 findings 关闭；门禁清单可解析成证据；越界/API diff/schema/golden/依赖图漂移被阻断；零漂移返工指标可算 |
 | **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input/日期目录 → .input/production_lines/<line>/tasks/<task>/attachments/` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除；首版允许只存（known-issues #51） | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
 | **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
 | **PC-3D 附件理解边界** | LLM #1 总结附件（文本摘要/图片视觉总结/关键词）；关键词并入查询 B；图片预处理（像素上限/EXIF 剥离/长边 360–1024/动图首帧/透明/去重/最多 4 张/总 ≤12MB）；非视觉 `image_manual_reference`；MIME 嗅探、路径校验、base64 不入包/日志、SVG 禁脚本；LLM #2 默认读摘要，必要时附图 | PC-3A/3B + PC-2A | 单测：文本附件摘要/关键词进查询 B；视觉模型总结图片、非视觉不伪造；超大图降采样/拒绝；损坏图 unreadable；重复图去重；>4 张截断；EXIF 不残留；base64 不出现在上下文包/日志 |
@@ -540,10 +560,11 @@
 | **PC-5B 就绪门 UI** | 产线头「初始化中」、清单/进度/重新检测、开任务按钮禁用、`409` 文案翻译、完成后自动刷新；「查看构建日志」 | PC-2B | UI 单测：缺项逐条显示、按钮禁用、补齐后自动放行、stale 后重新显示阻塞；`flutter analyze` 0 |
 | **PC-5C 归一化预览 UI** | 归一化文件列表、diff 查看、动作/rewrite 警告、应用/取消、写入进度、失败回滚提示、运行记录 | PC-2C | UI 单测：plan 不写盘、diff 正确、rewrite 需二次确认、apply 后刷新就绪门、失败显示回滚结果；`flutter analyze` 0 |
 | **PC-5D 计划审阅 UI** | 任务 DAG/列表、尺寸与风险、写域交叠/无门控/缺集成警告、批次预览、拆分/合并/改依赖/改门控、锁定与计划版本 diff | PC-3E | UI 单测：警告逐条可见、拆分/合并后重算批次、未解决警告禁止落档、锁定后生成 plan-vN；`flutter analyze` 0 |
+| **PC-5E 计划审查 UI** | 方案设计、不变量账本、追踪矩阵、每任务 `- [ ]` 门禁清单、findings（high/med/low）、plan diff、未解决项确认、变更单入口 | PC-3F | UI 单测：7 块齐全才可锁定；findings 分级显示；追踪断链高亮；门禁清单勾选与证据联动；plan diff 可查看；`flutter analyze` 0 |
 | **PC-5A 理解卡 UI** | 「开始理解」→ LLM #1 摘要进度 → 10s 检索倒计时 →「上下文已就绪」→ LLM #2 单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A + PC-5B | UI 单测：摘要阶段可见、10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用摘要+上下文、重新理解生成新 id；`flutter analyze` 0 |
 | **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、右栏任务详情页（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
-| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-5C/PC-5D/PC-6/PC-7/PC-9/PC-10 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
+| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-5C/PC-5D/PC-5E/PC-6/PC-7/PC-9/PC-10 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
 
 ### 8.1 实施导航（文件级）
 
@@ -601,6 +622,7 @@
 | TC-PL-C25 | 关键词质量：摘要输出含 terms/synonyms/entities/files/apis 与附件关键词；空关键词/摘要失败按 `digest_fallback` 或重试，不用原文静默替代 |
 | TC-PL-C26 | 稳定性控制面：重复派发只执行一次；过期租约写被拒；杀进程/断网/部分写后恢复不丢不重；执行者改门控结果被拒；换模型黄金任务通过；恢复耗时 SLO |
 | TC-PL-C27 | 任务拆分：环/跨计划依赖被拒；无门控/无验收/缺集成任务不能落档；写域交叠不能同批；超大任务拆分、微任务合并；批次与 max_parallel 一致；改计划生成 plan-vN |
+| TC-PL-C28 | 计划迭代/防漂移：7 块缺失不能落档；critic findings 分级与修复闭环；`- [ ]` 门禁可解析；追踪断链阻断；越界/API/schema/golden/依赖图/数据漂移被哨兵拦截；零漂移返工指标可算 |
 
 ---
 
