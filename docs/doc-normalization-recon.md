@@ -143,7 +143,7 @@ reanalyze  = 只重算受影响包的 L0（包内文件全量），标 stale，�
 | **D25** | 产线怎么用图谱 | 只经 `docnorm.query` / `docnorm.check` 执行站命令；前端按钮走委派端点；不新增核心 REST。**产线 `requires` 需含 `tree.docnorm`，缺失即 fail-closed** | 执行站是插件间唯一通道 |
 | **D26** | embeddings 与降级 | **本期默认上 embeddings**（模型池 `kind: embedding`），检索默认 `hybrid`（BM25 + 向量）；没有可用 embedding 时退 `entity linking + BM25 + 1~2 跳扩展`，结果显式标 `mode: lexical\|hybrid`，**不假装完整** | 用户拍板：上 embedding；但缺模型时不能被整块卡死 |
 | **D27** | 存储 | 独立插件 `tree.storage`（Sembast、纯 Dart）；`requires` 关系；DB 真源 + `export` 快照 | 用户拍板；避免插件各造格式 |
-| **D28** | 插件设置项 | **独立插件 `tree.settings`**（车道 K）：schema 注册 + 用户覆盖值存取 + `settings.changed` 广播；UI 通用渲染，核心不存值、不聚合；优先级 设置服务 > env > 插件 config > 默认；secret 只回 `has_value`；K 未落地前 docnorm 用 `.docnorm/config.json` + env | 预算/模型/开关要能改；用户拍板 D 方案“更干净” |
+| **D28** | 插件设置项 | **独立插件 `tree.settings`**（车道 K）：schema 注册 + 用户覆盖值存取 + `settings.changed` 广播；UI 通用渲染，核心不存值、不聚合；优先级 设置服务 > env > 插件 config > 默认；secret 只回 `has_value`。docnorm 已接入六项（`stage_budget` / `context_cap` / `context_ratio` / `full_code_ratio` / `model_max_seqlen` / `token_scale`），按 v2 的 `binding=plugin` 全局库注册与读取，设置服务缺失时退回 `.docnorm/config.json` + env | 预算/模型/开关要能改；用户拍板 D 方案“更干净” |
 | **D29** | 索引与"字节不变"冲突 | 索引维护**只允许追加式插入**（新行插到末尾或对应分组末尾，不重排）；必须重排的文件列入 `rewrite_allowlist`，在报告里给完整 diff 并单独成一次提交 | DN-6 的"字节不变"与自动维护索引本来冲突，必须显式开例外 |
 | **D30** | 安全边界 | 门禁命令默认只列不跑（`--run-gates`）；规则包 pin commit + sha256；默认禁网；`baseline` 默认 dry-run；不执行目标仓脚本、不跟随出仓链接、不读密钥 | 任意仓 = 不可信代码 / 供应链输入 |
 | **D31** | 阈值配置化 | 体积/单文件/API 数/收束字数/检索 k/边检查阈值全部落 `policy.json`；引擎无硬编码 | 与"规则可换"一致 |
