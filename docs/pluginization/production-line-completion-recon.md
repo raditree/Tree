@@ -278,6 +278,20 @@
 把检索扩成全维图谱、把上下文打成带 `evidence_id` 的包、加召回门控与「检索 ≤10s」预算，
 仍然只调一次 LLM（LLM 耗时单独记录，不计入 10s）。
 
+### 4.10 没有前置就绪门：文档归一化/索引未完成也能开任务
+
+产品要求「文档归一化 + 索引构建完成之前不得开任何任务」；当前没有这个门：
+
+| 要求 | 现状 | 证据 |
+| --- | --- | --- |
+| 文档归一化门 | `prepare.recon` 直接 `docnorm.query`，不检查 `doc_state` 是否就绪；无文档也能继续 | `_queryDocs` / `_callLlm`（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)） |
+| 索引门 | `task.create` / `queue.dispatch` / `start` / `tick` 都不查 `pkg_index`、`graph_*`、`dedup_*` | 任务创建与派发命令（[api.dart:248-290](../../plugins/tree.production.line/lib/src/api.dart#L248-L290), [api.dart:573-650](../../plugins/tree.production.line/lib/src/api.dart#L573-L650)） |
+| 状态表达 | 产线状态没有 `初始化中`，索引缺失时界面仍可点「新建/开始」 | `line.status` 计算（[orchestrator_service.dart:126-160](../../plugins/tree.production.line/lib/src/orchestrator_service.dart#L126-L160)） |
+| 失效重检 | 工作空间 HEAD 变化/索引 stale 后，没有自动冻结开新任务 | 无 readiness 服务/缓存版本校验 |
+
+**影响**：首任务可能在空图谱上打包/执行，理解卡没有文档/代码证据，等于把「真实全面」的地基抽掉；
+必须加产线级 `line.ready` 门，所有开任务命令统一校验，前端只做镜像。
+
 ---
 
 ## 5. 产品形态定稿（建议）
@@ -347,6 +361,8 @@
 | POST | `.../tasks/{taskId}/understand` | `production.prepare.understand` | **单次图谱搜索 + 一次 LLM**：返回 `understanding_id/retrieval_ms/llm_ms/partial/recall_gap/coverage/evidence`；`reuse_context_id` 可复用上下文包重试 |
 | GET | `.../tasks/{taskId}/understand/{understandingId}` | `production.prepare.understand.status` | 进度 / 结果 / 证据（流式或轮询） |
 | GET | `/api/production/lines/{id}/graph` | `production.graph.status` | 包图/文档图/代码块索引的新鲜度与覆盖 |
+| GET | `/api/production/lines/{id}/ready` | `production.line.ready` | **前置就绪门**：`{ready, phase, progress, missing[], graph_version, checked_at}` |
+| POST | `/api/production/lines/{id}/graph/rebuild` | `production.graph.rebuild` | 文档归一化/索引重建或重试；完成后重新判门 |
 | PATCH | `/api/production/lines/{id}/tasks/{taskId}`（扩展） | 新 `production.task.update` | 非终态任务可改 `title/brief/kind/priority/depends_on/read_scope/write_scope/acceptance/references`；终态只读 |
 | POST/DELETE | `.../tasks/{taskId}/attachments` | `production.task.attach/detach` | 附件登记/移除；来源限 `.input/`，复制进 `.input/production_lines/<line>/tasks/<task>/attachments/` 并记 `sha256/size/type` |
 | POST | `/api/production/lines/{id}/tasks`（扩展） | `production.task.create` | 建任务可带 `brief/acceptance/depends_on/references/attachment_sources` |
@@ -435,17 +451,19 @@
 | --- | --- | --- | --- |
 | **PC-1 驱动补洞** | `finalize` 后启动、手动派发后事件 tick、定时 tick 认 `queued`、产线状态计算、`start` 路由 | — | 插件单测：首任务自动起步、跑完自动 continue、暂停后不派发、状态计算真值表；自检新增 3 场景 |
 | **PC-2 准备阶段 REST** | `prepare/*` 六条写路由 + `GET prepare`；错误码映射；`agent_id` 透传 | PC-1 | 插件单测：intake→recon→answer→finalize 全链路；REST 形状测试；契约路由基线同步 |
-| **PC-2A 10s 单次检索** | `production.prepare.understand|status`；**一次**图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）→ 上下文包（`evidence_id`/配额/裁剪）→ **一次 LLM**；召回门控（`recall_gap` 不补第二轮）；证据校验；理解缓存与预 warm；**检索 10s 硬超时**（不含 LLM，`llm_ms` 单独记录）出 partial | PC-2 | 单测/基准：检索 P95 ≤ 10s（不含 LLM）；冷启动/门控不过出 `partial/recall_gap`；超时不空屏仍只调一次 LLM；结论引用 `evidence_id`；无 embedding 标 `degraded`；缓存命中 0 次检索/0 次模型调用 |
+| **PC-2B 前置就绪门** | `production.line.ready` + `graph.rebuild`；文档归一化（`doc_state`/`no_docs`）+ 包图 + 文档图 + 代码索引 + 测试映射的完成判定；`line.ready` 固定 `graph_version`；`understand/task.create/task.attach/queue.dispatch/start/tick` 统一门控；HEAD/stale 自动失效 | PC-2 | 单测：任一项缺失时上述命令全部 `409 line_not_ready` 且带 `missing[]`；补齐后自动放行；stale 后重新阻塞；无文档 `no_docs` 可放行；无 force 参数 |
+| **PC-2A 10s 单次检索** | `production.prepare.understand|status`；**一次**图谱聚合（`pkg_index` + 文档 graph + dedup 代码块/向量 + git/测试/风险）→ 上下文包（`evidence_id`/配额/裁剪）→ **一次 LLM**；召回门控（`recall_gap` 不补第二轮）；证据校验；理解缓存与预 warm；**检索 10s 硬超时**（不含 LLM，`llm_ms` 单独记录）出 partial | PC-2 + PC-2B | 单测/基准：检索 P95 ≤ 10s（不含 LLM）；冷启动/门控不过出 `partial/recall_gap`；超时不空屏仍只调一次 LLM；结论引用 `evidence_id`；无 embedding 标 `degraded`；缓存命中 0 次检索/0 次模型调用 |
 | **PC-3 任务输入与编辑 REST** | `production.task.create/update` 增 `brief/acceptance/depends_on/references`（字段白名单+状态边界）、`GET pack/messages/budget`、`GET runs/{id}`、`queue/plan`、`start`；派发前预检（内容/验收/依赖/写域） | PC-1 | 单测：缺内容/验收拒绝入队、终态拒改、在途只改优先级/依赖、改写域触发计划重算；大文件走磁盘/截断 |
 | **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input/日期目录 → .input/production_lines/<line>/tasks/<task>/attachments/` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除；首版允许只存（known-issues #51） | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
 | **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
 | **PC-9 记忆端口** | `tree.agent` 新增 `agent.memory.get/record`（`.self/memory.md` + 压缩摘要；未来升级只改 agent）；产线只加 `MemoryPort`（prepare/pack/run 三处注入）与终态回写；run 台账记 `memory_hash/sources`；项目文档收敛为一个 `projectContext` helper | PC-3 + tree.agent | 单测：记忆块进提示词、`pack.json` 无记忆正文、记忆变化不使 pack 失效、记忆不可用任务仍完成；契约测试钉住 `get/record` 形状 |
 | **PC-4 事件广播** | `broadcast.task_state`（seq）+ 写点 + REST 快照对齐；UI 订阅 + 3s 轮询兜底 | PC-1/PC-3 | 插件单测：seq 单调、重连去重；UI 单测：推送更新、断线轮询、断线横幅 |
 | **PC-5 准备阶段 UI** | 五栏表单、问题卡（默认/推荐/后果）、窗口提示、落档预览与摘要、开始执行（理解卡见 PC-5A） | PC-2 | UI 单测：空泛词提示、未答禁止落档、全部按推荐、落档后任务可见；`flutter analyze` 0 |
-| **PC-5A 理解卡 UI** | 「开始理解」→ 10s 检索倒计时/进度 →「上下文已就绪」→ 模型单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A | UI 单测：10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用上下文、重新理解生成新 id；`flutter analyze` 0 |
+| **PC-5B 就绪门 UI** | 产线头「初始化中」、清单/进度/重新检测、开任务按钮禁用、`409` 文案翻译、完成后自动刷新；「查看构建日志」 | PC-2B | UI 单测：缺项逐条显示、按钮禁用、补齐后自动放行、stale 后重新显示阻塞；`flutter analyze` 0 |
+| **PC-5A 理解卡 UI** | 「开始理解」→ 10s 检索倒计时/进度 →「上下文已就绪」→ 模型单独计时 → 理解卡（一句话/影响面/复用/约定/风险/未知/问题/覆盖读数）；`[E#]` 证据点开文件或文档；「重新理解」/「重试」；partial/recall_gap/degraded/stale 徽标 | PC-2A + PC-5B | UI 单测：10s 内上下文就绪、模型阶段单独计时、检索超时显示上下文包摘要、evidence 跳转正确、重试复用上下文、重新理解生成新 id；`flutter analyze` 0 |
 | **PC-6 执行监控 UI** | 主控条增强（guard/连续失败）、任务分组看板、右栏任务详情页（内容/附件/pack/改动/门控/消息/专家/usage）、批量派发 | PC-3A/PC-4 | UI 单测：blocked 原因可见、门控输出展开、批量派发只发 batch；零位移/滚动不回归 |
 | **PC-7 复盘与配置 UI** | 台账详情、产物点开（files `line:<id>`）、`limits/policy/docs` 配置、预算显示 | PC-3/PC-6 | UI 单测：产物跳转带正确作用域、配置回写不丢未知键；配置改动下一任务生效 |
-| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-6/PC-7/PC-9 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
+| **PC-8 真模型 E2E + 文档** | O6 全链路：准备 → 打包 → 执行 → 决策 → ask/answer → done；异常五路径；提示词索引/工作日志 | PC-5/PC-5A/PC-5B/PC-6/PC-7/PC-9 | 真模型一次通过 + 截图/台账证据；插件 analyze 0 + 全量测试 + 自检；UI 全量测试；docs_contract |
 
 ### 8.1 实施导航（文件级）
 
@@ -454,17 +472,18 @@
 | 驱动 | `plugins/tree.production.line/tree.production.line_plugin.dart` | manual dispatch 后 `_scheduleEventTick`；finalize 回调；`start` |
 | 驱动 | `lib/src/orchestrator_service.dart` | 定时 tick 条件、状态计算、`consecutive_failures` 恢复 |
 | 理解（新） | `lib/src/understanding.dart` / `lib/src/understanding_service.dart` | 单次图谱聚合、上下文包/证据、召回门控、一次 LLM、证据校验、**10s 检索超时（不含 LLM）**、缓存与预 warm |
+| 就绪门（新） | `lib/src/readiness.dart` / `lib/src/readiness_service.dart` | 文档归一化/包图/文档图/代码索引/测试映射完成判定、`line.ready`、`graph_version`、HEAD/stale 失效、开任务命令统一门控 |
 | 理解检索 | `lib/src/dedup_store.dart`（复用） / `tree.docnorm` `docnorm.query` | 代码块/向量 top-k、文档 BM25/hybrid、`pkg_index` 读取 |
-| REST | `lib/src/api.dart` | 新增 prepare/understand/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
+| REST | `lib/src/api.dart` | 新增 prepare/understand/ready/graph.rebuild/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
 | 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、附件复制与哈希、理解缓存、run 读取、保留策略 |
 | 记忆 | `tree.agent` / `plugins/tree.production.line/lib/src/memory_port.dart`（新） | agent 侧 `memory.get/record`；产线只做端口适配与三处注入，不读 `.self/memory.md` |
 | 事件 | `tree.production.line_plugin.dart` / `lib/src/service.dart` | 注册广播站、状态迁移写点 |
 | UI API | `plugins/tree.ui.default/lib/io/api_service.dart` | 新增 prepare/task update/pack/messages/budget/run detail/start 方法 |
 | UI 工作台 | `lib/ui/widgets/production_line_workbench.dart` | 三段式布局、准备阶段、任务看板、右栏详情页、轮询/订阅 |
 | UI 配置 | `lib/ui/widgets/create_production_line_dialog.dart` | `limits/policy/docs` 三组 |
-| UI 新组件 | `lib/ui/widgets/production_*` | 建议拆：准备面板、**理解卡**、右栏任务详情页、事件客户端（避免单文件继续膨胀） |
-| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`understanding_test`（含 10s 检索基准）、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
-| 测试 | `plugins/tree.ui.default/test/` | 扩充 `production_line_panel_test`；新增准备阶段/详情/事件用例 |
+| UI 新组件 | `lib/ui/widgets/production_*` | 建议拆：准备面板、**就绪门清单**、**理解卡**、右栏任务详情页、事件客户端（避免单文件继续膨胀） |
+| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`understanding_test`（含 10s 检索基准）、`readiness_test`、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
+| 测试 | `plugins/tree.ui.default/test/` | 扩充 `production_line_panel_test`；新增准备阶段/就绪门/理解卡/详情/事件用例 |
 
 ---
 
@@ -492,6 +511,7 @@
 | TC-PL-C18 | 记忆块进准备/打包/执行提示词；`pack.json` 无记忆正文；记忆升级后产线零改动；记忆不可用时任务仍完成并记 `memory_unavailable` |
 | TC-PL-C19 | 单次检索：P95 ≤ 10s（**不含 LLM**）；冷启动/无 embedding 出 `partial/degraded`；`recall_gap` 不触发第二次检索；检索超时不空屏且仍只调一次 LLM；`llm_ms` 单独记录 |
 | TC-PL-C20 | LLM 结论均引用存在的 `evidence_id`；无证据项进「未知」；覆盖读数与图谱实际一致；「重新理解」生成新 id、 `reuse_context_id` 不重新检索 |
+| TC-PL-C21 | 前置就绪门：文档归一化/包图/文档图/代码索引/测试映射任一缺失时，理解/建任务/附件/派发/启动/tick 全部 `409 line_not_ready`；补齐后自动放行；HEAD 变化后重新阻塞；无 force 开关 |
 
 ---
 
