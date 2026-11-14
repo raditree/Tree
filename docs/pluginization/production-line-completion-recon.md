@@ -310,6 +310,22 @@
 实际不会。需要把「归一化写入」拆成独立预检写入阶段（PC-2C），把「项目文档维护」明确为
 默认只读 + 显式文档任务（PC-3C）。
 
+### 4.12 图谱检索没有接入附件，图片边界完全未定义
+
+产品要求理解阶段把附件也作为输入；当前 `production.prepare.recon` 只查文档，
+没有附件 evidence，也没有图片处理：
+
+| 要求 | 现状 | 证据 |
+| --- | --- | --- |
+| 附件进入理解 | 准备阶段输入只有五栏 + `docnorm.query`；`task.attachments` 尚未实现（PC-3A） | `_recon` 调用 `_queryDocs` / `_callLlm`（[preparation_service.dart:188-207](../../plugins/tree.production.line/lib/src/preparation_service.dart#L188-L207)） |
+| 图片视觉 | 现有 `agent.worker.run` 没有 attachments 透传（PC-3B 才加） | `SubagentTurnRequest` 无附件字段 |
+| 图片边界 | 无像素上限、EXIF 剥离、动图首帧、透明处理、重复去重、超量降级、非视觉降级 | 无附件理解模块 |
+| 安全 | 没有「base64 不入上下文包」「MIME 嗅探」「SVG 禁脚本」的约束 | 无 attachment context builder |
+
+**影响**：用户上传设计稿/截图后，理解卡完全看不到图；或者实现时把 base64 塞进 JSON、
+把动图/超大图直接送模型，导致超时/超 token/隐私问题。需要单列 **PC-3D 附件理解边界**，
+把「附件作为显式 evidence + 图片预处理 + 同一次 LLM 多模态」钉死（§5.2.9 口径）。
+
 ---
 
 ## 5. 产品形态定稿（建议）
@@ -480,6 +496,7 @@
 | **PC-3C 文档维护边界** | 代码任务默认不写 `docs/`；计划可单独列文档任务（`write_scope` 只含目标文档、与同文档代码任务串行）；执行站写域校验；不自动改 work-log/project-status/known-issues；文档任务验收/台账 | PC-3 | 单测：代码任务越界写 docs 被拒；文档任务只写目标文档；同文档任务不并行；项目文档未被自动修改 |
 | **PC-3A 附件上传与登记** | `production.task.attach/detach`；`.input/日期目录 → .input/production_lines/<line>/tasks/<task>/attachments/` 复制、`sha256/size/type`、同名后缀、越界/超限拒绝；`pack.json` 附件快照；提示词增附件/引用段；UI 上传/预览/移除；首版允许只存（known-issues #51） | PC-3 | 单测：复制与哈希、路径穿越/符号链接/超限拒绝、改附件使 `packed→queued`；UI 单测：上传预览、缺附件报错、文本附件可读 |
 | **PC-3B 图像视觉** | `agent.worker.run` 增 `attachments`；`SubagentTurnRequest` 透传到现有 vision 通道；非视觉模型预检降级 | PC-3A + tree.agent | 单测：视觉模型收到 image part、非视觉模型只列路径不伪造；内联尺寸/JSON 上限沿用既有约束 |
+| **PC-3D 附件理解边界** | 理解阶段把附件作为显式 evidence 注入上下文包；文本 ≤4k/个；图片预处理（像素上限/EXIF 剥离/长边 360–1024/动图首帧/透明/去重/最多 4 张/总 ≤12MB）；同一次 LLM 携带 image part；非视觉 `image_manual_reference`；MIME 嗅探、路径校验、base64 不入包/日志、SVG 禁脚本 | PC-3A/3B + PC-2A | 单测：文本 evidence 可引用；视觉模型收到图、非视觉不送图；超大图降采样/拒绝；损坏图 unreadable；重复图去重；>4 张截断；EXIF 不残留；base64 不出现在上下文包/日志 |
 | **PC-9 记忆端口** | `tree.agent` 新增 `agent.memory.get/record`（`.self/memory.md` + 压缩摘要；未来升级只改 agent）；产线只加 `MemoryPort`（prepare/pack/run 三处注入）与终态回写；run 台账记 `memory_hash/sources`；项目文档收敛为一个 `projectContext` helper | PC-3 + tree.agent | 单测：记忆块进提示词、`pack.json` 无记忆正文、记忆变化不使 pack 失效、记忆不可用任务仍完成；契约测试钉住 `get/record` 形状 |
 | **PC-4 事件广播** | `broadcast.task_state`（seq）+ 写点 + REST 快照对齐；UI 订阅 + 3s 轮询兜底 | PC-1/PC-3 | 插件单测：seq 单调、重连去重；UI 单测：推送更新、断线轮询、断线横幅 |
 | **PC-5 准备阶段 UI** | 五栏表单、问题卡（默认/推荐/后果）、窗口提示、落档预览与摘要、开始执行（理解卡见 PC-5A） | PC-2 | UI 单测：空泛词提示、未答禁止落档、全部按推荐、落档后任务可见；`flutter analyze` 0 |
@@ -500,6 +517,7 @@
 | 就绪门（新） | `lib/src/readiness.dart` / `lib/src/readiness_service.dart` | 文档归一化/包图/文档图/代码索引/测试映射完成判定、`line.ready`、`graph_version`、HEAD/stale 失效、开任务命令统一门控 |
 | 归一化写入（新） | `lib/src/normalization.dart` / `lib/src/normalization_service.dart` | 复用 `docnorm` plan/apply；diff、备份/补丁、`before_sha256`、回滚、幂等、写入期任务冻结 |
 | 文档边界（新） | `lib/src/docs_guard.dart` | 项目文档默认只读、文档任务写域/串行校验、禁止自动改 work-log/project-status/known-issues |
+| 附件理解（新） | `lib/src/attachment_context.dart` | 文本 evidence、图片预处理/限额/安全、多模态 part、非视觉降级、base64 不入包 |
 | 理解检索 | `lib/src/dedup_store.dart`（复用） / `tree.docnorm` `docnorm.query` | 代码块/向量 top-k、文档 BM25/hybrid、`pkg_index` 读取 |
 | REST | `lib/src/api.dart` | 新增 prepare/understand/ready/graph.rebuild/normalize/attachments/pack/messages/budget/runs/{id}/queue plan/start 路由 |
 | 存储 | `lib/src/store.dart` | `task.update` 白名单写回（保留未知键）、附件复制与哈希、理解缓存、run 读取、保留策略 |
@@ -509,7 +527,7 @@
 | UI 工作台 | `lib/ui/widgets/production_line_workbench.dart` | 三段式布局、准备阶段、任务看板、右栏详情页、轮询/订阅 |
 | UI 配置 | `lib/ui/widgets/create_production_line_dialog.dart` | `limits/policy/docs` 三组 |
 | UI 新组件 | `lib/ui/widgets/production_*` | 建议拆：准备面板、**就绪门清单**、**归一化预览**、**理解卡**、右栏任务详情页、事件客户端（避免单文件继续膨胀） |
-| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`understanding_test`（含 10s 检索基准）、`readiness_test`、`normalization_test`、`docs_boundary_test`、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
+| 测试 | `plugins/tree.production.line/test/` | 新增 `prepare_api_test`、`understanding_test`（含 10s 检索基准）、`readiness_test`、`normalization_test`、`docs_boundary_test`、`attachment_understanding_test`、`task_update_test`、`attachment_test`、`driver_test`、`events_test` |
 | 测试 | `plugins/tree.ui.default/test/` | 扩充 `production_line_panel_test`；新增准备阶段/就绪门/归一化预览/理解卡/详情/事件用例 |
 
 ---
@@ -541,6 +559,7 @@
 | TC-PL-C21 | 前置就绪门：文档归一化/包图/文档图/代码索引/测试映射任一缺失时，理解/建任务/附件/派发/启动/tick 全部 `409 line_not_ready`；补齐后自动放行；HEAD 变化后重新阻塞；无 force 开关 |
 | TC-PL-C22 | 归一化预检写入：plan 0 写盘并返回 diff；apply 内容与 diff 一致；重复 apply 0 写盘；失败回滚；rewrite 未授权拒绝；写入期间任务全禁 |
 | TC-PL-C23 | 文档维护边界：代码任务越界写 `docs/` 被拒；文档任务只写目标文档且与同文档任务串行；work-log/project-status/known-issues 不被自动修改 |
+| TC-PL-C24 | 附件理解：文本附件进 evidence；视觉模型图片随同一次 LLM 读取；非视觉 `image_manual_reference`；超大/动图/透明/损坏/重复/超量按 §5.2.9；上下文包/日志无 base64 |
 
 ---
 

@@ -259,7 +259,7 @@
 #### 5.2.2 单次图谱搜索（硬门控）
 
 **只跑一次检索，不补第二轮。** 查询由需求五栏（目标/现状/验收/禁区/期限）拼成，
-一次召回六类上下文：
+一次召回六类图谱上下文 + 附件输入：
 
 | 维度 | 来源 | 配额（默认） |
 | --- | --- | --- |
@@ -269,10 +269,12 @@
 | 变更上下文 | `git status` + 近期 `git log` | 20 文件 |
 | 测试关联 | `test/` ↔ `lib/` 路径映射 | 10 文件 |
 | 风险与未知 | known-issues / TODO / `deny_globs` / 写域交叠 | 10 条 |
+| **附件输入** | `task.attachments`（显式输入，不进项目图谱） | 文本 ≤4k/个；图片 ≤4 张、≤12MB |
 
 **召回门控（recall gate）**：
 
 - 至少命中 1 个包、1 个代码块、1 段文档、1 条测试或风险；否则标 `recall_gap`。
+- 附件不算项目维度：附件读不了（损坏/不支持/非视觉）只进 `gaps`，不冒充「已理解」。
 - 相似度低于阈值的条目不硬塞；缺哪个维度就写进 `gaps`。
 - `recall_gap` **不触发第二次检索**；把缺口原样交给 LLM，让它变成「未知」或提问。
 - 无 embedding 模型时降级 lexical，并标 `degraded: lexical`。
@@ -284,15 +286,21 @@
   "requirement": {"goal": "...", "current": "...", "acceptance": "...", "forbidden": "...", "deadline": "..."},
   "graph": {"version": "...", "fresh": true, "coverage": {"packages": 42, "files": 318, "docs": 1204, "chunks": 96}},
   "evidence": [
-    {"id": "E1", "kind": "doc|code|package|change|test|risk", "path": "lib/...", "line": 88, "snippet": "...", "score": 0.82}
+    {"id": "E1", "kind": "doc|code|package|change|test|risk|attachment", "path": "lib/...", "line": 88, "snippet": "...", "score": 0.82}
   ],
-  "gaps": ["没有找到相关测试", "项目未启用 embedding"],
-  "limits": {"max_questions": 3}
+  "attachments": [
+    {"id": "A1", "evidence_id": "E20", "name": "design.png", "mime": "image/png", "size": 245760,
+     "width": 1440, "height": 900, "sha256": "9f2c...", "status": "vision|metadata_only|unreadable",
+     "note": "已缩放到 1024 长边、已去 EXIF"}
+  ],
+  "gaps": ["没有找到相关测试", "项目未启用 embedding", "A2 PDF 仅存不可读"],
+  "limits": {"max_questions": 3, "max_images": 4}
 }
 ```
 
-- 只放结构化事实与片段，不放整库、不放二进制、不放附件正文。
-- 超出 24k 字按「文档 / 代码 / 风险」优先级裁剪，裁剪项进 `gaps`。
+- 只放结构化事实与片段，不放整库、不放二进制；**图片不以 base64 写入上下文包**，
+  只放元数据与 `evidence_id`，图片本体作为多模态 part 随那一次 LLM 调用发送。
+- 文本附件按 4k/个截断并标 `truncated`；超出 24k 字按「文档 / 代码 / 附件 / 风险」优先级裁剪，裁剪项进 `gaps`。
 - 同一份上下文包可复用于重试；**重试不重新检索**，除非用户点「重新理解」。
 
 #### 5.2.4 一次 LLM（理解 + 语义对齐）
@@ -301,6 +309,11 @@
 
 系统提示词固定四段：角色（产线主控）、事实（上下文包）、边界（证据规则/提问规则）、
 输出契约（严格 JSON）。**不提供工具、不做多轮。**
+
+- 附件里有图片且角色模型支持视觉：**同一次调用**附带图片 part，不额外调模型、不做 OCR；
+  每张图带 `image_label` + `evidence_id`，模型引用图片时用该 id。
+- 模型不支持视觉：不送图片 part，`gaps` 记 `image_manual_reference`，提示用户补文字说明。
+- 图片 part 受 token/字节预算约束；超限只送前 N 张，其余进 `gaps`。
 
 输出：
 
@@ -381,6 +394,52 @@
 - **检索门控不过**：标 `recall_gap`，缺哪个维度写进 `gaps`；不补第二轮。
 - **重新理解**：一次新的单次搜索 + 一次 LLM，生成新的 `understanding_id`；旧卡保留可对比。
 - **不做后台深化**：单次搜索就是门控；需要更多上下文时由用户点「重新理解」。
+
+#### 5.2.9 附件进入理解：边界与图片处理
+
+**原则：附件是显式输入，不进入项目图谱；不为了附件额外检索；二进制不塞进上下文包。**
+
+流程：
+
+1. **校验**：`realpath` 必须落在 `.input/production_lines/<line>/tasks/<task>/attachments/`；
+   MIME 按字节嗅探，不信任扩展名；`sha256` 必须与登记一致；大小/数量受限。
+2. **分类**：
+   - 文本/代码/Markdown/JSON/CSV：读 ≤4k/个，作 `kind=attachment` 的 evidence，标 `truncated`；
+   - 图片：元数据 evidence +（可选）视觉 part；
+   - PDF/Office/其它二进制：只元数据 + `unreadable` / `manual_only` gap（known-issues #51）。
+3. **图片预处理**（目标 ≤1s；超时降级为元数据）：
+   - 解码前查像素上限（防解压炸弹），超限拒绝或降采样；
+   - 应用 EXIF orientation，剥离 EXIF/GPS，转 sRGB；
+   - 长边缩到 360–1024；最多 4 张、总计 ≤12MB；按附件顺序取前 4，其余进 `gaps`；
+   - 动图取首帧并标 `animated`；透明图转 JPEG 时合成白底，PNG 保留透明；
+   - SVG 按 XML 提取标题/`<text>`，必要时栅格化；禁止脚本与外部引用；
+   - HEIC/RAW/TIFF/BMP：有解码器则转 PNG，否则 `metadata_only`；
+   - PSD/Sketch/Figma/AI：只存；有内嵌预览则取预览，否则 `manual_only`；
+   - 相同 `sha256` 去重：一个 evidence，多个文件名；
+   - 损坏/空白/过小（<64px）：`unreadable` / `low_information`，不伪造描述。
+4. **视觉模型**：图片作为同一次 LLM 调用的 image part；每张图有 `image_label` 与 `evidence_id`；
+   模型引用图片必须用该 id。
+5. **非视觉模型**：不送 image part；`gaps` 记 `image_manual_reference`，UI 提示「请补文字说明」；
+   不静默忽略、不伪造。
+6. **失败不阻塞理解**：附件读不了只进 `gaps`；但若验收依赖该附件，派发前预检阻断。
+7. **安全**：不把 base64 写进上下文包/日志；不外部下载；不执行 SVG 脚本；v1 不做 OCR，
+   图片里的文字只由视觉模型读取。
+
+| 边界 | 处理 | 结果 |
+| --- | --- | --- |
+| 超大图（>40MP / >20000px） | 像素上限保护，拒绝或降采样 | `resized` / `rejected` |
+| 动图 GIF/WebP | 取首帧 | `animated: true` |
+| 透明 PNG | 保留透明；转 JPEG 时白底 | 正常读 |
+| EXIF 旋转 / GPS | 应用方向、剥离 GPS | 正常读，隐私保护 |
+| 损坏 / 截断 | 解码失败 | `unreadable`，进 `gaps` |
+| 扩展名与内容不符 | MIME 嗅探 | 按真实类型处理或拒绝 |
+| 符号链接 / 路径穿越 | 真实路径校验 | 拒绝 |
+| 重复图片 | sha256 去重 | 一个 evidence，多文件名 |
+| 超过 4 张 | 取前 4，其余元数据 | 其余进 `gaps` |
+| 单文件 >20MB / 任务 >50MB | 预检拒绝 | `attachment_too_large` |
+| SVG 外部引用/脚本 | 禁止加载与执行 | 只取本地文本 |
+| 加密 PDF | 无法预览/抽取 | `unreadable` |
+| 截图里的文字（非视觉模型） | 不 OCR | `image_manual_reference` |
 
 ### 5.3 第 3 步：对齐
 
@@ -490,6 +549,8 @@ T2 会话列表测试         依赖 T1   写域 test/                          
 - 图片内联沿用项目既有约束（长边 360–1024、单请求体上限），超限走引用而不是硬塞。
 - **首版允许「只存不读」**：PDF/Office/其它二进制与非视觉模型下的图片只落盘与预览，
   不抽取正文、不伪造描述；该取舍登记为 known-issues #51，抽取能力后续单独立项。
+- **理解阶段同矩阵**：文本附件进上下文包；图片仅在视觉模型下作为同一次 LLM 的 image part；
+  读不了只进 `gaps`，不阻塞理解（验收依赖时派发前阻断）。边界见 §5.2.9。
 
 #### 6.0.4 存储与上传流程
 
@@ -896,9 +957,10 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 | PS-11 | 前置就绪门 | 文档归一化与索引未完成时，开始理解/新建任务/派发/启动全部被拒（`409 line_not_ready`）；页面显示缺项与进度；完成后自动恢复 |
 | PS-12 | 归一化写入安全 | 先出 diff 再应用；`rewrite` 需 allowlist + 二次确认；写前备份、失败回滚；重复执行 0 写盘；归一化期间任务全禁 |
 | PS-13 | 文档维护边界 | 代码任务默认不改项目文档；需要时计划单独列文档任务，写域只含文档且串行；work-log/project-status/known-issues 不被自动改 |
+| PS-14 | 附件进入理解 | 文本附件可被引用；图片在视觉模型下随同一次 LLM 读取，非视觉模型明确提示人工参考；超大/动图/透明/损坏/重复/超量均按 §5.2.9 处理，不伪造 |
 
 > 与 [production-line-completion-recon.md](production-line-completion-recon.md) §9 的
-> TC-PL-C01~C23 一一对应；产品场景用于手工验收，TC 用于自动化。
+> TC-PL-C01~C24 一一对应；产品场景用于手工验收，TC 用于自动化。
 
 ---
 
@@ -913,7 +975,7 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 | 归一化预检写入（diff/确认/备份/回滚） | PC-2C + PC-5C |
 | 项目文档维护边界（只读/文档任务） | PC-3C |
 | 任务看板 / 右侧详情页 / 批量派发 | PC-3 + PC-6 |
-| 任务内容 / 附件 / 引用 / 编辑预检 | PC-3 + PC-3A（图像视觉 PC-3B） |
+| 任务内容 / 附件 / 引用 / 编辑预检 | PC-3 + PC-3A（图像视觉 PC-3B；理解边界 PC-3D） |
 | 记忆注入 / 结果回写 / 台账 hash | PC-9 |
 | 今日实时刷新 / 断线恢复 | PC-4 |
 | 工具（台账/产物/整理/去重）与配置页 | PC-7 |
@@ -943,3 +1005,4 @@ T2 会话列表按项目过滤                      [恢复] [重试] [取消]
 | PF-16 | 前置阻塞项 | **文档归一化 + 索引构建完成前不得开任何任务**；后端 `409 line_not_ready`，无 force/跳过 |
 | PF-17 | 归一化写入策略 | 先 diff 预览再应用；只追加、不新建；`rewrite` 需 allowlist + 二次确认；写前备份/失败回滚；不自动 commit |
 | PF-18 | 文档维护策略 | 项目文档默认只读；需要时计划单独列文档任务（写域只含文档、串行）；不自动改 work-log/project-status/known-issues |
+| PF-19 | 附件理解边界 | 附件不进项目图谱，作为显式 evidence；图片仅在视觉模型下随同一次 LLM 读取；超大/动图/透明/损坏/重复/超量按 §5.2.9，不伪造、不用 base64 入包 |
