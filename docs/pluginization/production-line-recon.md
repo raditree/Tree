@@ -735,6 +735,7 @@ dedup_max_index_chunks`；优先级 `settings > TREE_PL_DEDUP_* > 默认`。改�
 - Embedding 只做逻辑相似预筛，不承诺字节完全相同；`exact=true` 由 chunk 哈希二次确认；
 - 未跟踪文件不参与（需先 `git add`）；
 - 全局索引暴力比对，`dedup_max_index_chunks` 超限会截断并在 `reasons` 里说明；
+- compare 仍是暴力点积，但做了三层优化：索引按 `repoKey|runId` 常驻内存（一个 run 的后续批次不再翻 storage / 解析 JSON）；向量入索引时归一化为 Float32、只做点积，内容哈希相同直接记 1.0；top-k 用长度 ≤ k 的有序表增量维护，每 10 个源块让出事件循环。新增向量会让快照失效并在下一轮重建。
 - 状态文件在插件数据 `<line>/dedup_state.json`（含 10 分钟陈旧锁），缓存与结果在 storage。
 
 ### 8.8 整理报告落盘与增量重扫
