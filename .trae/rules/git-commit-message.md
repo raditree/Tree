@@ -4,4 +4,4 @@ scene: git_message
 ---
 
 type(scope):overview
-- details
+details
