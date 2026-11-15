@@ -469,10 +469,17 @@ class Launcher {
     }
   }
 
-  /// 品牌落地：只更新启动器旁的 `Tree.lnk` 的 `IconLocation`。
+  /// 品牌落地：更新**所有指向本启动器的快捷方式**的 `IconLocation`。
+  ///
+  /// 安装器建的桌面 / 开始菜单快捷方式直接指向 `Tree.exe`，并不是启动器旁的
+  /// `Tree.lnk`；只改「同目录那个」会漏掉它们（桌面图标始终回落到 exe 的通用
+  /// 图标）。这里按**目标路径**匹配：凡是已存在、且目标为本 exe 的快捷方式都
+  /// 更新；不新建桌面 / 开始菜单入口（尊重安装器的 Tasks 选项）。
   ///
   /// - **绝不改写任何 exe 的 PE 资源**（图标是 Windows 快捷方式的属性）；
-  /// - 图标缺失 / 非 `.ico` ⇒ 把 `IconLocation` 清空，回默认图标；
+  /// - 图标缺失 / 非 `.ico` ⇒ `IconLocation` 指回 exe 自身，等同默认图标
+  ///   （`IconLocation = ''` 会被 WScript.Shell 拒绝）；
+  /// - 启动器同目录的 `Tree.lnk` 保持旧行为：没有就补一个；
   /// - 非 Windows 平台直接跳过。
   Future<void> _applyShortcutBranding() async {
     if (!Platform.isWindows) return;
@@ -492,14 +499,40 @@ class Launcher {
       File(launcherPath).parent.path,
       'Tree.lnk',
     );
-    final String iconLocation = icon == null ? '' : '$icon,0';
+    final String iconLocation = icon == null ? '$launcherPath,0' : '$icon,0';
     String q(String s) => s.replaceAll("'", "''");
-    final String script =
-        r'$ws = New-Object -ComObject WScript.Shell; '
-        "\$s = \$ws.CreateShortcut('${q(shortcut)}'); "
-        "\$s.TargetPath = '${q(launcherPath)}'; "
-        "\$s.IconLocation = '${q(iconLocation)}'; "
-        r'$s.Save()';
+    // 桌面（含 OneDrive 重定向与公共桌面）和开始菜单里，目标等于本 exe 的 .lnk
+    // 都写一遍；`updated` 只统计这一批（同目录 Tree.lnk 单独处理）。
+    final String script = <String>[
+      r'$ws = New-Object -ComObject WScript.Shell;',
+      "\$target = '${q(launcherPath)}';",
+      "\$icon = '${q(iconLocation)}';",
+      "\$adjacent = '${q(shortcut)}';",
+      r'$dirs = @(',
+      r"  [Environment]::GetFolderPath('Desktop'),",
+      r"  [Environment]::GetFolderPath('CommonDesktopDirectory'),",
+      r"  [Environment]::GetFolderPath('Programs'),",
+      r"  [Environment]::GetFolderPath('CommonPrograms')",
+      r') | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique;',
+      r'$updated = 0;',
+      r'foreach ($dir in $dirs) {',
+      r'  foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.lnk -Recurse -ErrorAction SilentlyContinue)) {',
+      r'    try {',
+      r'      $s = $ws.CreateShortcut($f.FullName);',
+      r'      if ($s.TargetPath -and ($s.TargetPath -ieq $target)) {',
+      r'        $s.IconLocation = $icon;',
+      r'        $s.Save();',
+      r'        $updated++;',
+      r'      }',
+      r'    } catch {}',
+      r'  }',
+      r'}',
+      r'$s = $ws.CreateShortcut($adjacent);',
+      r'$s.TargetPath = $target;',
+      r'$s.IconLocation = $icon;',
+      r'$s.Save();',
+      r'Write-Output "updated=$updated";',
+    ].join('\n');
     try {
       final ProcessResult result = await Process.run('powershell', <String>[
         '-NoProfile',
@@ -508,8 +541,18 @@ class Launcher {
         script,
       ]);
       if (result.exitCode == 0) {
+        final int updated =
+            int.tryParse(
+              RegExp(
+                    r'updated=(\d+)',
+                  ).firstMatch('${result.stdout}')?.group(1) ??
+                  '',
+            ) ??
+            0;
         stdout.writeln(
-          icon == null ? '  快捷方式图标已回默认。' : '  已应用品牌图标：$icon',
+          icon == null
+              ? '  快捷方式图标已回默认（外部快捷方式 $updated 个）。'
+              : '  已应用品牌图标：$icon（外部快捷方式 $updated 个）',
         );
       } else {
         stderr.writeln(
