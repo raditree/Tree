@@ -385,10 +385,23 @@ class CoreServer {
     hub.onStale = (String connectionId, LivenessTracker beat) {
       final String text = server._livenessLogText(beat);
       server.errorLog?.call('WS 连接 $connectionId $text');
+      // **判死即摘订阅**：只关 socket 不够——半开连接上 `onDone` 可能迟迟不来，
+      // 这段时间里该连接的站点订阅仍是活的（发布照常入队、`delivered` 照常涨），
+      // 表现就是"界面上收不到帧，可核心说自己已经投递了"。这里同步清一次，
+      // `onConnectionClosed` 是幂等的，`onDone` 再来一次也不会重复摘。
+      for (final WsConnection connection in hub.connections()) {
+        if (connection.id != connectionId) continue;
+        server._stationWsBridge?.onConnectionClosed(connection);
+        break;
+      }
     };
     hub.onLinkStale = (LivenessTracker beat) {
       final String text = server._livenessLogText(beat);
       server.errorLog?.call('WS 链路 $text');
+    };
+    // 写失败必须可见：它会把连接打成"半死"（socket 还在、帧全进补发队列）。
+    WsConnection.onWriteFailure = (String id, Object error) {
+      server.errorLog?.call('WS 连接 $id 写失败，已关闭并交给重连：$error');
     };
     // 平台执行站（plugin.* / station.*）+ UI 插件 WS 站点总线接线。
     server._stationPendingTtl = stationPendingTtl;

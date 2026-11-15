@@ -65,6 +65,14 @@ class LivenessWsConnection extends WsConnection {
   @override
   void send(Map<String, dynamic> frame) {
     if (!isOpen || liveness.isStale) {
+      if (framesQueuedForResend < 3) {
+        // 这条日志是"帧明明投递了、界面却收不到"的关键分界：
+        // open=false ⇒ socket 已断；stale=true ⇒ 心跳判死，帧在排队等恢复。
+        stderr.writeln(
+          '[ws-send] ${frame['type']} 转补发队列：open=$isOpen '
+          'stale=${liveness.isStale} queued=$framesQueuedForResend',
+        );
+      }
       _enqueue(frame);
       return;
     }

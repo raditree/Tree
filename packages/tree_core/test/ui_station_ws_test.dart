@@ -270,6 +270,56 @@ plugins:
       expect((data['scope'] as Map<String, dynamic>)['team_id'], 'team-1');
     });
 
+    test('同一条连接订阅多个广播站：每个站都能收到投递（槽位键必须带站点 id）', () async {
+      final _WsClient ws = await _connect(server);
+      sockets.add(ws);
+      ws.send(_hello('ui.alpha'));
+      // UI 启动就同时订多个广播站；订阅键位里**不含站点 id**，所以桥内部若拿它
+      // 当连接内的槽位键，后一条订阅会把前一条 dispose 掉——表现为「只有最后订的
+      // 那个站能收到帧，其余站的 delivered 照常涨、界面一帧都没有」。
+      for (final String stationId in <String>[
+        'system.broadcast',
+        'system.broadcast.turn.done',
+      ]) {
+        ws.send(<String, dynamic>{
+          'type': WsInboundType.stationSubscribe,
+          'data': <String, dynamic>{'station_id': stationId, 'scope': <String, dynamic>{}},
+        });
+      }
+      await awaitSubscribed(ws, 'system.broadcast');
+      await awaitSubscribed(ws, 'system.broadcast.turn.done');
+
+      final StationScope scope = StationScope.parse(<String, dynamic>{
+        'team_id': 'team-1',
+        'mode_key': 'local',
+      });
+      for (final String stationId in <String>[
+        'system.broadcast',
+        'system.broadcast.turn.done',
+      ]) {
+        final BroadcastStation station =
+            bus.stations.pointFor(stationId)! as BroadcastStation;
+        await station.publish(
+          topic: 'ping',
+          scope: scope,
+          payload: <String, dynamic>{'station': stationId},
+          sourcePluginId: 'headless.one',
+        );
+      }
+      for (final String stationId in <String>[
+        'system.broadcast',
+        'system.broadcast.turn.done',
+      ]) {
+        await ws.until(
+          (Map<String, dynamic> f) =>
+              f['type'] == WsOutboundType.stationDelivery &&
+              f['state'] == StationDeliveryState.data.wire &&
+              f['station_id'] == stationId,
+          reason: '$stationId 的 data 帧',
+        );
+      }
+    });
+
     test('协议 1.1：身份前到达的订阅 / 注册被挂起，hello 后按序补放并回执', () async {
       final _WsClient ws = await _connect(server);
       sockets.add(ws);

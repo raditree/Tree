@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:tree_protocol/tree_protocol.dart' as protocol;
 
@@ -254,7 +255,15 @@ class WsConnectionOutbox {
     required int seq,
     required bool isData,
   }) {
-    if (_disposed || _closedChannels.contains(owner)) return;
+    if (_disposed || _closedChannels.contains(owner)) {
+      // 静默丢弃是"核心说已投递、界面永远收不到"最隐蔽的一种成因，必须留痕。
+      stderr.writeln(
+        '[station-outbox] 入队被丢弃：disposed=$_disposed '
+        'closed=${_closedChannels.contains(owner)} station=${owner.stationId} '
+        'seq=$seq',
+      );
+      return;
+    }
     if (_pending.length >= capacity) {
       _overflow(current: owner, currentSeq: seq, currentIsData: isData);
     }
@@ -343,8 +352,9 @@ class WsConnectionOutbox {
   void _write(Map<String, dynamic> frame) {
     try {
       sink(frame);
-    } catch (_) {
-      // 连接已断：后续帧没有接收方，吞掉异常即可（清理路径会 removeChannel）。
+    } catch (error) {
+      // 连接已断：后续帧没有接收方；但吞掉异常就等于静默丢帧，必须留痕。
+      stderr.writeln('[station-outbox] 投递写失败（已吞）：$error');
     }
   }
 }

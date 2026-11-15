@@ -542,7 +542,13 @@ class StationWsBridge {
       );
       return;
     }
-    final WsStationSubscriberChannel? old = state.channels[key];
+    // 槽位键**必须带站点 id**：`subscriber.key` 只含「插件|scope|连接」，不含站点。
+    // 用它当连接内的槽位键时，同一条连接订阅多个广播站会撞成同一个槽位——后一条
+    // 订阅把前一条 dispose 掉，于是**只有最后订阅的那个站还能投递**，其余各站的
+    // 投递全部落进已关闭的通道（`deliver` 照样回 ok、`delivered` 照常涨，界面却
+    // 一帧都收不到）。UI 一启动就订三个站，正好每次都踩中。
+    final String slot = _slotKey(station.id, key);
+    final WsStationSubscriberChannel? old = state.channels[slot];
     if (old != null) {
       old.dispose();
       _forgetChannel(old);
@@ -575,7 +581,7 @@ class StationWsBridge {
       );
       return;
     }
-    state.channels[key] = channel;
+    state.channels[slot] = channel;
     _channelsByStation.putIfAbsent(
       station.id,
       () => <WsStationSubscriberChannel>{},
@@ -633,7 +639,7 @@ class StationWsBridge {
       stations.station(stationId)?.unsubscribeKey(channel.subscriberKey);
       channel.dispose();
       _forgetChannel(channel);
-      state.channels.remove(channel.subscriberKey);
+      state.channels.remove(_slotKey(channel.stationId, channel.subscriberKey));
     }
     // 退订是幂等的：没有该站的通道也算成功（客户端据此停掉重试）。
     _sendAck(
@@ -1025,6 +1031,13 @@ class StationWsBridge {
     return best;
   }
 
+  /// 连接内的订阅槽位键（站点 id + 订阅键位）。
+  ///
+  /// 加站点 id 是必需项，理由见 `_handleSubscribe` 里的注释；同站同 scope 的重复
+  /// 订阅仍然落到同一个槽位（幂等替换），跨站不会互相挤掉。
+  static String _slotKey(String stationId, String subscriberKey) =>
+      '$stationId|$subscriberKey';
+
   void _forgetChannel(WsStationSubscriberChannel channel) {
     final Set<WsStationSubscriberChannel>? set = _channelsByStation[
       channel.stationId
@@ -1038,7 +1051,7 @@ class StationWsBridge {
   void _detach(WsStationSubscriberChannel channel) {
     _forgetChannel(channel);
     final _UiConnectionState? state = _connections[channel.channelId];
-    state?.channels.remove(channel.subscriberKey);
+    state?.channels.remove(_slotKey(channel.stationId, channel.subscriberKey));
   }
 
   void _sendError(
@@ -1181,6 +1194,7 @@ class _UiConnectionState {
   /// TTL 到期仍未 hello：之后的站点请求 fail-fast（不再排队）。
   bool identityExpired = false;
 
+  /// 本站连接上的订阅通道：键 = `站点 id | 订阅键位`（见 [_slotKey]）。
   final Map<String, WsStationSubscriberChannel> channels =
       <String, WsStationSubscriberChannel>{};
 }

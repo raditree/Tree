@@ -32,6 +32,9 @@ class WsConnection {
 
   bool _open = true;
 
+  /// 写失败回调（由核心接到错误日志；null = 不记）。
+  static void Function(String connectionId, Object error)? onWriteFailure;
+
   /// 已发送的业务帧数（不含分片帧）。
   int framesSent = 0;
 
@@ -53,7 +56,12 @@ class WsConnection {
   /// 分帧后接收侧（前端 `WebSocketService._maybeReassemble`）重组为原始
   /// JSON 文本再走业务分发，因此**业务语义与单帧发送完全等价**。
   void send(Map<String, dynamic> frame) {
-    if (!_open) return;
+    if (!_open) {
+      if (framesSent < 3) {
+        stderr.writeln('[ws-send] ${frame['type']} 被丢弃：连接已关（open=false）');
+      }
+      return;
+    }
     final String raw = jsonEncode(frame);
     final List<int> bytes = utf8.encode(raw);
     framesSent++;
@@ -71,8 +79,15 @@ class WsConnection {
     try {
       socket.add(raw);
     } catch (_) {
-      // 对端已断开：静默标记，交由清理路径注销
+      // 写失败 = 这条连接已经不可用：**必须真的把它关掉**。
+      //
+      // 只翻 `_open` 的后果很隐蔽：`LivenessWsConnection.send` 之后会把每一帧
+      // 转进待补发队列，而 socket 在 OS 层仍是 Established —— UI 既不重连，
+      // 也收不到任何帧，核心这边却照常记账"已投递"。表现就是"帧一直在发，
+      // 界面只有快照同步"。关掉之后 `onDone` 会走注销 → 订阅清理 → 前端重连补发。
       _open = false;
+      onWriteFailure?.call(id, 'socket.add failed');
+      unawaited(close(1011, 'write failed'));
     }
   }
 

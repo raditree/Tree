@@ -65,6 +65,9 @@ class Launcher {
 
   static const Duration _uiWatchInterval = Duration(seconds: 3);
 
+  /// 核心 stderr 落盘的单份上限（超过就轮转成 `core.stderr.log.1`，只留上一轮）。
+  static const int _coreStderrMaxBytes = 8 * 1024 * 1024;
+
   Future<int> run() async {
     try {
       _core = await _connect();
@@ -149,7 +152,10 @@ class Launcher {
         .transform(const LineSplitter())
         .listen((String line) {
           if (line.trim().isEmpty) return;
-          stderr.writeln('[core:err] $line');
+          final String tagged = '[core:err] $line';
+          stderr.writeln(tagged);
+          // 发布版没有控制台：只写 stderr 等于把核心的诊断丢掉。
+          _appendCoreStderr(tagged);
         });
     process.exitCode.then((int code) {
       if (_process != null) {
@@ -218,6 +224,38 @@ class Launcher {
     return home.isEmpty
         ? _join(Directory.systemTemp.path, 'tree')
         : _join(_join(home, '.local'), 'share/tree');
+  }
+
+  /// 核心 stderr 的落盘副本路径：`<数据根>/logs/core.stderr.log`。
+  ///
+  /// 为什么需要：核心里的 `stderr.writeln` 诊断**不走** `CoreLogSink`（那条出口只覆盖
+  /// 显式传了 log 回调的地方）。由启动器拉起时，核心 stderr 只被转写到启动器自己的
+  /// stderr——发布版没有控制台，等于当场丢掉。「帧一直在发、界面却收不到」这类静默
+  /// 故障，就是因为这些诊断看不见才会查很久。
+  File? _coreStderrFile() {
+    try {
+      final Directory dir = Directory(_join(_dataRootGuess(), 'logs'));
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      return File(_join(dir.path, 'core.stderr.log'));
+    } catch (_) {
+      return null; // 日志落盘失败绝不能影响启动
+    }
+  }
+
+  /// 追加一行核心 stderr；超过 [_coreStderrMaxBytes] 先轮转一份（只留上一轮）。
+  void _appendCoreStderr(String line) {
+    try {
+      final File? file = _coreStderrFile();
+      if (file == null) return;
+      if (file.existsSync() && file.lengthSync() > _coreStderrMaxBytes) {
+        final File rotated = File('${file.path}.1');
+        if (rotated.existsSync()) rotated.deleteSync();
+        file.renameSync(rotated.path);
+      }
+      file.writeAsStringSync('$line\n', mode: FileMode.append);
+    } catch (_) {
+      // 同上：诊断通道坏了也不许连累主流程
+    }
   }
 
   /// 读核心的实例发现文件并探测它是否真的活着。
