@@ -105,6 +105,28 @@ abstract final class ExecStationErrorCodes {
   /// 插件存储命令失败：按 `error` 处理，**不重试**。
   static const String storageError = 'storage_error';
 
+  /// 记忆通道不可用（`tree.agent` 记忆服务 / 产线记忆端口）：降级为空记忆并记台账，
+  /// 任务继续，**不重试**。
+  static const String memoryUnavailable = 'memory_unavailable';
+
+  /// 存储通道不可用（`tree.docnorm` / 产线去重）：写任何目标文件前 fail-closed；
+  /// 修好存储后可按原命令重试。
+  static const String storageUnavailable = 'storage_unavailable';
+
+  /// 计划修正补丁删掉了已确认内容（产线计划轮次）：带 findings 重跑修正，
+  /// **不重试**同一补丁。
+  static const String planPatchRewrote = 'plan_patch_rewrote';
+
+  /// 换模型黄金任务回归失败（产线 SG-05）：门控形状/结论不一致；**不重试**，
+  /// 回滚模型并看报告。
+  static const String modelSwapRegression = 'model_swap_regression';
+
+  /// 恢复耗时超出 SLO（产线 SG-06）：**不重试**，查 blocked/retry 指标与恢复现场。
+  static const String recoverySloMissed = 'recovery_slo_missed';
+
+  /// 批次写域越界（产线 BG-01）：停下一批并看 diff；**不重试**。
+  static const String driftScope = 'drift_scope';
+
   // ── 兜底 ────────────────────────────────────────────────────────────
   /// 任何没给码的失败：只能当"可读原因、不可编程分支"处理。
   static const String unknown = 'unknown';
@@ -138,6 +160,12 @@ abstract final class ExecStationErrorCodes {
     productionError,
     settingsError,
     storageError,
+    memoryUnavailable,
+    storageUnavailable,
+    planPatchRewrote,
+    modelSwapRegression,
+    recoverySloMissed,
+    driftScope,
     unknown,
   };
 

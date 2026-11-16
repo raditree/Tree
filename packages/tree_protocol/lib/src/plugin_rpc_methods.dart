@@ -233,5 +233,8 @@ const Map<String, String> nonProtocolPluginMethodLiterals = <String, String>{
   // 实参只是日志/诊断用的提示点名字（实际下行是 `llm.call` 执行站命令，且这个
   // 标签并不随请求发出），不是插件↔核心 JSON-RPC method。
   'production.recon': 'LLM 提示点标签（production.line 内部），非 JSON-RPC method',
-  'production.scope': '同上',
+  'production.digest': 'LLM 提示点标签（production.line 内部），非 JSON-RPC method',
+  'production.plan': 'LLM 提示点标签（production.line 内部），非 JSON-RPC method',
+  'production.plan.critic': 'LLM 提示点标签（production.line 内部），非 JSON-RPC method',
+  'production.plan.fix': 'LLM 提示点标签（production.line 内部），非 JSON-RPC method',
 };

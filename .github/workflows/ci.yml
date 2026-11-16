@@ -71,6 +71,11 @@ jobs:
         with:
           sdk: ${{ env.DART_SDK }}
       - run: dart pub get
+      # 跨仓用例要跑插件仓里的**真源码入口**（self_updater）：入口按文件往上找
+      # package_config.json 解析依赖，没跑过插件的 pub get 会在 setUp 里显式红。
+      - name: 插件包 pub get（跨仓真机用例的前置）
+        working-directory: plugins/self_updater
+        run: dart pub get
       - run: dart analyze
       - run: dart test
 

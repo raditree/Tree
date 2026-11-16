@@ -306,6 +306,12 @@ plugins/files/lib/src/remote_files.dart:118                 if (!'$error'.contai
 | 插件 | `unknown_command` | 12 | **插件内部**命令分发不认识：看 `error` 的命令表，不重试（与核心层 `command_unknown` 分属两层） |
 | 插件 | `production_error` | 12 | `tree.production.line` 业务状态/前置不满足：按 `error` 处理，不重试 |
 | 插件 | `settings_error` / `storage_error` | 12 | 插件设置 / 存储命令失败：按 `error` 处理，不重试 |
+| 插件 | `memory_unavailable` | 12 | `tree.agent` / 产线记忆通道不可用：降级为空记忆并记台账，任务继续，不重试 |
+| 插件 | `storage_unavailable` | 12 | `tree.docnorm` / 产线去重的存储通道不可用：写盘前 fail-closed；修好存储后按原命令重试 |
+| 插件 | `plan_patch_rewrote` | 12 | 产线计划修正补丁删掉已确认内容：带 findings 重跑修正，不重试同一补丁 |
+| 插件 | `model_swap_regression` | 12 | 产线 SG-05 换模型黄金任务回归失败：不重试，回滚模型并看报告 |
+| 插件 | `recovery_slo_missed` | 12 | 产线 SG-06 恢复耗时超 SLO：不重试，查 blocked/retry 指标与恢复现场 |
+| 插件 | `drift_scope` | 12 | 产线 BG-01 批次写域越界：停下一批并看 diff，不重试 |
 | 兜底 | `unknown` | 任何没给码的失败 | 只能当"可读原因、不可编程分支"处理 |
 
 > 命名规则：`<对象>_<状态>`，不带族前缀（`file_` / `ssh_` 不带）。

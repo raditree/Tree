@@ -176,6 +176,8 @@ void main() {
       '$uiRel/io/websocket_service.dart': '大帧分片 frame_chunk 的分片序号（传输层）',
       '$uiRel/io/protocol_contract.dart':
           'UI 自持契约：WsStreamSeq.field 的 `seq` 字面量在这里定义（零依赖 D2）',
+      '$uiRel/ui/widgets/production_line_workbench.dart':
+          '产线事件增量自己的单调序号（产线协议域，非流式帧）',
       'packages/tree_core/lib/src/ws/ws_hub.dart':
           '大帧分片 frame_chunk 的分片序号（传输层）',
       'packages/tree_core/lib/src/ws/inbound_frames.dart': '核心侧重组成大帧时读分片序号',

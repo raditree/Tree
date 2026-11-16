@@ -71,6 +71,12 @@ void main() {
     'productionError': ExecStationErrorCodes.productionError,
     'settingsError': ExecStationErrorCodes.settingsError,
     'storageError': ExecStationErrorCodes.storageError,
+    'memoryUnavailable': ExecStationErrorCodes.memoryUnavailable,
+    'storageUnavailable': ExecStationErrorCodes.storageUnavailable,
+    'planPatchRewrote': ExecStationErrorCodes.planPatchRewrote,
+    'modelSwapRegression': ExecStationErrorCodes.modelSwapRegression,
+    'recoverySloMissed': ExecStationErrorCodes.recoverySloMissed,
+    'driftScope': ExecStationErrorCodes.driftScope,
     'unknown': ExecStationErrorCodes.unknown,
   };
 
