@@ -490,6 +490,11 @@ abstract final class Shell {
   /// 命令里它们很常见（见类文档）。同步执行与后台 hook 共用这一处包装，两边语义一致。
   ///
   /// 全部用 Dart 原始字符串写 PowerShell 片段：省掉一层 $ / \ 转义，读起来就是 PS 原文。
+  /// 退出码为什么不用 `exit`：`exit` 会**立刻终止** PowerShell，把还在格式化缓冲里的
+  /// 对象输出一起丢掉——实测 `pwd; exit 0` 的 stdout 是空的（`Get-Location` 的
+  /// PathInfo 只在管线收尾时格式化），而 `pwd` 恰恰是模型最常用来确认 cwd 的命令。
+  /// `$host.SetShouldExit(code)` 只设进程退出码、不打断管线，输出照常收尾；
+  /// pwsh 7 与 Windows PowerShell 5.1 上都实测生效（`-Command` 与 `-File` 两种模式）。
   static String _wrapPowerShell(String command) {
     // 顺序有意：先补裸 echo（在模型的原始命令上认命令位置最准），再翻译 && / ||
     final String translated = translateLogicalOperators(
@@ -500,7 +505,8 @@ abstract final class Shell {
         r"$PSDefaultParameterValues['Out-File:Encoding']='utf8'; "
         '$translated; '
         r'$__treeOk=$?; $__treeCode=$LASTEXITCODE; '
-        r'if ($__treeCode -is [int] -and $__treeCode -ne 0) { exit $__treeCode }; '
-        r'if ($__treeOk) { exit 0 } else { exit 1 }';
+        r'if ($__treeCode -is [int] -and $__treeCode -ne 0) { $host.SetShouldExit($__treeCode) } '
+        r'elseif ($__treeOk) { $host.SetShouldExit(0) } '
+        r'else { $host.SetShouldExit(1) }';
   }
 }

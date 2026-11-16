@@ -278,6 +278,15 @@ void main() {
       expect(outcome.stdout, contains('always'));
       expect(outcome.stdout, isNot(contains('no')));
     });
+
+    test('pwd：cmdlet 的对象输出不被退出码收尾丢掉', () async {
+      if (!_isPowerShellWindows) return;
+      // 回归：包装层以前用 `exit`，它会立刻终止 PowerShell，把还在格式化缓冲里的
+      // PathInfo（`Get-Location` 的输出）一起丢掉——`pwd` 于是"成功但没输出"。
+      final ExecOutcome outcome = await io.exec('pwd');
+      expect(outcome.exitCode, 0, reason: outcome.stderr);
+      expect(outcome.stdout, contains(root.path), reason: 'pwd 的输出不能是空的');
+    });
   });
   group('裸 echo 兼容翻译（cmd 语义：输出一个空行）', () {
     test('命令位置上的无参 echo 补成空串参数', () {
