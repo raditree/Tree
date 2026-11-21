@@ -309,7 +309,7 @@ Future<void> _warmUpPeripheralsAfterHandshake(
                 log: log,
               );
               if (seededBundled.isNotEmpty) {
-                log('已登记随包插件：${seededBundled.join('、')}');
+                log('已登记/升级随包插件：${seededBundled.join('、')}');
               }
             } catch (error) {
               // 登记失败不该拦住插件系统启动（最坏就是那几个插件要手开一次）。

@@ -413,13 +413,16 @@
     只能把 id 交下去；插件在自己的启动例程里应用它——界面多窗口因此归到同一个任务栏按钮。
     没读这个变量的老插件照旧工作（空操作）。
 
-34. **全量版随包插件自动登记（`seedBundledPlugins`）**（2026-11-21，
+34. **全量版随包插件自动登记 / 原地升级（`seedBundledPlugins`）**（2026-11-21，
     [bundled_plugins.dart](bundled_plugins.dart)、`tree_core_cli` 启动序列）：
     「全量版」安装包/便携包把全部插件成品与 `plugin-index.json` 放进 **exe 同级 `plugins/`**；
     核心启动时按**四条本机事实**登记条目并 `enabled: true`——索引存在、声明的每个
     `files[].target` 都在盘上且字节数一致、`runtime != ui`、`plugins.yaml` 里**没有**这一条。
-    已有条目（含用户关掉的）一律不覆盖；普通发行版没有这份索引 ⇒ 完全空操作。
-    界面（`runtime: ui`）仍由 `seedDesktopUiPlugin` 单独登记，两条路径不重叠。
+    已有 `source: bundled` 的条目按「索引版本或成品指纹变化」**原地升级**，只改核心生成
+    的字段，`enabled` 保留用户开关；`command / args / env / scope` 与上次登记的签名不一致
+    （用户手改过）⇒ 整条不动；`local / release` 来源一律不动。首次遇到没有指纹的存量
+    条目只记录基线、本次不升级（没有历史签名无法证明未手改）。界面（`runtime: ui`）仍由
+    `seedDesktopUiPlugin` 单独登记，两条路径不重叠。
 
 ## 测试
 

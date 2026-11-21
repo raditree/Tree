@@ -43,10 +43,12 @@ void main() {
     int bytes = 3,
     String runtime = 'headless',
     String command = '',
+    String version = '1.2.3',
+    String name = '',
   }) => <String, dynamic>{
     'id': id,
-    'name': '示例 $id',
-    'version': '1.2.3',
+    'name': name.isEmpty ? '示例 $id' : name,
+    'version': version,
     'runtime': runtime,
     'command': command.isEmpty ? target : command,
     'args': <String>[],
@@ -90,6 +92,122 @@ void main() {
       isEmpty,
     );
     expect(s.readEntry('demo')!['enabled'], isFalse);
+  });
+
+  test('比版本号变了 ⇒ 原地升级，保留用户的停用状态', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe');
+    writeIndex(dir, <Map<String, dynamic>>[entry()]);
+    final PluginConfigStore s = store();
+    seedBundledPlugins(store: s, executableDir: temp.path);
+    expect(s.setEnabled('demo', false).ok, isTrue);
+
+    writeIndex(dir, <Map<String, dynamic>>[entry(version: '2.0.0')]);
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      <String>['demo'],
+    );
+    final Map<String, dynamic> saved = s.readEntry('demo')!;
+    expect(saved['repo_version'], '2.0.0');
+    expect(saved['enabled'], isFalse, reason: '开关是用户状态，升级不覆盖');
+  });
+
+  test('版本号没变但成品字节变了 ⇒ 按指纹原地升级', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe', bytes: 3);
+    writeIndex(dir, <Map<String, dynamic>>[entry(bytes: 3)]);
+    final PluginConfigStore s = store();
+    seedBundledPlugins(store: s, executableDir: temp.path);
+
+    // 同样 3 字节、内容不同：只看长度会漏，指纹要能认出来。
+    File(p.join(dir, 'demo.exe')).writeAsStringSync('yyy');
+    writeIndex(
+      dir,
+      <Map<String, dynamic>>[entry(bytes: 3, name: '重建版')],
+    );
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      <String>['demo'],
+    );
+    expect(s.readEntry('demo')!['name'], '重建版');
+  });
+
+  test('用户手改过（command / args / env / scope）⇒ 不升级', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe');
+    writeIndex(dir, <Map<String, dynamic>>[entry()]);
+    final PluginConfigStore s = store();
+    seedBundledPlugins(store: s, executableDir: temp.path);
+
+    final String custom = p.join(temp.path, 'my-build.exe');
+    expect(s.update('demo', <String, dynamic>{'command': custom}).ok, isTrue);
+    writeIndex(dir, <Map<String, dynamic>>[entry(version: '9.9.9')]);
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      isEmpty,
+    );
+    final Map<String, dynamic> saved = s.readEntry('demo')!;
+    expect(saved['command'], custom);
+    expect(saved['repo_version'], '1.2.3');
+  });
+
+  test('存量条目先记基线，下次启动才参与升级', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe');
+    writeIndex(dir, <Map<String, dynamic>>[entry()]);
+    final PluginConfigStore s = store();
+    // 模拟本特性上线前登记的条目：有 source: bundled，但没有指纹/签名。
+    expect(
+      s.create(<String, dynamic>{
+        'id': 'demo',
+        'name': '旧名字',
+        'command': p.join(dir, 'demo.exe'),
+        'source': kBundledPluginSourceValue,
+        'repo_version': '1.2.3',
+      }).ok,
+      isTrue,
+    );
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      isEmpty,
+      reason: '第一次只记录基线，不覆盖存量条目',
+    );
+    expect(s.readEntry('demo')![kBundledDigestKey], isNotNull);
+    expect(s.readEntry('demo')![kBundledSnapshotKey], isNotNull);
+
+    File(p.join(dir, 'demo.exe')).writeAsStringSync('yyyy');
+    writeIndex(
+      dir,
+      <Map<String, dynamic>>[entry(bytes: 4, name: '新名字')],
+    );
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      <String>['demo'],
+    );
+    expect(s.readEntry('demo')!['name'], '新名字');
+  });
+
+  test('local / release 来源的条目不动（不是随包安装的）', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe');
+    writeIndex(dir, <Map<String, dynamic>>[entry(version: '9.9.9')]);
+    final PluginConfigStore s = store();
+    final String mine = p.join(temp.path, 'mine.exe');
+    expect(
+      s.create(<String, dynamic>{
+        'id': 'demo',
+        'command': mine,
+        'source': 'local',
+      }).ok,
+      isTrue,
+    );
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      isEmpty,
+    );
+    expect(s.readEntry('demo')!['command'], mine);
   });
 
   test('成品缺失 / 字节数不符 ⇒ 跳过并给出原因', () {
