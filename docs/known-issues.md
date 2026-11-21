@@ -3049,3 +3049,66 @@ Tree 的 agent shell 里 `gh` 之类仍然找不到；只有整套重启才可�
 
 在有模型池 / 密钥的环境执行一次 AG-11 / TC-PL-C15，留存截图与台账，然后把本条目降级为历史记录。
 
+---
+
+## #54 插件化后系统提示词的三个 provider 无生产接线（Spec 索引 / 已选全文 / 工作空间提示词文件）
+
+**状态**：**已确认、未修复**（2026-11-21，M4 收口时自查发现）。
+
+### 现象
+
+`tree.agent` 迁移到插件后，`workspace_prompt.dart` 里的三个全局 provider 在生产代码中**没有任何赋值点**：
+
+- `specIndexProvider`（Spec 索引）
+- `selectedSpecsProvider`（本会话已选 Spec 全文）
+- `systemPromptFileProvider`（工作空间 `.self/system_prompt.md` 基础段）
+
+因此实际发给模型的系统提示词里大概率缺这三段；压缩估算走同一个
+`systemPromptWithWorkspace`，也按同样的缺段口径计算。
+
+### 根因
+
+接线原先在核心 `server/core_server.dart`（见 `docs/known-issues.md` #28/#1 与
+`agent-memory-recon.md` 的 MEM-R4 备注），迁移到插件仓时只搬了领域库与
+`ConversationService.promptStatePrewarm` 钩子，**没有在 `AgentRuntime` 构造器里
+重新赋值这三个 provider**，也没有把 Spec 预热 / 提示词文件预热接进
+`promptStatePrewarm`。
+
+### 证据
+
+- `plugins/tree.agent/lib/src/agent/workspace_prompt.dart`：三个 provider 的声明与注释仍在，
+  注释明确要求"接线只要一行"。
+- 全仓检索 `specIndexProvider =` / `selectedSpecsProvider =` / `systemPromptFileProvider =`：
+  命中仅出现在 `test/workspace_prompt_test.dart` 与 `test/spec_service_test.dart`，
+  生产文件（`runtime/agent_runtime.dart`、`tree.agent_plugin.dart`）为零。
+- `AgentRuntime` 构造器里目前只接了 `memorySectionProvider`（M4，`55d2c19`）；
+  `promptStatePrewarm` 也只 `await refreshMemorySection(...)`。
+- `SpecService` 本身已提供同步快照（`indexSnapshot` / `selectedSpecsSnapshot`）与
+  `ensureSnapshots`；`SystemPromptStore.refresh` 与 `_cache` 也在，缺的只是接线。
+
+### 影响
+
+- Spec 体系在插件化版本中退化：模型看不到索引，"已选 Spec 全文"也不会持续注入，
+  与 #1 当初修复的目标相悖（`spec select` 只剩当轮工具结果）。
+- 用户在工作空间 `.self/system_prompt.md` 里写的基础段不生效。
+- M4 的记忆段不受影响：它走独立的 `memorySectionProvider`，已在构造器接线并有
+  `memory_prompt_pin_test` 钉子；但同一函数里的其他三段仍缺。
+
+### 修复方向
+
+1. 在 `AgentRuntime` 构造器补三处 provider：
+   `specIndexProvider = (agent) => specService.indexSnapshot(agent.id)`；
+   `selectedSpecsProvider = (agent, sessionId) => specService.selectedSpecsSnapshot(agent.id, sessionId)`；
+   `systemPromptFileProvider` 需要一个按 agent 缓存的 `SystemPromptStore` 实例。
+2. `conversation.promptStatePrewarm` 里先 `await specService.ensureSnapshots(agentId, sessionId)`
+   与 `SystemPromptStore.refresh(agentId)`，再刷新记忆段——否则首次拼装会拿到冷串并永久钉住
+   （#28 的真机事故形态）。
+3. 接线后首次重建会改变 `[0] system` 字节（预期一次性代价）；已钉住会话继续逐字复用，
+   需要新内容时开新会话或压缩一次。
+4. 补回归：两处拼装同字节 + 冷启动预热后索引 / 全文 / 基础段都非空。
+
+### 后续
+
+与 M5（agent 配置页「系统提示词」tab）同批处理，或在 M5 前单独提交一个接线修复；
+修复前不要宣称插件化版本的 Spec 索引已生效。
+
