@@ -19,6 +19,14 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **`read` 给二进制留出「看得见内容」的两条路**（**修改** `plugins/tree.agent/README.md`
+  的工具口径，`ToolOutcome.images` 为新增通道）：
+  - 按字节取：`read` 带 `offset` / `length` 时走执行站的 `raw` 通道，回
+    `（二进制分块）… offset / 本块字节 / 文件总字节 / eof` + base64 正文（缺省 64 KiB 一块，自己递进）；
+  - 图像给模型看：按**魔数**认出 PNG / JPEG / GIF / WebP 时正文报格式与宽高
+    （`lib/src/tool/image_digest.dart` 零依赖解头部），路径进 `ToolOutcome.images`，引擎在
+    整批工具结果之后追加一条带图像块的 user 消息（与用户附件同一条视觉链路）；送不进去
+    （视觉没开 / 端点不支持 / 超内联上限）必须附一句说明，**不许让模型以为看见了**。
 - **`read` 工具不再把「没有文本」说成「（空文件）」**（**修改**
   `plugins/tree.agent/README.md` 的 `read` 提示口径、`plugins/local_executor/README.md` 与
   `plugins/ssh_executor/README.md` 的 `file.read` 返回）：
