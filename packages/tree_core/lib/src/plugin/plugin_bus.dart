@@ -42,18 +42,16 @@ typedef RuntimeStationScopeResolver = StationScope Function(
   StationScopeContext context,
 );
 
-
 /// UI 宿主工厂（测试注入假宿主；生产走 [UiHost.start]）。
 ///
 /// [windowId] 为空 = 老口径（单窗口）。同一 UI 插件的多窗口各自一份进程，
 /// 靠它区分身份（窗口级状态键 / `ui.hello.window_id`）。
-typedef UiHostFactory =
-    Future<UiHost> Function(
-      PluginConfig config, {
-      required String coreUrl,
-      required String coreToken,
-      String windowId,
-    });
+typedef UiHostFactory = Future<UiHost> Function(
+  PluginConfig config, {
+  required String coreUrl,
+  required String coreToken,
+  String windowId,
+});
 
 /// 插件总线（M6b + M9 Wave 3-F）：配置、实例生命周期、事件分发、工具聚合、
 /// **站点体系**与**心跳判活**。
@@ -369,6 +367,7 @@ class PluginBus {
   /// 为什么不能拿 `_configs` 里的那一份比：对账会重读磁盘并**整体覆盖** `_configs`，
   /// 旧配置当场就没了；而"这个进程当时是按什么参数起来的"才是"要不要重启"的判据。
   final Map<String, PluginConfig> _spawnedConfigs = <String, PluginConfig>{};
+
   /// 每世代已发过「插件下线」通知的插件（`closed` 只发一次；见 `_setLifecycle`）。
   final Set<String> _offlineNotified = <String>{};
 
@@ -891,7 +890,8 @@ class PluginBus {
     PluginConfig config, {
     String resumeDumpId = '',
   }) async {
-    if (_hosts.containsKey(config.id) || _uiHosts.containsKey(config.id)) return;
+    if (_hosts.containsKey(config.id) || _uiHosts.containsKey(config.id))
+      return;
     // **代际在拉起之前**就定下来：快照的索引键靠它，而「这一世是谁」必须在进程还
     // 没起来时就确定（否则转储与取回会各自猜一个号，两边对不上）。
     final int generation = (_generations[config.id] ?? 0) + 1;
@@ -1016,9 +1016,7 @@ class PluginBus {
     if (!config.enabled) throw PluginException('插件 $id 未启用');
     final Map<String, dynamic>? blocked = apiBlock(config);
     if (blocked != null) {
-      throw PluginException(
-        (blocked['error'] ?? '核心 API 版本不满足').toString(),
-      );
+      throw PluginException((blocked['error'] ?? '核心 API 版本不满足').toString());
     }
     final PluginDependencyReport dependency = checkDependencies(config);
     if (!dependency.ok) {
@@ -1078,9 +1076,7 @@ class PluginBus {
       throw PluginException('插件 $id 不存在（未在 plugins.yaml 声明）');
     }
     if (config.runtimeKind != PluginRuntimeKind.ui) {
-      throw PluginException(
-        '插件 $id 的 runtime 是「${config.runtime}」，不是 ui',
-      );
+      throw PluginException('插件 $id 的 runtime 是「${config.runtime}」，不是 ui');
     }
     // 先留一份宿主引用：`_disconnect` 会把窗口表整批摘掉，之后再想看
     // “这批进程到底退没退”就只剩这里了。
@@ -1102,11 +1098,7 @@ class PluginBus {
       }
       _maybeRequestUiExit(reason: 'UI 主动关闭全部窗口（$id）');
     }
-    return <String, dynamic>{
-      'ok': true,
-      'plugin_id': id,
-      'closed': closed,
-    };
+    return <String, dynamic>{'ok': true, 'plugin_id': id, 'closed': closed};
   }
 
   /// 当前所有 UI 窗口（`GET /api/plugin/windows` 的数据源）。
@@ -1260,8 +1252,9 @@ class PluginBus {
         !(_uiWindows[pluginId]?.isNotEmpty ?? false)) {
       return;
     }
-    final String resolvedWindow =
-        windowId.isNotEmpty ? windowId : (_uiHosts[pluginId]?.windowId ?? '');
+    final String resolvedWindow = windowId.isNotEmpty
+        ? windowId
+        : (_uiHosts[pluginId]?.windowId ?? '');
     if (resolvedWindow.isNotEmpty) {
       _uiHelloWindowSeen.add('$pluginId#$resolvedWindow');
     }
@@ -1320,11 +1313,7 @@ class PluginBus {
     if (crashed) {
       _errors[config.id] = 'UI 插件进程异常退出（exit=$code）';
       _setLifecycle(config.id, PluginLifecycleState.failed);
-      _emitStatus(
-        config,
-        'disabled',
-        reason: 'UI 插件进程异常退出（exit=$code）',
-      );
+      _emitStatus(config, 'disabled', reason: 'UI 插件进程异常退出（exit=$code）');
       // 崩溃也是“界面没了”：最后一个 UI 窗口这样退出去时，核心不该留在后台。
       // 核心自己发起的停止不会走到这里（`_disconnect` 先摘窗口表，退出回调直接返回）。
       if (!stoppedByCore) {
@@ -1342,9 +1331,7 @@ class PluginBus {
     );
     // 插件自己 exit 0（关掉最后一个窗口）同样允许核心收尾；核心发起的停止不走这里。
     if (!stoppedByCore) {
-      _maybeRequestUiExit(
-        reason: 'UI 插件 ${config.id} 的最后一个窗口已退出（exit=$code）',
-      );
+      _maybeRequestUiExit(reason: 'UI 插件 ${config.id} 的最后一个窗口已退出（exit=$code）');
     }
   }
 
@@ -1379,9 +1366,7 @@ class PluginBus {
     }
     // 全部停用 / 卸载 ⇒ 没有启用的 UI 条目，核心必须留着给 loader 开引导页。
     if (!_hasEnabledUiPlugin()) {
-      log?.call(
-        'UI 窗口已全部退出，但配置里没有启用的 UI 插件 ⇒ 保持运行（引导页模式）',
-      );
+      log?.call('UI 窗口已全部退出，但配置里没有启用的 UI 插件 ⇒ 保持运行（引导页模式）');
       return;
     }
     // 正在重启 / 正在拉起的新一世还没落定：不能把“换窗口”当成“退出应用”。
@@ -2022,11 +2007,11 @@ class PluginBus {
     int killed = 0;
     for (final UiHost uiTarget in uiTargets) {
       if (!uiTarget.isClosed) {
-        await uiTarget.kill('用户显式强制停止 UI 插件 $pluginId 的窗口 ${uiTarget.windowId}');
-        killed++;
-        log?.call(
-          'UI 插件 $pluginId 的窗口 ${uiTarget.windowId} 被用户强制停止 ⇒ 显式 kill',
+        await uiTarget.kill(
+          '用户显式强制停止 UI 插件 $pluginId 的窗口 ${uiTarget.windowId}',
         );
+        killed++;
+        log?.call('UI 插件 $pluginId 的窗口 ${uiTarget.windowId} 被用户强制停止 ⇒ 显式 kill');
       }
       await uiTarget.close(waitForExit: true);
     }
@@ -2136,7 +2121,8 @@ class PluginBus {
       // 于是这里无限等，HTTP 调用侧没有任何可读回包。按「判活窗口 + 一个心跳间隔」
       // 给一个预算，到期即放弃等待并回可读拒绝——**照旧不 kill**（D8 不变：
       // 换不掉就说换不掉，用户要杀自己去走「强制停止」那条显式路）。
-      final Duration budget = host.liveness.staleWindow + host.liveness.interval;
+      final Duration budget =
+          host.liveness.staleWindow + host.liveness.interval;
       bool timedOut = false;
       final Completer<void> giveUp = Completer<void>();
       final Timer timer = Timer(budget, () {
@@ -2875,7 +2861,11 @@ class PluginBus {
       // 的场景靠它把已付费的模型正文交给调用方（known-issues #31）。
       // 码：插件回什么就带什么；不带（老产物）⇒ 这里补 `unknown` 并留一条日志
       // （契约 §4.1 第 4 条：缺码必须可见，不许静默当成无码可判）。
-      final String code = _settleReplyCode(pluginId, context.command, reply.code);
+      final String code = _settleReplyCode(
+        pluginId,
+        context.command,
+        reply.code,
+      );
       return StationCommandOutcome.failedWith(
         reply.error,
         reply.payload,
@@ -2984,44 +2974,45 @@ class PluginBus {
         return _pluginStateDump(pluginId, args);
       case 'plugin.stateFetch':
         return _pluginStateFetch(pluginId, args);
-      case 'plugin.toolCall': {
-        // 不透明转发：core 只看 plugin_id / tool；arguments.scope 原样交给插件，
-        // 不解析 agent_id / team_id / mode_key / session_id。
-        final PluginHost? host = _hosts[pluginId];
-        if (host == null || host.isClosed) {
+      case 'plugin.toolCall':
+        {
+          // 不透明转发：core 只看 plugin_id / tool；arguments.scope 原样交给插件，
+          // 不解析 agent_id / team_id / mode_key / session_id。
+          final PluginHost? host = _hosts[pluginId];
+          if (host == null || host.isClosed) {
+            return <String, dynamic>{
+              'ok': false,
+              'error': '插件 $pluginId 未运行，无法调用其工具',
+            };
+          }
+          final String tool = (args['tool'] ?? '').toString().trim();
+          final Object? rawToolArgs = args['arguments'];
+          final Map<String, dynamic> toolArguments = rawToolArgs is Map
+              ? rawToolArgs.map(
+                  (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+                )
+              : <String, dynamic>{};
+          final Object? rawScope = args['scope'];
+          final Map<String, dynamic>? opaqueScope = rawScope is Map
+              ? rawScope.map(
+                  (dynamic k, dynamic v) => MapEntry(k.toString(), v),
+                )
+              : null;
+          final PluginCallResult result = await host.callTool(
+            tool,
+            toolArguments,
+            scope: opaqueScope,
+          );
           return <String, dynamic>{
-            'ok': false,
-            'error': '插件 $pluginId 未运行，无法调用其工具',
+            'ok': true,
+            'payload': <String, dynamic>{
+              'tool': tool,
+              'result': result.text,
+              'is_error': result.isError,
+              'raw': result.raw,
+            },
           };
         }
-        final String tool = (args['tool'] ?? '').toString().trim();
-        final Object? rawToolArgs = args['arguments'];
-        final Map<String, dynamic> toolArguments = rawToolArgs is Map
-            ? rawToolArgs.map(
-                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-              )
-            : <String, dynamic>{};
-        final Object? rawScope = args['scope'];
-        final Map<String, dynamic>? opaqueScope = rawScope is Map
-            ? rawScope.map(
-                (dynamic k, dynamic v) => MapEntry(k.toString(), v),
-              )
-            : null;
-        final PluginCallResult result = await host.callTool(
-          tool,
-          toolArguments,
-          scope: opaqueScope,
-        );
-        return <String, dynamic>{
-          'ok': true,
-          'payload': <String, dynamic>{
-            'tool': tool,
-            'result': result.text,
-            'is_error': result.isError,
-            'raw': result.raw,
-          },
-        };
-      }
       default:
         return <String, dynamic>{
           'ok': false,
@@ -4995,8 +4986,10 @@ class PluginBus {
   /// **真实归属**解析（不信任调用方自报的 team / mode，与订阅同一 fail-closed 口径）。
   ///
   /// 边界（一律给可读原因，不静默拒绝）：
-  /// - **内置点位不可触发**：它们的触发时机由核心在固定接入点决定，插件要用内置
-  ///   能力请下命令（`station/command`）；
+  /// - **内置点位默认不可触发**：它们的触发时机由核心在固定接入点决定，插件要用
+  ///   内置能力请下命令（`station/command`）。唯一例外是
+  ///   [StationHubIds.pluginTriggerablePoints] 里显式登记的点位（接入点已下沉到
+  ///   领域插件、核心手上不再有调用点，如 `system.relay.context.compact`）；
   /// - **执行站不可触发**：它由命令驱动，没有「触发一次」的语义；
   /// - **消息必须带确定的 mode_key**：空 mode 在**订阅**里是通配（两种工作面都收），
   ///   但投递判据是「消息 ↔ 订阅者」，一条没有工作面的消息定不了投给谁；
@@ -5041,7 +5034,13 @@ class PluginBus {
     }
     final bool builtin = StationHubIds.all.contains(station.id);
     final bool isOwner = station.id.startsWith('plugin.${config.id}.');
-    if (!station.callableBy(config.id, isOwner: isOwner, isBuiltin: builtin)) {
+    // 例外：接入点已下沉到领域插件的内置点位（见 [StationHubIds.pluginTriggerablePoints]）。
+    // 它们对**任何**插件开放触发——核心已经不再有调用点，不放行就等于这个点位永远
+    // 没人触发；scope 仍按真实归属解析（下面同一套 fail-closed）。
+    final bool pluginOrderedBuiltin =
+        builtin && StationHubIds.pluginTriggerablePoints.contains(station.id);
+    if (!pluginOrderedBuiltin &&
+        !station.callableBy(config.id, isOwner: isOwner, isBuiltin: builtin)) {
       final String reason = builtin
           ? '「${station.id}」是内置${station.kind.label}：触发时机由核心在固定接入点'
                 '决定，插件不能主动触发；要使用内置能力请下命令（station/command）'
@@ -5124,6 +5123,7 @@ class PluginBus {
         'kind': station.kind.wire,
         'result': <String, dynamic>{
           'handled': result.handled,
+          'replaced': !identical(result.data, payload),
           'data': result.data,
           'plugin_id': result.pluginId,
           'request_id': result.requestId,
@@ -5306,8 +5306,9 @@ class PluginBus {
         'station/command 的 arguments 必须是 JSON 对象',
       );
     }
-    final Map<String, dynamic> arguments =
-        sanitizeStationArguments(rawArguments);
+    final Map<String, dynamic> arguments = sanitizeStationArguments(
+      rawArguments,
+    );
     // scope = 这一次命令的**运行期四元组**（Q2：单实例 + 每条消息带身份）。
     // 声明只作上限；team / mode 由核心按目标 agent 的真实归属解析。
     final StationScope declared = StationScope.parse(config.scope);
@@ -5337,8 +5338,7 @@ class PluginBus {
         ...StationPoints.allCommands,
         for (final StationInstance candidate in stations.stationList())
           if (candidate is ExecuteStation) ...candidate.commands,
-      }.toList()
-        ..sort();
+      }.toList()..sort();
       return <String, dynamic>{
         ExecStationEnvelopeKeys.command: command,
         ExecStationEnvelopeKeys.ok: false,
@@ -6139,10 +6139,7 @@ class PluginBus {
     }
     // 插件下线 = 工具表失效点（模型工具表必须随之变化）
     invalidateToolTable(reason: '插件 $pluginId 下线');
-    final Set<UiHost> uiTargets = <UiHost>{
-      ...uiWindows.values,
-      ?uiHost,
-    };
+    final Set<UiHost> uiTargets = <UiHost>{...uiWindows.values, ?uiHost};
     for (final UiHost window in uiTargets) {
       try {
         // UI 插件没有 stdio shutdown：只能发信号。awaitExit 只给“要看到退出码”的场景。
@@ -6179,7 +6176,6 @@ class PluginBus {
   }
 
   static int _nowSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
-
 }
 
 /// **`api/delegate` 的可读失败**（片 C）：HTTP 层据此映射 503 / 504 / 502。
@@ -6198,7 +6194,6 @@ class PluginDelegateException implements Exception {
   @override
   String toString() => reason;
 }
-
 
 /// `plugin.*` 六条命令的**对外面**（20261015-hot-restart 阶段 1，D9/D2）。
 ///
@@ -6227,9 +6222,7 @@ abstract final class PluginToolSurface {
   };
 
   /// **内部转发命令**：只供执行站/插件之间使用，不得申报成 agent tool。
-  static const Set<String> internalCommands = <String>{
-    'plugin.toolCall',
-  };
+  static const Set<String> internalCommands = <String>{'plugin.toolCall'};
 
   /// 需要**留审计行**的命令：就是控制面那四条。
   ///

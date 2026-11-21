@@ -295,6 +295,21 @@ abstract final class StationHubIds {
     collectUiBranding,
   };
 
+  /// **允许插件 `station/trigger` 的内置点位**（默认一个都没有）。
+  ///
+  /// 口径没有变：内置点位的触发时机由核心在固定接入点决定，插件要用内置能力请下
+  /// `station/command`。这里是**唯一的例外清单**，只收"接入点已经下沉到领域插件、
+  /// 核心手上不再有任何调用点"的点位——目前只有 `system.relay.context.compact`：
+  /// 上下文压缩整个搬进了 `tree.agent`，核心既不知道什么时候该压、也拿不到压缩
+  /// 所需的线形请求，再坚持"由核心触发"就等于这个点位永远没人触发（用户侧现象：
+  /// 装了压缩插件，每次压缩仍走内置摘要）。
+  ///
+  /// 加进来之前先自问：核心是否**真的**不再有触发时机？如果只是"图方便"，正解是
+  /// 下命令，而不是把内置点位变成插件可触发。
+  static const Set<String> pluginTriggerablePoints = <String>{
+    relayContextCompact,
+  };
+
   /// 退役 id 集合（迁移判定用；它们不再出现在 [all] 里）。
   static const Set<String> retired = <String>{
     legacyRelay,

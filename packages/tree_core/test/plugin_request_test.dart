@@ -177,19 +177,16 @@ void main() {
       params: <String, dynamic>{'station': 'relay'},
     );
     expect(subscribed['error'], isNull, reason: '${subscribed['error']}');
-    final Map<String, dynamic> sub = subscribed['result'] as Map<String, dynamic>;
+    final Map<String, dynamic> sub =
+        subscribed['result'] as Map<String, dynamic>;
     expect(sub['ok'], isTrue, reason: '${sub['error']}');
     expect(sub['kind'], 'relay');
     // 点位化：`station: 'relay'` 不带 point = **一次订阅工具前 + 工具后两个点位**
     // （点位化之前就是一个实例收两段，老插件因此零改动）；station_id 取第一条。
-    expect(
-      sub['station_ids'],
-      <String>[
-        StationHubIds.relayToolPre,
-        StationHubIds.relayToolPost,
-      ],
-      reason: '一次订阅两个点位，回包逐条给出',
-    );
+    expect(sub['station_ids'], <String>[
+      StationHubIds.relayToolPre,
+      StationHubIds.relayToolPost,
+    ], reason: '一次订阅两个点位，回包逐条给出');
     expect(
       sub['station_id'],
       StationHubIds.relayToolPre,
@@ -250,11 +247,7 @@ void main() {
     final Map<String, dynamic> unsub =
         removed['result'] as Map<String, dynamic>;
     expect(unsub['ok'], isTrue);
-    expect(
-      unsub['removed'],
-      2,
-      reason: '一个 relay 订阅声明落在两个点位上，逐条退订共 2 条',
-    );
+    expect(unsub['removed'], 2, reason: '一个 relay 订阅声明落在两个点位上，逐条退订共 2 条');
     expect(relay.subscribers, isEmpty);
     expect(
       (bus.stations.station(StationHubIds.relayToolPost)! as RelayStation)
@@ -394,156 +387,162 @@ void main() {
       '自建广播站：接管内置工具公告后按 team 再分发；'
       '订阅者回 payload = 附带再分发数据，回 null = 收到不改动';
 
-  test('station/register：自建广播站 ⇒ id 由核心拼装（plugin.<自己>.<kind>.<name>）', () async {
-    final PluginBus bus = await startBus(teamPluginYaml());
+  test(
+    'station/register：自建广播站 ⇒ id 由核心拼装（plugin.<自己>.<kind>.<name>）',
+    () async {
+      final PluginBus bus = await startBus(teamPluginYaml());
 
-    final Map<String, dynamic> response = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{
-        'kind': 'broadcast',
-        'name': 'fanout',
-        'description': '转发站：按 team 再分发',
-        'readme': selfReadme,
-      },
-    );
-    final Map<String, dynamic> result =
-        response['result'] as Map<String, dynamic>;
-    expect(result['ok'], isTrue, reason: '${result['error']}');
-    expect(
-      result['station_id'],
-      'plugin.sample.broadcast.fanout',
-      reason: 'id 由**核心**按插件身份拼：插件不能自选 id（归属强制点）',
-    );
-    // 真的落在站点中枢里，且是持久化实例（非内置）
-    final StationInstance? station = bus.stations.station(
-      'plugin.sample.broadcast.fanout',
-    );
-    expect(station, isA<BroadcastStation>());
-    expect(station!.builtin, isFalse);
-    expect(station.description, '转发站：按 team 再分发');
-    // 断言 3：介绍落进实例（面板详情页读它）
-    expect(station.readme, selfReadme);
-    expect(station.readmeText, selfReadme);
-    // 默认不共享：别人的插件既不能用它（断言 2 的闸门只认显式声明）
-    expect(station.shared, isFalse);
-    expect(station.allowedPlugins, isEmpty);
-    expect(station.config, isEmpty);
+      final Map<String, dynamic> response = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{
+          'kind': 'broadcast',
+          'name': 'fanout',
+          'description': '转发站：按 team 再分发',
+          'readme': selfReadme,
+        },
+      );
+      final Map<String, dynamic> result =
+          response['result'] as Map<String, dynamic>;
+      expect(result['ok'], isTrue, reason: '${result['error']}');
+      expect(
+        result['station_id'],
+        'plugin.sample.broadcast.fanout',
+        reason: 'id 由**核心**按插件身份拼：插件不能自选 id（归属强制点）',
+      );
+      // 真的落在站点中枢里，且是持久化实例（非内置）
+      final StationInstance? station = bus.stations.station(
+        'plugin.sample.broadcast.fanout',
+      );
+      expect(station, isA<BroadcastStation>());
+      expect(station!.builtin, isFalse);
+      expect(station.description, '转发站：按 team 再分发');
+      // 断言 3：介绍落进实例（面板详情页读它）
+      expect(station.readme, selfReadme);
+      expect(station.readmeText, selfReadme);
+      // 默认不共享：别人的插件既不能用它（断言 2 的闸门只认显式声明）
+      expect(station.shared, isFalse);
+      expect(station.allowedPlugins, isEmpty);
+      expect(station.config, isEmpty);
 
-    // 同名重复注册 = 幂等（插件重启后会再注册一遍，不能报错也不能覆盖）
-    final Map<String, dynamic> again = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{
-        'kind': 'broadcast',
-        'name': 'fanout',
-        'readme': '改写过的介绍',
-      },
-    );
-    expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
-    expect(
-      (again['result'] as Map<String, dynamic>)['station_id'],
-      result['station_id'],
-    );
-    expect(station.readme, selfReadme, reason: '幂等分支不覆盖既有站点：介绍也保持第一次注册的版本');
-    expect(
-      bus.stations
-          .stationList()
-          .where((StationInstance s) => !s.builtin)
-          .length,
-      1,
-      reason: '没有建出第二条',
-    );
-  });
+      // 同名重复注册 = 幂等（插件重启后会再注册一遍，不能报错也不能覆盖）
+      final Map<String, dynamic> again = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{
+          'kind': 'broadcast',
+          'name': 'fanout',
+          'readme': '改写过的介绍',
+        },
+      );
+      expect((again['result'] as Map<String, dynamic>)['ok'], isTrue);
+      expect(
+        (again['result'] as Map<String, dynamic>)['station_id'],
+        result['station_id'],
+      );
+      expect(station.readme, selfReadme, reason: '幂等分支不覆盖既有站点：介绍也保持第一次注册的版本');
+      expect(
+        bus.stations
+            .stationList()
+            .where((StationInstance s) => !s.builtin)
+            .length,
+        1,
+        reason: '没有建出第二条',
+      );
+    },
+  );
 
-  test('station/register：name 非法 / 缺 commands / 缺 readme / 收集站缺 schema 都是可读拒绝', () async {
-    final PluginBus bus = await startBus(teamPluginYaml());
+  test(
+    'station/register：name 非法 / 缺 commands / 缺 readme / 收集站缺 schema 都是可读拒绝',
+    () async {
+      final PluginBus bus = await startBus(teamPluginYaml());
 
-    // ① 缺 name
-    final Map<String, dynamic> noName = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{'kind': 'relay'},
-    );
-    expect((noName['result'] as Map<String, dynamic>)['ok'], isFalse);
-    expect(
-      (noName['result'] as Map<String, dynamic>)['error'],
-      contains('name'),
-    );
+      // ① 缺 name
+      final Map<String, dynamic> noName = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{'kind': 'relay'},
+      );
+      expect((noName['result'] as Map<String, dynamic>)['ok'], isFalse);
+      expect(
+        (noName['result'] as Map<String, dynamic>)['error'],
+        contains('name'),
+      );
 
-    // ② name 里带点号：会与归属前缀判定冲突（插件 a 建 b.relay.x 顶掉 a.b 的站）
-    final Map<String, dynamic> dotted = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{'kind': 'relay', 'name': 'a.b'},
-    );
-    expect((dotted['result'] as Map<String, dynamic>)['ok'], isFalse);
-    expect(
-      (dotted['result'] as Map<String, dynamic>)['error'],
-      contains('只允许'),
-    );
+      // ② name 里带点号：会与归属前缀判定冲突（插件 a 建 b.relay.x 顶掉 a.b 的站）
+      final Map<String, dynamic> dotted = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{'kind': 'relay', 'name': 'a.b'},
+      );
+      expect((dotted['result'] as Map<String, dynamic>)['ok'], isFalse);
+      expect(
+        (dotted['result'] as Map<String, dynamic>)['error'],
+        contains('只允许'),
+      );
 
-    // ③ 自建执行站必须带非空 commands（插件内部定义能执行什么）
-    final Map<String, dynamic> execute = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{
-        'kind': 'execute',
-        'name': 'x',
-        'readme': '夹具',
-      },
-    );
-    expect((execute['result'] as Map<String, dynamic>)['ok'], isFalse);
-    expect(
-      (execute['result'] as Map<String, dynamic>)['error'],
-      contains('commands'),
-    );
+      // ③ 自建执行站必须带非空 commands（插件内部定义能执行什么）
+      final Map<String, dynamic> execute = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{
+          'kind': 'execute',
+          'name': 'x',
+          'readme': '夹具',
+        },
+      );
+      expect((execute['result'] as Map<String, dynamic>)['ok'], isFalse);
+      expect(
+        (execute['result'] as Map<String, dynamic>)['error'],
+        contains('commands'),
+      );
 
-    // ④ 收集站必须带非空 schema（输入格式由站点定义）
-    final Map<String, dynamic> collect = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{'kind': 'collect', 'name': 'probe'},
-    );
-    expect((collect['result'] as Map<String, dynamic>)['ok'], isFalse);
-    expect(
-      (collect['result'] as Map<String, dynamic>)['error'],
-      contains('schema'),
-    );
+      // ④ 收集站必须带非空 schema（输入格式由站点定义）
+      final Map<String, dynamic> collect = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{'kind': 'collect', 'name': 'probe'},
+      );
+      expect((collect['result'] as Map<String, dynamic>)['ok'], isFalse);
+      expect(
+        (collect['result'] as Map<String, dynamic>)['error'],
+        contains('schema'),
+      );
 
-    // ⑥ **缺 readme ⇒ 拒绝**（断言 3：每个插件内置站点必须有介绍）。
-    // 站是插件建的，"它干什么、别人该怎么用"只有建站的插件说得清；共享时
-    // 这份介绍是别人唯一能读到的说明书，所以不能省。
-    final Map<String, dynamic> noReadme = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{'kind': 'broadcast', 'name': 'silent'},
-    );
-    expect((noReadme['result'] as Map<String, dynamic>)['ok'], isFalse);
-    expect(
-      (noReadme['result'] as Map<String, dynamic>)['error'],
-      contains('readme'),
-      reason: '拒绝理由要点出缺的是介绍',
-    );
+      // ⑥ **缺 readme ⇒ 拒绝**（断言 3：每个插件内置站点必须有介绍）。
+      // 站是插件建的，"它干什么、别人该怎么用"只有建站的插件说得清；共享时
+      // 这份介绍是别人唯一能读到的说明书，所以不能省。
+      final Map<String, dynamic> noReadme = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{'kind': 'broadcast', 'name': 'silent'},
+      );
+      expect((noReadme['result'] as Map<String, dynamic>)['ok'], isFalse);
+      expect(
+        (noReadme['result'] as Map<String, dynamic>)['error'],
+        contains('readme'),
+        reason: '拒绝理由要点出缺的是介绍',
+      );
 
-    // ⑤ 类型未知 ⇒ 参数错误（JSON-RPC 层，不静默）
-    final Map<String, dynamic> badKind = await pluginRequest(
-      bus,
-      method: 'station/register',
-      params: <String, dynamic>{'kind': 'teleport', 'name': 'x'},
-    );
-    expect(badKind['result'], isNull);
-    expect(
-      (badKind['error'] as Map<String, dynamic>)['code'],
-      PluginRpcErrorCode.invalidParams,
-    );
+      // ⑤ 类型未知 ⇒ 参数错误（JSON-RPC 层，不静默）
+      final Map<String, dynamic> badKind = await pluginRequest(
+        bus,
+        method: 'station/register',
+        params: <String, dynamic>{'kind': 'teleport', 'name': 'x'},
+      );
+      expect(badKind['result'], isNull);
+      expect(
+        (badKind['error'] as Map<String, dynamic>)['code'],
+        PluginRpcErrorCode.invalidParams,
+      );
 
-    // 一个都不该留下
-    expect(
-      bus.stations.stationList().where((StationInstance s) => !s.builtin),
-      isEmpty,
-    );
-  });
+      // 一个都不该留下
+      expect(
+        bus.stations.stationList().where((StationInstance s) => !s.builtin),
+        isEmpty,
+      );
+    },
+  );
 
   test('station/register：自建执行站 ⇒ id 由核心拼、命令挂到建站插件', () async {
     final PluginBus bus = await startBus(teamPluginYaml());
@@ -578,18 +577,21 @@ void main() {
     // 就会变成"未知命令"）。
     final Map<String, dynamic> again =
         (await pluginRequest(
-          bus,
-          method: 'station/register',
-          params: <String, dynamic>{
-            'kind': 'execute',
-            'name': 'local',
-            'readme': '夹具：自建执行站',
-            'commands': <String>['agent.worker.run'],
-          },
-        ))['result'] as Map<String, dynamic>;
+              bus,
+              method: 'station/register',
+              params: <String, dynamic>{
+                'kind': 'execute',
+                'name': 'local',
+                'readme': '夹具：自建执行站',
+                'commands': <String>['agent.worker.run'],
+              },
+            ))['result']
+            as Map<String, dynamic>;
     expect(again['ok'], isTrue, reason: '${again['error']}');
     expect(again['station_id'], 'plugin.sample.execute.local');
-    expect(station.commands, <String>['agent.worker.run'], reason: '重注册必须刷新命令表');
+    expect(station.commands, <String>[
+      'agent.worker.run',
+    ], reason: '重注册必须刷新命令表');
     expect(
       station
           .mounts(command: 'agent.worker.run')
@@ -605,32 +607,34 @@ void main() {
 
     final Map<String, dynamic> wide =
         (await pluginRequest(
-          bus,
-          method: 'station/register',
-          params: <String, dynamic>{
-            'kind': 'execute',
-            'name': 'wide',
-            'readme': '夹具：宽命令表',
-            'commands': <String>[
-              for (int i = 0; i < 35; i++) 'demo.wide$i',
-            ],
-          },
-        ))['result'] as Map<String, dynamic>;
+              bus,
+              method: 'station/register',
+              params: <String, dynamic>{
+                'kind': 'execute',
+                'name': 'wide',
+                'readme': '夹具：宽命令表',
+                'commands': <String>[
+                  for (int i = 0; i < 35; i++) 'demo.wide$i',
+                ],
+              },
+            ))['result']
+            as Map<String, dynamic>;
     expect(wide['ok'], isTrue, reason: '${wide['error']}');
 
     final Map<String, dynamic> tooWide =
         (await pluginRequest(
-          bus,
-          method: 'station/register',
-          params: <String, dynamic>{
-            'kind': 'execute',
-            'name': 'too_wide',
-            'readme': '夹具：超限命令表',
-            'commands': <String>[
-              for (int i = 0; i < 65; i++) 'demo.tooWide$i',
-            ],
-          },
-        ))['result'] as Map<String, dynamic>;
+              bus,
+              method: 'station/register',
+              params: <String, dynamic>{
+                'kind': 'execute',
+                'name': 'too_wide',
+                'readme': '夹具：超限命令表',
+                'commands': <String>[
+                  for (int i = 0; i < 65; i++) 'demo.tooWide$i',
+                ],
+              },
+            ))['result']
+            as Map<String, dynamic>;
     expect(tooWide['ok'], isFalse);
     expect(tooWide['error'], contains('commands 过多'));
   });
@@ -649,7 +653,11 @@ void main() {
         'schema': <String, dynamic>{
           'description': '探针产出',
           'fields': <dynamic>[
-            <String, dynamic>{'name': 'value', 'type': 'string', 'required': true},
+            <String, dynamic>{
+              'name': 'value',
+              'type': 'string',
+              'required': true,
+            },
           ],
         },
       },
@@ -682,8 +690,8 @@ void main() {
         'readme': selfReadme,
       },
     );
-    final String myId = (mine['result'] as Map<String, dynamic>)['station_id']
-        as String;
+    final String myId =
+        (mine['result'] as Map<String, dynamic>)['station_id'] as String;
 
     // ① 别的插件注销我的站 ⇒ 拒绝（归属校验）
     final Map<String, dynamic> steal = await pluginRequest(
@@ -825,6 +833,53 @@ void main() {
       (builtinTrigger['result'] as Map<String, dynamic>)['error'],
       contains('station/command'),
       reason: '要使用内置能力时正解是下命令，这里要把正解说出来',
+    );
+
+    // ②d 例外清单：`system.relay.context.compact` 允许插件触发（接入点已下沉到
+    // tree.agent，核心不再有调用点）。无订阅者时照样回 ok:true + handled:false，
+    // 让调用方能拿到"没接管"的结构化结论而不是一条命令失败。
+    final Map<String, dynamic> compactTrigger = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': StationHubIds.relayContextCompact,
+        'payload': <String, dynamic>{'agent_id': 'agt_1'},
+        'scope': <String, dynamic>{
+          'team_id': 'team-1',
+          'agent_id': 'agt_1',
+          'mode_key': 'local',
+        },
+      },
+    );
+    final Map<String, dynamic> compactResult =
+        compactTrigger['result'] as Map<String, dynamic>;
+    expect(compactResult['ok'], isTrue, reason: '${compactResult['error']}');
+    expect(
+      (compactResult['result'] as Map<String, dynamic>)['handled'],
+      isFalse,
+      reason: '没有订阅者 ⇒ 不接管，但触发本身是允许的',
+    );
+    expect(
+      (compactResult['result'] as Map<String, dynamic>)['replaced'],
+      isFalse,
+      reason: '放行原数据 ≠ 订阅者回填：调用方靠这一位判"到底有没有接管"'
+          '（订阅者回 null 时 handled 也是 true，data 是原载荷）',
+    );
+
+    // ②e 例外是**窄**的：其它内置中转点位仍然不可触发
+    final Map<String, dynamic> toolPreTrigger = await pluginRequest(
+      bus,
+      method: 'station/trigger',
+      params: <String, dynamic>{
+        'station_id': StationHubIds.relayToolPre,
+        'payload': '原数据',
+        'scope': <String, dynamic>{'team_id': 'team-1', 'mode_key': 'local'},
+      },
+    );
+    expect(
+      (toolPreTrigger['result'] as Map<String, dynamic>)['ok'],
+      isFalse,
+      reason: '例外清单只收接入点已下沉的点位，不能顺手放开其它内置点位',
     );
 
     // ③ 按 station_id 退订：幂等
