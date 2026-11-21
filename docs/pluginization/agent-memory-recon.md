@@ -19,7 +19,7 @@
 | MEM-R5 | `llm.embed`（OpenAI `/embeddings`，kind=embedding）与 `llm.call`（可指定 model_id，缺省 JSON / 显式 text）已落地，都是**执行站命令** | 已核验 | `agent_runtime.dart:777,990,1085-1149`、`embedding_client.dart:41-105`、`llm_json_caller.dart:1-75` | L3 摘要 + 向量化可直接复用，不用加新模型协议 |
 | MEM-R6 | 数据根布局已有 `config/ data/ agents/ logs/ hooks/ store/ settings/ storage/ plugin_settings/`；**没有** `memory/` | 已核验 | `tree_paths.dart:29-158`、`settings_engine.dart:60-82` | 拍板项②：新增 `<dataRoot>/memory/<agent_id>/`（数据根下，非工作空间） |
 | MEM-R7 | UI「模型信息」是右栏 `RightPanelEntry(id: 'modelInfo')`，`ModelInfoPanel` 一个 StatefulWidget 内放模型 / 提示词 / 参数 / 工具勾选；引导文案与 README 不变量 28 都按"模型信息"写死 | 已核验 | `main_page.dart:1955-1976`、`model_info_panel.dart:1-120`、`onboarding_steps.dart:62-66`、`lib/README.md:582-658` | 拍板项③：更名「agent 配置页」需同步改 UI 5 处 + 跨仓 README 门禁 |
-| MEM-R8 | 新增 REST 需进 `tree_protocol.ApiPaths.delegated` + `contractRoutes`（当前 114 = 核心 35 + 委派 79），由 tree.agent 经 `system.collect.api.routes` 申报（36 条已申报） | 已核验 | `api_paths.dart:583-586`、`tree_agent_loop.dart:151`、`tree.agent_plugin.dart:349-352` | 记忆管理 / 快照查看的 REST 端点走委派申报，不动核心 35 条永久面 |
+| MEM-R8 | 新增 REST 需进 `tree_protocol.ApiPaths.delegated` + `contractRoutes`（**当前 123 = 核心 35 + 委派 88**），由 tree.agent 经 `system.collect.api.routes` 申报（**60 条已申报**） | 已核验（M2/M4 后基线更新） | `api_paths.dart:583-586`、`tree_agent_loop.dart:167`、`tree.agent_plugin.dart:349-352` | 记忆管理 / 快照查看的 REST 端点走委派申报，不动核心 35 条永久面 |
 
 ---
 

@@ -37,7 +37,7 @@
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
 | **L UI 圆角化** | RND-UI-1 + S1~S4 已落地（UI 插件 `f208763`；版本随发版车道 D） | 已完成 | 真机视觉验收（深/浅、240px 窄栏、tab 溢出） | [ui-roundness-visual-upgrade-recon.md](pluginization/ui-roundness-visual-upgrade-recon.md) §4 |
 | **M 核心与 UI 生命周期** | 最后一个 UI 进程退出 ⇒ 核心收尾剩余插件并退出；全部停用/卸载/从未连上 ⇒ 保持引导页模式 | 已完成 | 真机 E2E-14（托盘退出 / 直接结束 UI 进程 / 全部停用） | [ui-pluginization.md](pluginization/ui-pluginization.md) §4.1.1 ＋ `ui-pluginization_acceptance.md` D-13/E-16/E2E-14 |
-| **N 记忆与上下文治理** | **M3 异步管道完成**（L3 摘要→L2 提取→去重/修正合并→L1 提升→衰减归档，纯编排可测 + 单飞/降级；pipeline/status 接实）；M1/M2 已落地；D1~D11 全拍板 | 进行中 | M4 工具+快照段（memory 工具 + memorySectionProvider 注入 + 快照查看器）→ M5 配置页 | [agent-memory-recon.md](pluginization/agent-memory-recon.md) ＋ [agent-memory-upgrade-plan.md](pluginization/agent-memory-upgrade-plan.md) §10 |
+| **N 记忆与上下文治理** | **M4 工具 + 快照段完成**：`memory` 工具（in/recall/forget/archive/restore/overview，recall 支持 level/tags）、`memorySectionProvider` 经 `promptStatePrewarm` 注入（D1：只在快照重建时生效，两处拼装同字节）、消息落库后异步 `tick`、快照查看器同口径（source/dirty）；M1~M3 已落地；D1~D11 全拍板 | 进行中 | M5 agent 配置页 4 tab（记忆管理 / 系统提示词 / 快照查看器）+ 引导 / README / CHANGELOG | [agent-memory-recon.md](pluginization/agent-memory-recon.md) ＋ [agent-memory-upgrade-plan.md](pluginization/agent-memory-upgrade-plan.md) §10 |
 
 **车道 H 门控覆盖**（冻结版 [production-line-gates.md](pluginization/production-line-gates.md)）：
 LG-01~07 就绪门（结构 / 文档归一化 / 包图 / 文档图 / 代码索引 / 测试映射 / 复合就绪）；
