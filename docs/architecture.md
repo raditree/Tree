@@ -50,8 +50,8 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
    （同一会话串行；**不同会话并行**，见 §5）。
 2. **构造上下文**（`ConversationService._contextOf` → `systemPromptWithWorkspace`）：
    ```
-   [0] system  = 工作空间基础段(.self/system_prompt.md) + agent.system_prompt
-                 + 工作空间软约束 + Spec 索引 + 已选 Spec 全文
+   [0] system  = 工作空间基础段 + agent.system_prompt
+                 + 工作空间软约束 + Spec 索引 + 已选 Spec 全文 + 记忆段（快照重建时刷新）
    [1..n] 历史 = 逐字重建的"实发那一份"（见 §4）
    [last] 本轮输入
    ```
@@ -127,8 +127,8 @@ Flutter UI 进程（lib/）                     核心进程（packages/tree_cor
 
 | 提示词 | 源码（唯一真源） | 运行期落点 |
 | --- | --- | --- |
-| 默认系统提示词（`defaultSystemPromptSeed`） | agent/system_prompt_file.dart | `.tree/<agent_id>/.self/system_prompt.md`——**只播种一次**：落盘后用户改文件即改提示词，代码不再覆盖；右侧「重置」先备份成 `.bak.<n>` |
-| 系统提示词拼装顺序（`systemPromptWithWorkspace`） | agent/workspace_prompt.dart | 基础段 + agent 自己的 `system_prompt` + 工作空间软约束 + Spec 索引 + 已选 Spec 全文 |
+| 默认系统提示词（`defaultSystemPromptSeed`） | agent/system_prompt_file.dart | **插件化后不再播种 / 不接生产路径**（见 [known-issues.md](known-issues.md) #54）；当轮生效的提示词源是 `agent.system_prompt`，在 UI「agent 配置 → 系统提示词」编辑；快照查看器只读展示钉住的最终字节 |
+| 系统提示词拼装顺序（`systemPromptWithWorkspace`） | agent/workspace_prompt.dart | 基础段 + agent 自己的 `system_prompt` + 工作空间软约束 + Spec 索引 + 已选 Spec 全文 + **记忆段**（AGENT-MEM M4：L0/L1/L2 得分注入，只在快照重建时刷新） |
 | 内置 Spec 模板（`kBuiltinSpecs` / `kBuiltinSpecTexts`：general-task / hard-task / team-meeting / plugin-creator + 四条共享的「第 0 步」） | spec/builtin_specs.dart | `.tree/<agent_id>/.self/spec/<id>.md`——**核心管理的快照**：模板内容变了就刷新（旧副本备份成 `<id>.md.bak.<n>`），副本 `version` 高于模板则保留不动 |
 | 插件开发指南（模型读的协议口径） | [plugin-development.md](plugin-development.md) | 选中 `plugin-creator` 规范时播种到 `.self/docs/plugin-development.md`（spec/builtin_spec_assets.dart + [plugin/plugin_guide.dart](../packages/tree_core/lib/src/plugin/plugin_guide.dart)） |
 | 附件说明片段（`attachmentPrompt`） | agent/attachment_prompt.dart | 拼进 user 消息的附件路径说明；生成与压缩估算**共用同一份**（逐字一致） |

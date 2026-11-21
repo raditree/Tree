@@ -19,6 +19,22 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **右栏「模型信息」窗改为「agent 配置」四 tab**（**修改** `plugins/tree.ui.default/lib/README.md`
+  不变量 28，窗口 id `modelInfo` 保留）：
+  - 四个 tab：模型配置 / 工具配置 / 记忆管理 / 系统提示词；子面板 `IndexedStack` 常挂，
+    **每个 tab 只 PATCH 自己负责的字段**（模型与参数覆盖 / `tool_policy` / `memory-config` /
+    `agent.system_prompt`），避免跨 tab 保存把对方加载时的旧值覆盖回去；
+  - 期望宽度 480 → 600；新手引导与 `onboarding_steps` 文案同步为「agent 配置」；
+- **系统提示词以 `agent.system_prompt` 为唯一提示词源，快照只读**（**修改**同上不变量 28）：
+  - 文件窗的「重置系统提示词」由"播种 `.self/system_prompt.md`"改为清空 `agent.system_prompt`；
+  - 第 4 个 tab 下半是只读快照查看器：段来源 / 字符数 / `dirty_sources` / 钉住时间，
+    不提供直接编辑最终字节的入口（编辑走提示词源与记忆管理）；
+- **记忆配置的全部阈值在 UI 可改**（**修改**同上不变量 28；AGENT-MEM D11）：
+  记忆管理 tab 提供 score 四维权重、L0 阈值与注入预算、归档阈值、置信度缺省、各层半衰期、
+  TOP N、聚类相似度/Jaccard/tag 交集、可复用来源数与 score 累加阈值，分组 + 「恢复默认」；
+  模型选择（embedding / 提取 LLM）只由模型 tab 写同一份 `config.json`；另含检索（可含 L4 归档）、
+  手动新建 / 编辑（version 自增）/ 移入 L4、管道状态。
+
 - **UI 是零依赖的 `runtime: ui` 插件：契约自持、只增不改，发现面发布 `ui_contract`**
   （**新增** `plugins/tree.ui.default/lib/io/protocol_contract.dart` 的 `uiContractVersion`、
   `plugins/tree.ui.default/lib/README.md` 不变量 4；
