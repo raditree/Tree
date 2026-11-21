@@ -379,3 +379,17 @@ M1~M5 按上表顺序推进，与车道 H（生产线）无文件区域冲突（
 
 **仍属实施细节（不阻塞、不需再拍板）**：D6 的 Float32List 在 semdb 里的具体编码、D5 摘要提示词文案、
 `pipeline.log` 的轮转策略——由 M1 / M3 切片按本仓既有口径（`write_queue` / `core_log_sink`）自行定夺。
+
+### 11.1 M3 落地时自查发现并修正的偏差（2026-11）
+
+M3 提交后自查，发现五处"实现与方案/自身注释不符"，已在同批修正并补回归钉子：
+
+| 偏差 | 现象 | 修正 | 回归钉子 |
+| --- | --- | --- | --- |
+| `embedder` 是死代码 | 管道注入了它但从不调用，D6「向量存 semdb」没兑现 | L3 overview 更新时对 outline 向量化并写入 `overview.json.embedding` | `L3 overview 真的被向量化` |
+| 降级标记失真 | `_similarity` 两分支都返回 Jaccard，`degraded` 恒 true | 降级只由 L3 向量化失败驱动；去重走 lexical 是常态不算降级 | `无 embedding 模型 ⇒ degraded=true` |
+| 阈值误用 | `cluster.similarity`(0.82，为余弦设计)当 Jaccard 阈值，中文短句几乎判不出同题 | Jaccard 用 `cluster.lexicalJaccard`(0.6)；cosine 才用 0.82 | `内容不同但同题 → 修正`（改成硬断言） |
+| L1 提升污染归档 | `put(asCorrection:true)` 让 L2→L1 在 L4 留旧版垃圾 | 提升用 `put()` 直接覆盖、version 不变、不写 archive | `L1 提升不写 archive` |
+| 新 id 用真实时钟 | `_newId` 用 `DateTime.now()`，测试不可控 | 改用注入时钟 `_now` | 全量测试可复现 |
+
+排查口径：这五处都是**注释/文档说 A、代码做 B**——正是"文档与代码冲突以代码为准，但偏差要记档"那条侦察纪律要抓的形态。M4/M5 落地时同样先自查再提交。
