@@ -19,6 +19,15 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **`read` 工具不再把「没有文本」说成「（空文件）」**（**修改**
+  `plugins/tree.agent/README.md` 的 `read` 提示口径、`plugins/local_executor/README.md` 与
+  `plugins/ssh_executor/README.md` 的 `file.read` 返回）：
+  - `local.file.read` / `ssh.file.read` 的**文本模式都回 `size`**（原来只有 `raw` 分块通道有）：
+    非 UTF-8 的内容只回 `base64`、`content` 为空，上层只能靠 `size` 区分「空文件」与「二进制」；
+  - tree.agent 的 `read` 分三支如实说：二进制（给字节数并明确「不是空文件」）/ 空文件（`size == 0`）/
+    `start_line` 越界（给总行数并要求改小）；`truncated` 在正文后标注，不再把半篇当全篇；
+  - 事故来源：2026-11-21 一张 11047 字节的 PNG 被报成「（空文件）」，agent 照着假提示对用户说
+    「这图读出来是空的」——错的是提示本身。
 - **消息卡片改版：复制键落到正文下方的动作行、文字选区半透明**（**修改**
   `plugins/tree.ui.default/lib/README.md` 不变量 11 与 29）：
   - 模型卡片带一层极浅投影，底部新增**恒定占位**的动作行：复制键常驻行内、悬停淡入，

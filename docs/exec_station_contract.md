@@ -127,6 +127,7 @@ RPC 层错误**不走这个信封**：`command` 缺失、`arguments` 不是对�
 | `file.rename` | **无此命令** | 有（原子改名：源不存在 / 目标已存在都显式报错，绝不覆盖） | `kExecutorCommands` ↔ `exec_station.dart:196-197,487-494` |
 | `file.read` 分块下载通道 `raw:true`（`base64`/`offset`/`size`/`eof`） | **无** | 有 | `executor.dart:84-119` ↔ `exec_station.dart:325-341` |
 | 非 UTF-8 内容读取 ⇒ **内联 `base64`** | 有 | 有 | `executor.dart:92-98,117` ↔ `exec_station.dart:346-351,373` |
+| `file.read` 文本模式**必回 `size`**（调用方据此区分空文件与二进制；2026-11-21 补） | 有 | 有 | `executor.dart` 的 `_read` ↔ `exec_station.dart` 的 `_read`：两侧同一格，缺一边上层就把二进制报成空文件 |
 | 租约登记 | 曾走**核心**的 `workspace/register` 通知（`plugin_bus.dart:5067-5099`） | 走**执行站命令** `ssh.lease.register`（`exec_station.dart:180-181`） | **已统一（片 3）**：两侧都走执行站命令（本机 `local.lease.register`），核心那张表已撤 |
 
 > 最后一行是本表里唯一"看着像差异、其实是两套系统"的项：本机命令带
