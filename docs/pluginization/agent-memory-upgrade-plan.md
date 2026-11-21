@@ -91,8 +91,17 @@ score = w_i * importance + w_c * confidence
 | 时间衰减 | exp 指数，`half_life_days` 按层配置（L0 最长 / frozen 时不衰减） | 存储层按 `last_decay_at` 惰性重算，无需定时任务逐条写盘 |
 | `relevance` | [0,1] | 会话相关性：L3 overview 的 topics/向量与本会话输入的匹配度；**初次构建快照时**按"用户输入 + 项目背景"判定一次，随快照钉住（D1） |
 
-默认权重 `w_i=0.35, w_c=0.20, w_t=0.25, w_r=0.20`；L0 全量注入阈值 `0.6`。
-权重 / 半衰期 / TOP N 全部进配置（§4.4），UI 可调；具体数值待模型池环境实测校准（recon §5 未知项 4）。
+**已拍板默认值（AGENT-MEM-D7）**：权重 `w_i=0.35, w_c=0.20, w_t=0.25, w_r=0.20`；
+L0 全量注入阈值 `0.6`；归档阈值 `score < 0.15`；置信度缺省降级值 `0.5`。
+
+| 层 | 半衰期（天） | 说明 |
+| --- | --- | --- |
+| L0 | frozen（不衰减） | 用户显式长期记忆，衰减维度恒为 1.0 |
+| L1 | 180 | 长期共享记忆，约半年衰减一半 |
+| L2 | 30 | 会话记忆，约一个月衰减一半 |
+| L3 / L4 | 不适用 | overview 不进 score；归档不参与注入 |
+
+权重 / 半衰期 / TOP N / 阈值全部进配置（§4.4），UI 可调；默认值先落地，再按模型池环境实测校准。
 
 **不变式**：
 - score 变化是**惰性**的（读时按当前时间算），不触发快照重建（D1）。
@@ -108,15 +117,16 @@ score = w_i * importance + w_c * confidence
 ```
 <dataRoot>/
 ├── memory/<agent_id>/
-│   ├── records.semdb        # L0/L1/L2/L4 统一条目库（Sembast，纯 Dart）
-│   ├── vectors.jsonl?       # 向量快照（可选：semdb 直接存 Float32List 亦可，切片 M1 定）
+│   ├── records.semdb        # L0/L1/L2/L4 统一条目库（Sembast，纯 Dart），**向量作为条目字段同库存放**
 │   ├── pipeline.log         # 异步管道的可读日志（失败 / 降级 / 去重 / 修正留痕）
-│   └── config.json          # 该 agent 的记忆配置（模型 id / 权重 / TOP N），或复用 settings 插件
+│   └── config.json          # 该 agent 的记忆配置（模型 id / 权重 / TOP N）—— 已拍板落此处，不复用 settings 插件
 ├── data/<agent>/<session>/overview.json   # L3 会话摘要（随会话走）
 └── agents/<agent_id>.yaml   # 保留 system_prompt 作为"自己的提示词源"（D3），不新增大字段
 ```
 
-- 与 `tree.storage` 的取舍：本期**数据根直存**（用户拍板），不引入插件依赖；
+- **已拍板（AGENT-MEM-D6）**：向量直接存 `records.semdb` 的条目字段（Float32List 编码），不另建向量文件；
+  `embedding` 字段与条目其余字段同事务写入，避免"条目在、向量丢"的割裂。
+- 与 `tree.storage` 的取舍：本期**数据根直存**（D2），不引入插件依赖；
   若后续要多插件共享再迁 `storage.*`（recon §2.3）。
 - Sembast 已在 `tree.agent` 的传递依赖里（`conversation_db.dart` 用），无新增依赖。
 
@@ -162,17 +172,35 @@ score = w_i * importance + w_c * confidence
 
 ### 5.2 流水线（每会话）
 
+**已拍板（AGENT-MEM-D5）**：L3 摘要**新写一条 `llm.call` 路径**，不改造 `CompactionService._summarize`
+——那条是压缩触发、与 `compactedSummary` 耦合，硬塞异步滚动会污染压缩语义与前缀缓存口径。
+用 `responseFormat: 'text'` 避免 `json_object` 改写前缀（known-issues #27）；提示词与解析独立成
+`plugins/tree.agent/lib/src/memory/l3_summarizer.dart`，与压缩互不调用。
+
 ```
-1. 取 msg_watermark 之后的新消息 → 喂 extract LLM（text 形态，避免改写前缀，见 known-issues #27）
-2. 合并旧 overview.outline → 新 L3 overview + topics → embedding（有模型时）
+1. 取 msg_watermark 之后的新消息 → 喂 extract LLM（新 llm.call 路径，text 形态，见上）
+2. 合并旧 overview.outline → 新 L3 overview + topics → embedding（有模型时，D6 存 semdb）
 3. 从 outline/topics 提取 L2 候选（一点一条，LLM 给 tag/type/importance/confidence）
 4. 对每条候选：向量相似检索已有 L2/L1 →
    - 高相似且矛盾 ⇒ 修正：旧条目 version+1 内容替换，旧 version 进 L4
    - 高相似且一致 ⇒ 合并（更新 source / 提升 confidence）
    - 无相似 ⇒ 新建 L2
-5. 跨会话复用判定：L2 条目与 L1 池聚类 → 可复用者提升为 L1（一点一条，同去重 / 修正流程）
-6. 衰减：按半衰期计算 score（惰性）→ 低于清理阈值进 L4
+5. 跨会话复用判定（AGENT-MEM-D8，见 §5.4）：L2 条目与 L1 池聚类 → 可复用者提升为 L1
+6. 衰减：按半衰期计算 score（惰性）→ 低于归档阈值（0.15）的条目进 L4
 ```
+
+### 5.4 L1 跨会话聚类判据（AGENT-MEM-D8）
+
+用户授权本方案定夺，取值如下（写进 `config.json`，可改）：
+
+- **候选筛选**：L2 条目创建后，按 `tag` 交集 ≥ 1 **且** `type` 相同筛出 L1 池候选，再算向量相似度。
+- **同题阈值**：余弦 ≥ `0.82` 判为"同一件事"→ 走合并 / 修正流程（同 §5.2 步骤 4）；
+  `< 0.82` 视为新主题，新建 L1 条目。
+- **可复用判定**：某 L1 条目的 `source.session_ids` 覆盖 ≥ 2 个不同会话 ⇒ 认定为"跨会话可复用"，
+  进入快照 L1 TOP N 池；只有 1 个会话来源的留在 L2 池（不进 L1 注入段）。
+- **聚类粒度**：L1 一条 = 一个可复用结论（一点一条），不按会话聚合；多会话来源记在同一条目的
+  `source.session_ids`（去重）。
+- **无向量降级**：无 embedding 时用 tag 交集 + keywords Jaccard ≥ `0.6` 替代余弦，标 `degraded`（与 §5.3 一致）。
 
 ### 5.3 失败与降级（红线：不留静默失败）
 
@@ -221,6 +249,9 @@ score = w_i * importance + w_c * confidence
   ```
 - 注入集在**快照重建时**一次性计算并随之钉住；之后异步管道再怎么更新，当前会话快照不变（D1）。
 - 压缩估算（`CompactionService.estimateContextTokens`）走同一个 `systemPromptWithWorkspace`，自动同口径。
+- **已拍板（AGENT-MEM-D9）**：L0 注入预算 **4k token**（走 `util/tokens.dart` 的统一口径 `ceil(字符/token_scale)`，
+  按每模型 `token_scale` 折算），L1 / L2 各 TOP N 另计；超预算的 L0 条目按 score 从低到高裁掉，
+  被裁条目仍可 `memory.recall` 召回。注入段总预算与裁剪留痕写进 `pipeline.log`。
 
 ### 7.2 快照查看器（D3）
 
@@ -305,11 +336,20 @@ M1~M5 按上表顺序推进，与车道 H（生产线）无文件区域冲突（
 
 ---
 
-## 11. 未在本次拍板、开工前要清的问题
+## 11. 追加拍板记录（AGENT-MEM-D5~D9，2026-11 用户定稿）
 
-1. L3 滚动摘要是改造 `CompactionService._summarize` 还是新写 `llm.call` 路径（recon §5.1）。
-2. `vectors` 存 semdb 字段还是独立 jsonl（§4.1，切片 M1 定）。
-3. L1 跨会话聚类的判据（tag + 向量阈值）与"可复用"的阈值（recon §5.3）。
-4. score 权重 / 半衰期 / 0.6 阈值的默认值是否要随模型池实测调整（§3）。
-5. 记忆配置落 `config.json` 还是 `tree.settings` 的 plugin 绑定库（§4.4）——默认 config.json，待 K 车道复用评估。
-6. L0「全量注入」的预算上限（字符 / token 双限），与压缩估算的叠加（§6 风险表）。
+首轮 D1~D4 见 [recon §7](agent-memory-recon.md)；本轮把侦察 §5 的待清项全部拍死：
+
+| ID | 拍板 | 落地位置 |
+| --- | --- | --- |
+| **D5** | L3 摘要**新写 `llm.call` 路径**，不改造 `CompactionService._summarize` | §5.2（新 `memory/l3_summarizer.dart`） |
+| **D6** | 向量作为条目字段存 `records.semdb`，不另建向量文件 | §4.1 |
+| **D7** | score 权重 `0.35/0.20/0.25/0.20`、L0 阈值 `0.6`、归档阈值 `0.15`、L0/L1/L2 半衰期 `frozen/180/30` 天、置信度缺省 `0.5` | §3 |
+| **D8** | L1 聚类判据由本方案定夺：tag 交集 ≥1 + 同 type 筛选、余弦 ≥0.82 同题、≥2 会话来源判可复用、无向量回退 Jaccard ≥0.6 | §5.4 |
+| **D9** | L0 注入预算 **4k token**（统一 token 口径），超预算按 score 裁剪、可 recall | §7.1 |
+| — | 记忆配置落 `config.json`（不复用 `tree.settings` 的 plugin 绑定库） | §4.4 |
+
+以上均为**默认值进配置**、可后续按模型池实测调整；调整走配置不改代码（D7 的权重 / 阈值、D8 的阈值、D9 的预算都是 `config.json` 字段）。
+
+**仍属实施细节（不阻塞、不需再拍板）**：D6 的 Float32List 在 semdb 里的具体编码、D5 摘要提示词文案、
+`pipeline.log` 的轮转策略——由 M1 / M3 切片按本仓既有口径（`write_queue` / `core_log_sink`）自行定夺。
