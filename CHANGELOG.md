@@ -19,6 +19,14 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **消息卡片改版：复制键落到正文下方的动作行、文字选区半透明**（**修改**
+  `plugins/tree.ui.default/lib/README.md` 不变量 11 与 29）：
+  - 模型卡片带一层极浅投影，底部新增**恒定占位**的动作行：复制键常驻行内、悬停淡入，
+    点完就地翻成「已复制」并在 1.4s 后复位，**不再弹 SnackBar、也不再浮在正文右上角压住第一行字**；
+    行高恒定 ⇒ 悬停进出与流式封口都不改气泡高度（窗口化列表的滚动补偿不被牵动）；
+  - 用户气泡右下角收一档（`AppRadius.md` → `AppRadius.xs`：聊天气泡的收角）；
+  - 文字选区改为**主题色 + 半透明薄涂**（浅色深主色 20% / 深色主题色 30%；原来深色写死
+    不透明 `#4DD0E1`）：选中范围看得见、正文不被吃掉，手柄仍是实色。
 - **任务栏归为同一个应用：核心与插件进程统一 AUMID**（**新增**
   `packages/tree_core/lib/src/plugin/README.md` 不变量 33、`plugins/tree.ui.default/lib/README.md` 不变量 35）：
   核心启动早期把自身 AUMID 设为 `Tree.Desktop`，并把 `TREE_APP_USER_MODEL_ID` 注入每个插件进程；
@@ -30,6 +38,10 @@
   `plugin-index.json` 拷进独立的 `dist/full-release/`，产出第二个 zip / 安装包；核心首次启动按
   「索引在 + 成品齐 + 字节数对 + 用户没写过这一条」把插件登记为 `enabled: true`。
   普通版仍不随包成品（②e 断言不变），两条发行链互不影响。
+- **插件进程统一托管进 Windows Job Object（无豁免）**（**新增**
+  `packages/tree_core/lib/src/plugin/README.md` 不变量 35）：核心创建
+  `KILL_ON_JOB_CLOSE` 作业，`PluginHost.start` / `UiHost.start` 拉起进程后立即 Assign
+  （含界面插件，无白名单）；核心崩溃或被强杀时插件与孙进程由内核统一收走。
 
 - **右栏「模型信息」窗改为「agent 配置」四 tab**（**修改** `plugins/tree.ui.default/lib/README.md`
   不变量 28，窗口 id `modelInfo` 保留）：
