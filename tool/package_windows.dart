@@ -26,6 +26,10 @@ import 'package:tree_protocol/tree_protocol.dart';
 ///   --version x.y.z    版本号（默认取 pubspec.yaml 里 + 之前的部分）
 ///   --iscc path          Inno Setup 的 ISCC.exe（默认自动探测 PATH 与常见安装目录）
 ///   --installer          额外编译 Inno Setup 安装包
+///   --bundle-plugins     额外产出「全量版」：把 build/plugins 里的全部插件成品 +
+///                        plugin-index.json 一起打进发行目录（首次启动自动登记启用）
+///   --plugins-dir dir     插件成品目录（默认 build/plugins；只在 --bundle-plugins 时用）
+///   --skip-plugins-build  全量版复用已有插件产物（不重跑 tool/build_plugins.dart）
 ///   --no-zip             只准备便携目录，不压缩
 ///   --skip-verify        跳过"启动打包好的核心读握手"自检
 Future<void> main(List<String> args) async {
@@ -280,8 +284,12 @@ Future<void> _package(List<String> args) async {
   }
 
   // ⑥ 可选：Inno Setup 安装包（本机没装 iscc 时给出手工命令，不假装成功）
+  //
+  // `--bundle-plugins` 也要用它（全量版是第二个安装包），所以 iscc 只探测一次。
+  final String iscc = (options.installer || options.bundlePlugins)
+      ? (options.iscc ?? _findIscc() ?? '')
+      : '';
   if (options.installer) {
-    final String iscc = options.iscc ?? _findIscc() ?? '';
     if (iscc.isEmpty) {
       stdout.writeln(
         '== 跳过安装包：没找到 ISCC.exe ==\n'
@@ -290,17 +298,111 @@ Future<void> _package(List<String> args) async {
         '/DReleaseDir="${releaseDir.path}" tool/installer/tree-desktop.iss',
       );
     } else {
-      stdout.writeln('== 编译安装包（$iscc）==');
-      final int code = await _runLive(iscc, <String>[
-        '/DAppName=$appName',
-        '/DAppExe=$appExeName',
-        '/DAppVersion=$version',
-        '/DReleaseDir=${releaseDir.path}',
-        'tool/installer/tree-desktop.iss',
+      await _buildInstaller(
+        iscc: iscc,
+        root: root.path,
+        appName: appName,
+        appExeName: appExeName,
+        version: version,
+        releaseDir: releaseDir.path,
+      );
+    }
+  }
+
+  // ⑦ 全量版：发行目录 + 全部插件成品 + plugin-index.json，产出第二个 zip / 安装包。
+  //
+  // 为什么不直接往 releaseDir 里塞：普通版的 ②e 断言（发行目录不许有插件成品）会红，
+  // 而且下一次 `--skip-build` 重跑也会带着上一轮的成品。这里复制一份独立目录，
+  // 两个版本互不污染。
+  String? fullZipPath;
+  String? fullReleasePath;
+  if (options.bundlePlugins) {
+    final String pluginsBuild =
+        options.pluginsDir ?? _join(root.path, 'build/plugins');
+    if (!options.skipPluginsBuild) {
+      stdout.writeln('== 编译全部插件（tool/build_plugins.dart）==');
+      final int code = await _runLive(dart, <String>[
+        'run',
+        'tool/build_plugins.dart',
+        '--out',
+        pluginsBuild,
       ], root.path);
       if (code != 0) {
-        await _fail('安装包编译失败（exit=$code）', code);
+        await _fail('插件构建失败（exit=$code）', code);
       }
+    }
+    final File pluginIndex = File(
+      _join(pluginsBuild, 'plugin-index.json'),
+    );
+    if (!pluginIndex.existsSync()) {
+      await _fail(
+        '找不到插件索引：${pluginIndex.path}\n'
+        '  先跑 `dart run tool/build_plugins.dart`（或去掉 --skip-plugins-build）。',
+        3,
+      );
+    }
+
+    fullReleasePath = _join(outDir.path, 'full-release');
+    final Directory fullRelease = Directory(fullReleasePath);
+    if (fullRelease.existsSync()) fullRelease.deleteSync(recursive: true);
+    _copyDirTree(Directory(releaseDir.path), fullRelease);
+    final Directory targetPlugins = Directory(
+      _join(fullReleasePath, 'plugins'),
+    )..createSync(recursive: true);
+    int copiedFiles = 0;
+    for (final FileSystemEntity entity
+        in Directory(pluginsBuild).listSync()) {
+      if (entity is! File) continue;
+      entity.copySync(_join(targetPlugins.path, _basename(entity.path)));
+      copiedFiles++;
+    }
+    stdout.writeln(
+      '   全量包：拷入 $copiedFiles 个插件文件 → ${targetPlugins.path}',
+    );
+    _assertBundledPluginsComplete(targetPlugins.path);
+
+    if (!options.noZip) {
+      fullZipPath = _join(
+        outDir.path,
+        'tree-desktop-$version-windows-x64-full.zip',
+      );
+      if (File(fullZipPath).existsSync()) File(fullZipPath).deleteSync();
+      stdout.writeln('== 打包全量版 zip（tar -a）==');
+      final int zipCode = await _runLive('tar', <String>[
+        '-a',
+        '-cf',
+        fullZipPath,
+        '-C',
+        fullRelease.parent.path,
+        _basename(fullRelease.path),
+      ], root.path);
+      if (zipCode != 0) {
+        await _fail('全量版压缩失败（exit=$zipCode）', zipCode);
+      }
+      stdout.writeln(
+        '   产物：$fullZipPath'
+        '（${(File(fullZipPath).lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
+      );
+    }
+
+    if (iscc.isEmpty) {
+      stdout.writeln(
+        '== 跳过全量版安装包：没找到 ISCC.exe ==\n'
+        '   手工执行：iscc /DAppName=$appName /DAppExe=$appExeName '
+        '/DAppVersion=$version /DReleaseDir="$fullReleasePath" '
+        '/DInstallerSuffix=-full '
+        'tool/installer/tree-desktop.iss',
+      );
+    } else {
+      await _buildInstaller(
+        iscc: iscc,
+        root: root.path,
+        appName: appName,
+        appExeName: appExeName,
+        version: version,
+        releaseDir: fullReleasePath,
+        installerSuffix: '-full',
+      );
     }
   }
 
@@ -311,7 +413,91 @@ Future<void> _package(List<String> args) async {
   stdout.writeln('  界面插件：$uiExe（+ plugin.json）');
   stdout.writeln('  核心：$coreExe');
   if (zipPath != null) stdout.writeln('  zip：$zipPath');
+  if (fullReleasePath != null) {
+    stdout.writeln('  全量版目录：$fullReleasePath（自带全部插件成品）');
+  }
+  if (fullZipPath != null) stdout.writeln('  全量版 zip：$fullZipPath');
   stdout.writeln('  数据目录（首次运行自动创建）：%APPDATA%\\Tree');
+}
+
+/// 调 ISCC 编安装包（普通版 / 全量版共用；差异只有发行目录与输出文件名）。
+Future<void> _buildInstaller({
+  required String iscc,
+  required String root,
+  required String appName,
+  required String appExeName,
+  required String version,
+  required String releaseDir,
+  String installerSuffix = '',
+}) async {
+  stdout.writeln('== 编译安装包（$iscc）==');
+  final int code = await _runLive(iscc, <String>[
+    '/DAppName=$appName',
+    '/DAppExe=$appExeName',
+    '/DAppVersion=$version',
+    '/DReleaseDir=$releaseDir',
+    if (installerSuffix.isNotEmpty) '/DInstallerSuffix=$installerSuffix',
+    'tool/installer/tree-desktop.iss',
+  ], root);
+  if (code != 0) {
+    await _fail('安装包编译失败（exit=$code）', code);
+  }
+}
+
+/// 递归复制目录（全量版从已排好版的 Release 复制一份，保持两个版本互不污染）。
+void _copyDirTree(Directory from, Directory to) {
+  to.createSync(recursive: true);
+  for (final FileSystemEntity entity in from.listSync()) {
+    final String target = _join(to.path, _basename(entity.path));
+    if (entity is Directory) {
+      _copyDirTree(entity, Directory(target));
+    } else if (entity is File) {
+      entity.copySync(target);
+    }
+  }
+}
+
+/// 全量版的完整性断言：索引里声明的每个成品都真在 `plugins/` 里，且字节数对得上。
+///
+/// 打包链自己再查一遍（核心首次启动也会查）：漏拷一个文件在用户机器上的表现是
+/// “这个插件第一次启动就失败”，而归因要翻到打包目录里找——在这里红掉最省事。
+void _assertBundledPluginsComplete(String pluginsDir) {
+  final String indexPath = _join(pluginsDir, 'plugin-index.json');
+  final File index = File(indexPath);
+  if (!index.existsSync()) {
+    throw StateError('全量版缺少插件索引：$indexPath');
+  }
+  final Object? decoded = jsonDecode(index.readAsStringSync());
+  final Object? rawPlugins = decoded is Map ? decoded['plugins'] : null;
+  if (rawPlugins is! List) {
+    throw StateError('全量版插件索引格式不对（缺少 plugins 数组）：$indexPath');
+  }
+  final Set<String> ids = <String>{};
+  for (final Object? item in rawPlugins) {
+    if (item is! Map) continue;
+    final String id = '${item['id'] ?? ''}';
+    ids.add(id);
+    final Object? files = item['files'];
+    if (files is! List || files.isEmpty) {
+      throw StateError('全量版索引条目 $id 没有 files 声明');
+    }
+    for (final Object? rawFile in files) {
+      if (rawFile is! Map) continue;
+      final String target = '${rawFile['target'] ?? ''}';
+      final File artifact = File(_join(pluginsDir, target));
+      if (!artifact.existsSync()) {
+        throw StateError('全量版缺少插件成品：$target（插件 $id）');
+      }
+      final int declared = (rawFile['bytes'] as num?)?.toInt() ?? 0;
+      if (declared > 0 && artifact.lengthSync() != declared) {
+        throw StateError(
+          '全量版插件成品字节数不符：$target'
+          '（${artifact.lengthSync()} ≠ $declared，插件 $id）',
+        );
+      }
+    }
+  }
+  stdout.writeln('   全量包自检：${ids.length} 个插件、成品齐且字节数一致');
 }
 
 /// 便携包内的使用说明（首次运行指引）。
@@ -1057,6 +1243,9 @@ class _Options {
     this.noZip = false,
     this.skipVerify = false,
     this.uiDir = 'plugins/tree.ui.default',
+    this.bundlePlugins = false,
+    this.pluginsDir,
+    this.skipPluginsBuild = false,
   });
 
   final String? flutter;
@@ -1072,6 +1261,15 @@ class _Options {
   /// UI 插件源码目录（相对仓根）。
   final String uiDir;
 
+  /// 是否额外产出「全量版」（全部插件成品随包）。
+  final bool bundlePlugins;
+
+  /// 插件成品目录（仅全量版使用；null = 仓根 `build/plugins`）。
+  final String? pluginsDir;
+
+  /// 全量版复用已有插件产物（不重跑 `tool/build_plugins.dart`）。
+  final bool skipPluginsBuild;
+
   static _Options parse(List<String> args) {
     String? flutter;
     String? iscc;
@@ -1083,6 +1281,9 @@ class _Options {
     bool installer = false;
     bool noZip = false;
     bool skipVerify = false;
+    bool bundlePlugins = false;
+    bool skipPluginsBuild = false;
+    String? pluginsDir;
     for (int i = 0; i < args.length; i++) {
       String value() => i + 1 < args.length ? args[++i] : '';
       switch (args[i]) {
@@ -1107,6 +1308,12 @@ class _Options {
           noZip = true;
         case '--skip-verify':
           skipVerify = true;
+        case '--bundle-plugins':
+          bundlePlugins = true;
+        case '--plugins-dir':
+          pluginsDir = value();
+        case '--skip-plugins-build':
+          skipPluginsBuild = true;
         case '--help':
         case '-h':
           throw const _UsageError(0);
@@ -1125,6 +1332,9 @@ class _Options {
       noZip: noZip,
       skipVerify: skipVerify,
       uiDir: uiDir,
+      bundlePlugins: bundlePlugins,
+      pluginsDir: pluginsDir,
+      skipPluginsBuild: skipPluginsBuild,
     );
   }
 }

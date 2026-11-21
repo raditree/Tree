@@ -33,6 +33,13 @@
   #define ReleaseDir "..\..\build\windows\x64\runner\Release"
 #endif
 
+; 输出文件名后缀由打包脚本传入：普通版空串，全量版 "-full"。
+; 注意 ISPP 的 {#...} 不会在 #define 的值里再展开一层，所以这里用后缀拼接，
+; 不要写成 OutputBaseFilename={#OutputBaseFilename}（会留下字面量 "{#AppVersion}"）。
+#ifndef InstallerSuffix
+  #define InstallerSuffix ""
+#endif
+
 [Setup]
 AppId={{8E1F1B7A-9C4D-4E2B-9F3A-2B6F5C7D4A10}
 AppName=Tree 桌面端
@@ -42,7 +49,7 @@ DefaultDirName={autopf}\Tree Desktop
 DefaultGroupName=Tree
 DisableProgramGroupPage=yes
 OutputDir=..\..\dist\installer
-OutputBaseFilename=tree-desktop-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=tree-desktop-{#AppVersion}-windows-x64{#InstallerSuffix}-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

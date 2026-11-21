@@ -299,6 +299,22 @@ Future<void> _warmUpPeripheralsAfterHandshake(
               // 播种失败不该拦住插件系统启动（最坏就是中转站没默认开）。
               log('播种默认内置插件失败（已忽略）：$error');
             }
+            // 2b) [seedBundledPlugins]：**全量版**安装包把全部插件成品与
+            //    `plugin-index.json` 一起放进 exe 同级 `plugins/`；这里按“文件真在
+            //    盘上 + 字节数对得上 + 用户没写过这一条”把它登记并启用。普通发行版
+            //    没有这份索引 ⇒ 空操作。
+            try {
+              final List<String> seededBundled = seedBundledPlugins(
+                store: builtinStore,
+                log: log,
+              );
+              if (seededBundled.isNotEmpty) {
+                log('已登记随包插件：${seededBundled.join('、')}');
+              }
+            } catch (error) {
+              // 登记失败不该拦住插件系统启动（最坏就是那几个插件要手开一次）。
+              log('登记随包插件失败（已忽略）：$error');
+            }
             // 3) [seedDesktopUiPlugin]：随安装包发布的默认界面（与核心同目录的
             //    `tree_ui.exe` + `plugin.json`）首次出现时登记一条 `runtime: ui`。
             //    少了这一步，新装机的 plugins.yaml 里根本没有界面这一条，核心

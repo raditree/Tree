@@ -25,6 +25,11 @@
   界面插件在 `runApp` 之前应用同一 id，多窗口因此归到同一个任务栏按钮。AUMID 是进程内 API
   （`SetCurrentProcessExplicitAppUserModelID`），核心不能替子进程设置，只能交 id；非 Windows /
   老插件 / FFI 失败均为空操作。
+- **全量版随包插件自动登记**（**新增** `packages/tree_core/lib/src/plugin/README.md` 不变量 34）：
+  `tool/package_windows.dart --bundle-plugins` 会先跑 `build_plugins`，把全部插件成品与
+  `plugin-index.json` 拷进独立的 `dist/full-release/`，产出第二个 zip / 安装包；核心首次启动按
+  「索引在 + 成品齐 + 字节数对 + 用户没写过这一条」把插件登记为 `enabled: true`。
+  普通版仍不随包成品（②e 断言不变），两条发行链互不影响。
 
 - **右栏「模型信息」窗改为「agent 配置」四 tab**（**修改** `plugins/tree.ui.default/lib/README.md`
   不变量 28，窗口 id `modelInfo` 保留）：

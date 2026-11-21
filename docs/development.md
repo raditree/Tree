@@ -256,14 +256,21 @@ dart run tool/build_agent.dart           # → build/agents/tree_agent-linux-{am
                                          #   交叉编译（--target-os/--target-arch，本仓 Dart 3.13.4 实测可用；
                                          #   首次会下载目标端 AOT 产物，约 2 分钟）
 
-# 插件仓（clone 在 `plugins/`）的七个成品 + 发布合同（见 §3.2）
-# ⚠ 出包前必须跑：`package_windows.dart` 只按 `build/plugins/plugin-index.json` 拷成品，
-#   索引不在就是“面板上能装、随包却没带”（它会打一行跳过，不会静默）
+# 插件仓（clone 在 `plugins/`）的全部成品 + 发布合同（见 §3.2）
+# 普通版**不随包**成品；只有 `--bundle-plugins`（全量版）会按这份索引把成品拷进
+# dist/full-release/plugins/。索引不在时全量版直接失败（不会静默出一份“少了插件”的包）
 dart run tool/build_plugins.dart
 
 # 安装包（需要 Inno Setup 6；iscc 不在 PATH 时用 --iscc 指定）
 dart run tool/package_windows.dart --installer
 dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+
+# 两个安装包一起出：普通版 + 全量版（全量版自带 build/plugins 里的全部插件成品）
+dart run tool/package_windows.dart --installer --bundle-plugins
+# 产物：
+#   dist/installer/tree-desktop-<版本>-windows-x64-setup.exe       （普通版）
+#   dist/installer/tree-desktop-<版本>-windows-x64-full-setup.exe  （全量版）
+#   dist/tree-desktop-<版本>-windows-x64.zip / ...-full.zip
 ```
 
 脚本替你做的、**必须由脚本做**的事（漏一个用户就会踩坑）：
@@ -275,32 +282,31 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
    不把空白按钮发给用户（代价：字体 18 KB → 1.6 MB，安装包约 +0.5 MB）；
 2. 用**同一个 SDK** 编译 `tree_core.exe` 并放进 Release 目录——发行版要求核心与界面 `tree_ui.exe` 同目录；
 3. 拷 `build/native_assets/windows/*.dll`（pdfrx 的 `pdfium.dll`）到 exe 旁边（native assets 不会自动进发行目录）；
-4. 拷**插件成品与开发指南** → 发行目录 `plugins/`（核心按**自身可执行文件同级**的
-   `plugins/<name>[.exe]` 解析内置插件）：成品按 `build/plugins/plugin-index.json` 里的
-   `files[].target` 逐条拷（那份索引是**装机端唯一读的合同**，打包链按同一份拷才能做到
-   “发布仓库有的，安装包也有”；自己扫目录就是第二份真相、两边一定会漂），另拷一份
-   `docs/plugin-development.md` → `plugins/plugin-development.md`（应用内「打开插件开发说明」
-   与核心播种到工作空间的那一份都找它）；2026-10-17：**不再拷 `examples/plugins/` 的 Python
-   脚本**（最后一份示例迁进插件仓后那个目录已删），配套的 `__pycache__`/`*.pyc` 过滤也跟着
-   删了——打包链不再产 Python 文件；
+4. 拷**插件开发指南** → 发行目录 `plugins/plugin-development.md`（应用内「打开插件开发说明」
+   与核心播种到工作空间的那一份都找它）。**普通版刻意不带插件成品**（2026-10-18 口径）：
+   成品只从发布仓库装，②e 的断言会在发行目录里发现成品时直接失败。要出「全量版」时加
+   `--bundle-plugins`：脚本先跑 `build_plugins`，把全部成品与 `plugin-index.json` 拷进
+   **另一份** `dist/full-release/`，核心首次启动按“索引在 + 成品齐 + 字节数对 + 用户没写过
+   这一条”自动登记并启用（插件 README 不变量 34）——两个版本目录互不污染；
 5. 写 `使用说明.txt`（数据目录、可手改的配置文件、常见问题）；
 6. **自检**：真启动一次打包好的核心，读到握手再让它优雅退出；
 7. 压 zip 到 `dist/`。
 
 安装包自检（本仓库验证过的流程）：静默装到临时目录 → 检查
 `Tree.exe` / `tree_core.exe` / `pdfium.dll` / `使用说明.txt` /
-**`plugins/tree_ssh_executor.exe`（中转站插件，与 `Tree.exe` 同级）** /
-**`plugins/` 里索引列出的那几条插件成品**（按 `build/plugins/plugin-index.json` 逐条点名，
-少一条就是面板上那个开关拉不上去）** /
-**`agents/tree_agent-linux-{amd64,arm64}`（目标机执行体，与 `plugins/` 同级）** 是否齐 →
-用装好的核心跑一遍冒烟与文件写路径测试 → 静默卸载并确认无残留。
+**`plugins/plugin-development.md`（插件开发指南）** /
+**`agents/tree_agent-linux-{amd64,arm64}`（目标机执行体，与 `plugins/` 同级）** 是否齐；
+普通版还要确认 **`plugins/` 下没有任何插件成品**（与打包链 ②e 断言同一口径）；
+全量版则反过来：按 `dist/full-release/plugins/plugin-index.json` 逐条点名，少一条就是
+面板上那个开关拉不上去 → 用装好的核心跑一遍冒烟与文件写路径测试 → 静默卸载并确认无残留。
 
 > **新目录是怎么进包的**：安装器用 `Source: "{#ReleaseDir}\*"` + `recursesubdirs createallsubdirs`
-> **整目录递归**，所以 `agents/` 与 `plugins/` 下的新文件**不需要改 `.iss`**；
-> 需要保证的只有"复制进发行目录"这一步 —— 那是 `tool/package_windows.dart` 的
-> `_copySshExecutorArtifacts`（`build/plugins/` 与 `build/agents/` → 发行目录），
-> 并在复制前**逐个校验产物里的版本串**（`_verifyBinaryVersion`）：与 `pubspec.yaml` 的版本
-> （`+` 之前那部分）不一致就**直接拒绝出包**并告诉你要先跑哪条构建命令。
+> **整目录递归**，所以 `agents/` 与 `plugins/` 下的新文件**不需要改 `.iss`**；需要保证的只有
+> “复制进发行目录”这一步 —— 普通版是插件开发指南与目标机 agent（`_copyPluginGuide` /
+> `_copyAgentArtifacts`），全量版额外由 `--bundle-plugins` 把 `build/plugins` 的全部成品与
+> `plugin-index.json` 拷进 `dist/full-release/plugins/`。目标机 agent 在复制前逐个校验产物里的
+> 版本串（`_verifyBinaryVersion`）：与 `pubspec.yaml` 的版本（`+` 之前那部分）不一致就
+> **直接拒绝出包**并告诉你要先跑哪条构建命令。
 > 为什么加这道闸：2026-10-11 出 1.0.3+2 时**忘了重编两份二进制**，包里因此装着 1.0.2 的插件与 agent
 > （目标机上出现 `~/.tree/agent/1.0.2/`），功能上完全看不出来 —— 这种"包名与包内容版本对不上"
 > 只能靠出包失败来拦。

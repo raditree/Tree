@@ -30,6 +30,7 @@ export 'src/plugin/agent_events.dart';
 export 'src/plugin/builtin_plugins.dart';
 export 'src/plugin/environment_commands.dart';
 export 'src/plugin/execute_mounts.dart';
+export 'src/plugin/bundled_plugins.dart';
 export 'src/plugin/plugin_bus.dart';
 export 'src/plugin/plugin_capability.dart';
 export 'src/plugin/plugin_config_store.dart';
