@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:tree_local_exec/tree_local_exec.dart';
 
 import '../util/app_user_model.dart';
+import '../util/win_job.dart';
 import 'plugin_host.dart' show PluginConfig, PluginException;
 
 /// UI 插件的进程宿主（片 D）。
@@ -106,6 +107,9 @@ class UiHost {
     } catch (error) {
       throw PluginException('启动 UI 插件 ${config.id} 失败：$error');
     }
+    // 无豁免：界面进程同样进作业。核心异常退出时界面一起收走，不留一个连不上
+    // 核心、token 已失效的孤儿窗口（启动器检测到界面消失会重开引导页）。
+    assignPluginProcessToJob(process.pid, log: log);
     return UiHost._(
       config,
       process,

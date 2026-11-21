@@ -7,6 +7,7 @@ import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
 
 import '../util/app_user_model.dart';
 import '../util/liveness.dart';
+import '../util/win_job.dart';
 import 'plugin_dependency.dart';
 import 'plugin_runtime.dart';
 import 'station_runtime.dart';
@@ -91,6 +92,9 @@ class PluginHost {
     } catch (error) {
       throw PluginException('启动插件 ${config.id} 失败：$error');
     }
+    // 统一生命周期：插件进程放进核心的 Job Object。核心无论怎么死（崩溃 /
+    // taskkill /F），作业句柄关闭都会连它之后 fork 的子进程一起由内核终止。
+    assignPluginProcessToJob(process.pid, log: log);
     final StringBuffer stderr = StringBuffer();
     // 同 MCP：协议是 UTF-8，但坏字节只顶替（U+FFFD）不中断通道。
     // 按**行**收口：内存尾巴与落盘日志（`PluginLogSink`）用同一条行边界，

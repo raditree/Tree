@@ -424,6 +424,15 @@
     条目只记录基线、本次不升级（没有历史签名无法证明未手改）。界面（`runtime: ui`）仍由
     `seedDesktopUiPlugin` 单独登记，两条路径不重叠。
 
+35. **插件进程统一托管进 Windows Job Object（无豁免）**（2026-11-21，
+    [win_job.dart](../util/win_job.dart)、[plugin_host.dart](plugin_host.dart)、
+    [ui_host.dart](ui_host.dart)）：
+    核心启动时创建带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的作业；`PluginHost.start` 与
+    `UiHost.start` 在 `Process.start` 之后立刻 `AssignProcessToJobObject`——**无头插件与界面
+    插件一律加入，没有豁免**。核心无论怎么死（崩溃 / `taskkill /F` / 强关控制台），作业句柄
+    随进程关闭，作业内进程连同之后 fork 的孙进程由内核统一终止；核心自己绝不加入该作业。
+    非 Windows / 创建或 Assign 失败一律降级为空操作，只记日志，不阻断插件启动。
+
 ## 测试
 
 ```bash
