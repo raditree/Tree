@@ -50,7 +50,8 @@ keywords      list[str]    # 检索关键词（来自草案）
 recall_cond   list[str]    # 召回条件（来自草案）
 score         object       # 见 §3
 embedding     list[float]? # 向量；无 embedding 模型时为空并标 degraded
-source        object       # {agent_id, session_id, msg_ids[], l3_id, created_from}
+source        object       # {agent_id, l3_id, created_from, sources: [{session_id, score, msg_ids[], at}]}
+              # sources 为多来源列表，各带该会话里这条记忆的 score（同一会话多次命中取最高分去重），供 L1 可复用累加判定（D10）
 created_at    ms
 updated_at    ms
 decay         object       # {half_life_days, last_decay_at, frozen} —— L0 frozen=true
@@ -147,17 +148,34 @@ L0 全量注入阈值 `0.6`；归档阈值 `score < 0.15`；置信度缺省降�
   3. 迁移成功写 `migrated.json`（含源文件 hash 与条目数），幂等；原文件**保留不删**（可回溯）。
 - 迁移失败不阻塞启动，写 `pipeline.log` + 一次性可读提示。
 
-### 4.4 配置项（UI 可调）
+### 4.4 配置项（**全部阈值都在 UI「agent 配置 → 记忆管理」页可配**，AGENT-MEM-D11）
 
-| 配置 | 默认 | 落点 |
+**拍板**：方案里出现的**每一个阈值 / 权重 / 预算 / TOP N 都是 `config.json` 字段**，没有硬编码常量；
+UI 的记忆管理页提供对应控件（数值输入 / 滑块），改完经 `PATCH .../memory/config` 即时落盘。
+管道读配置取"当轮快照"——配置变更在**下一次管道 tick / 下一次快照重建**生效，不追溯已钉住的快照（D1）。
+
+| 配置键 | 默认 | 语义 / 出处 |
 | --- | --- | --- |
-| `memory.embedding_model` | 空（无则不向量化，降级 lexical） | `config.json`（per agent） |
-| `memory.extract_llm_model` | 空（缺省用 agent 主模型） | `config.json` |
-| `memory.top_n.L1` / `memory.top_n.L2` | 10 / 10 | `config.json` |
-| `memory.weights.*` / `memory.half_life_days.*` / `memory.l0_threshold` | §3 默认 | `config.json` |
+| `memory.embedding_model` | 空 | 无则不向量化、降级 lexical（§5.3） |
+| `memory.extract_llm_model` | 空 | 空 = 用 agent 主模型（§5.2 D5） |
+| `memory.weights.importance` / `.confidence` / `.time` / `.relevance` | 0.35 / 0.20 / 0.25 / 0.20 | score 四维权（§3 D7） |
+| `memory.l0_threshold` | 0.6 | L0 全量注入阈值（§3 / §7.1） |
+| `memory.archive_threshold` | 0.15 | 低于此进 L4（§3 D7） |
+| `memory.confidence_default` | 0.5 | LLM 未给置信度时的降级值（§3 D7） |
+| `memory.half_life_days.L0` / `.L1` / `.L2` | frozen / 180 / 30 | 各层衰减半衰期（§3 D7） |
+| `memory.top_n.L1` / `.L2` | 10 / 10 | 快照注入条数（§2.1） |
+| `memory.l0_budget_tokens` | 4000 | L0 注入预算（§7.1 D9） |
+| `memory.reuse.min_sources` | 2 | L1 可复用最少来源会话数（§5.4 D10） |
+| `memory.reuse.min_score_sum` | 1.0 | L1 可复用来源 score 累加阈值（§5.4 D10） |
+| `memory.cluster.similarity` | 0.82 | 向量余弦同题阈值（§5.4 D8） |
+| `memory.cluster.lexical_jaccard` | 0.6 | 无向量降级 Jaccard 阈值（§5.4 D8） |
+| `memory.cluster.tag_overlap_min` | 1 | 聚类的 tag 交集下限（§5.4 D8） |
 
-配置经 `PATCH /api/agents/{agentId}/memory/config` 写入；下列模型 id 必须是模型池中
-`kind=embedding` / `kind=chat`，校验逻辑复用 `DomainSettings.validateModelChange`（`domain_settings.dart`）。
+- 模型 id 字段必须是模型池中 `kind=embedding` / `kind=chat`，校验复用 `DomainSettings.validateModelChange`（`domain_settings.dart`）；
+  数值字段做范围校验（权重和 = 1.0、半衰期 > 0、阈值 ∈ [0,1] 或 >0、budget > 0），校验失败回可读 400。
+- UI 记忆管理页按分组展示（score 权重 / 注入预算 / 衰减 / 聚类 / 可复用 / 模型），带"恢复默认"按钮
+  （默认值即表内值，写回 `config.json` 前 `delete` 对应键）。
+- 移动端式"高级"折叠：普通用户只调 TOP N / 预算 / 模型，权重与阈值收在高级区——但**都能改**（不做只读常量）。
 
 ---
 
@@ -196,10 +214,14 @@ L0 全量注入阈值 `0.6`；归档阈值 `score < 0.15`；置信度缺省降�
 - **候选筛选**：L2 条目创建后，按 `tag` 交集 ≥ 1 **且** `type` 相同筛出 L1 池候选，再算向量相似度。
 - **同题阈值**：余弦 ≥ `0.82` 判为"同一件事"→ 走合并 / 修正流程（同 §5.2 步骤 4）；
   `< 0.82` 视为新主题，新建 L1 条目。
-- **可复用判定**：某 L1 条目的 `source.session_ids` 覆盖 ≥ 2 个不同会话 ⇒ 认定为"跨会话可复用"，
-  进入快照 L1 TOP N 池；只有 1 个会话来源的留在 L2 池（不进 L1 注入段）。
+- **可复用判定（AGENT-MEM-D10，用户 2026-11 修订）**：某 L1 条目的 `source.sources` 去重来源
+  **≥ 2 个会话**，且**各来源 score 累加 `Σsource.score > reuse_min_score`**（默认 `1.0`）⇒ 才认定为
+  "跨会话可复用"，进入快照 L1 TOP N 池；不满足的留在 L2 池（不进 L1 注入段）。
+  - 默认值 `1.0` 的理由：相当于两来源平均 score ≥ 0.5，与 L0 注入阈值 0.6、归档阈值 0.15 形成梯度；
+    时间衰减会让老来源分数下降，门槛不宜再高；只数来源数会把"在多会话里都平庸"的记忆误抬成长期记忆。
+  - 每个 `source.sources[]` 带该来源会话里这条记忆的 score（同一会话多次命中取最高分），累加用它。
 - **聚类粒度**：L1 一条 = 一个可复用结论（一点一条），不按会话聚合；多会话来源记在同一条目的
-  `source.session_ids`（去重）。
+  `source.sources[]`（按 session_id 去重）。
 - **无向量降级**：无 embedding 时用 tag 交集 + keywords Jaccard ≥ `0.6` 替代余弦，标 `degraded`（与 §5.3 一致）。
 
 ### 5.3 失败与降级（红线：不留静默失败）
@@ -298,7 +320,7 @@ tree.agent 在 `kDeclaredRoutes` + `system.collect.api.routes` 追加（路径�
 | --- | --- | --- |
 | 模型配置 | 现有模型下拉 / 参数覆盖 / 模型 info 卡 + **新增** embedding 模型、提取 LLM 两个选择器 | `ModelInfoPanel` 现有逻辑（仅列 kind=chat）+ 模型池按 kind 过滤 |
 | 工具配置 | 现有工具勾选 + tool_groups | 原样迁入 |
-| 记忆管理 | 向量搜索 / 手动创建 / 编辑 / 删除（移入 L4）/ L4 归档浏览 / 管道状态 | 新 REST §8 |
+| 记忆管理 | 向量搜索 / 手动创建 / 编辑 / 删除（移入 L4）/ L4 归档浏览 / 管道状态；**全部阈值配置控件**（score 权重 / L0 阈值与 4k 预算 / 归档阈值 / 半衰期 / TOP N / 聚类余弦与 Jaccard / 可复用来源数与累加阈值 / 模型选择），分组展示 + 高级折叠 + 恢复默认 | 新 REST §8（含 `PATCH .../memory/config`）；字段全集见 §4.4 |
 | 系统提示词 | 上半编辑自己的提示词源（`agent.system_prompt`），下半只读快照查看器 | §7.2 |
 
 - 旧 `.self/system_prompt.md` 的重置按钮（`file_panel.dart` / `api_service.dart:2565` reset）改为
@@ -336,7 +358,7 @@ M1~M5 按上表顺序推进，与车道 H（生产线）无文件区域冲突（
 
 ---
 
-## 11. 追加拍板记录（AGENT-MEM-D5~D9，2026-11 用户定稿）
+## 11. 追加拍板记录（AGENT-MEM-D5~D11，2026-11 用户定稿）
 
 首轮 D1~D4 见 [recon §7](agent-memory-recon.md)；本轮把侦察 §5 的待清项全部拍死：
 
@@ -345,11 +367,13 @@ M1~M5 按上表顺序推进，与车道 H（生产线）无文件区域冲突（
 | **D5** | L3 摘要**新写 `llm.call` 路径**，不改造 `CompactionService._summarize` | §5.2（新 `memory/l3_summarizer.dart`） |
 | **D6** | 向量作为条目字段存 `records.semdb`，不另建向量文件 | §4.1 |
 | **D7** | score 权重 `0.35/0.20/0.25/0.20`、L0 阈值 `0.6`、归档阈值 `0.15`、L0/L1/L2 半衰期 `frozen/180/30` 天、置信度缺省 `0.5` | §3 |
-| **D8** | L1 聚类判据由本方案定夺：tag 交集 ≥1 + 同 type 筛选、余弦 ≥0.82 同题、≥2 会话来源判可复用、无向量回退 Jaccard ≥0.6 | §5.4 |
+| **D8** | L1 聚类判据由本方案定夺：tag 交集 ≥1 + 同 type 筛选、余弦 ≥0.82 同题、无向量回退 Jaccard ≥0.6 | §5.4 |
 | **D9** | L0 注入预算 **4k token**（统一 token 口径），超预算按 score 裁剪、可 recall | §7.1 |
+| **D10** | **L1 可复用判据修订**：来源 ≥2 会话**且各来源 score 累加 > 阈值**（默认 `1.0`，即平均 ≥0.5）；`source` 扩为带 score 的多来源列表 | §5.4 / §2.2 |
+| **D11** | **所有阈值 / 权重 / 预算 / TOP N 都在 UI「agent 配置 → 记忆管理」页可配**，无硬编码常量；配置落 `config.json`，下次 tick / 快照重建生效 | §4.4 / §9.1 |
 | — | 记忆配置落 `config.json`（不复用 `tree.settings` 的 plugin 绑定库） | §4.4 |
 
-以上均为**默认值进配置**、可后续按模型池实测调整；调整走配置不改代码（D7 的权重 / 阈值、D8 的阈值、D9 的预算都是 `config.json` 字段）。
+以上均为**默认值进配置**、可后续按模型池实测调整；调整走配置不改代码（D7 的权重 / 阈值、D8 的阈值、D9 的预算、D10 的累加阈值都是 `config.json` 字段）。
 
 **仍属实施细节（不阻塞、不需再拍板）**：D6 的 Float32List 在 semdb 里的具体编码、D5 摘要提示词文案、
 `pipeline.log` 的轮转策略——由 M1 / M3 切片按本仓既有口径（`write_queue` / `core_log_sink`）自行定夺。
