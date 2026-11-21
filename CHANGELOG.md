@@ -19,6 +19,12 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **工具读到的图像写进会话库，后面轮次能回放**（**修改** `plugins/tree.agent/README.md`
+  的 `read`/图像口径）：`ToolOutcome.images` 改成带字节的 `ToolImagePayload{path, mime, base64}`
+  （工具侧 4 MiB base64 上限，超了只报尺寸与字节数）；`AgentToolEnd.images` 用纯 Map 过境，
+  `ConversationService` 落成 `CoreMessage.toolResultImages`（键 `tool_result_images`，非空才写）；
+  重建历史时在那一批 tool 结果之后按内联 data URL 回放（每轮 ≤ 4 张，`if_vision` 关则不塞图）。
+  上传走不通时改用**手里那份字节**内联，不再降级成"看不见"。
 - **Markdown 的选择是一棵树，不再按块切碎**（**修改** `plugins/tree.ui.default/lib/README.md`
   不变量 11）：`MarkdownView` 不再用 markdown 包自带的 `selectable: true`（「每块一个
   `SelectableText`」，跨块拖选在块边界就断、Ctrl+C 只拿到半截），改成 `selectable: false` +
