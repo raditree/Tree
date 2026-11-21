@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:tree_local_exec/tree_local_exec.dart';
 
+import '../util/app_user_model.dart';
 import 'plugin_host.dart' show PluginConfig, PluginException;
 
 /// UI 插件的进程宿主（片 D）。
@@ -88,6 +89,9 @@ class UiHost {
           // （界面里起的子进程 / 打开的终端才不会丢用户 PATH），再叠配置与核心端点。
           ...await cachedLoginEnvironment(log: log),
           ...config.env,
+          // 统一应用标识：界面进程按它设置 AUMID，多窗口才会归到同一个
+          // 任务栏按钮（AUMID 是进程内 API，核心只能把 id 交下去）。
+          kAppUserModelIdEnv: kAppUserModelId,
           'TREE_CORE_URL': coreUrl,
           'TREE_CORE_TOKEN': coreToken,
           // 数据根：UI 的用量账本 / 核心日志入口靠它拼路径（`<数据根>/data/...`）。

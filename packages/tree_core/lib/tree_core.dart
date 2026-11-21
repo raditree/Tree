@@ -73,6 +73,7 @@ export 'src/store/tree_store.dart';
 export 'src/store/usage_log.dart';
 export 'src/store/write_queue.dart';
 export 'src/store/yaml_codec.dart';
+export 'src/util/app_user_model.dart';
 export 'src/util/core_log_sink.dart';
 export 'src/util/ids.dart';
 export 'src/util/plugin_log_sink.dart';

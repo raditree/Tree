@@ -405,6 +405,14 @@
     用例：`plugin_config_api_test.dart`（卸载三条 + 四路由 503）、
     `plugin_downloader_test.dart`（三来源并集 / 解释器不碰 / 只删存在的）。
 
+33. **插件进程环境固定注入统一应用标识 `TREE_APP_USER_MODEL_ID`**（2026-11-21，
+    [plugin_host.dart](plugin_host.dart)、[ui_host.dart](ui_host.dart)）：
+    核心在启动早期把自身 AUMID 设为 `Tree.Desktop`，并把同一 id 注入**每个**插件进程的环境
+    （`plugin_host.dart` / `ui_host.dart` 的 `Process.start`），值不接受 `config.env` 覆盖。
+    AUMID 是进程内 API（`SetCurrentProcessExplicitAppUserModelID`），核心不能替子进程设置，
+    只能把 id 交下去；插件在自己的启动例程里应用它——界面多窗口因此归到同一个任务栏按钮。
+    没读这个变量的老插件照旧工作（空操作）。
+
 ## 测试
 
 ```bash

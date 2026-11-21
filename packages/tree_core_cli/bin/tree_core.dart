@@ -33,6 +33,9 @@ import 'package:tree_local_exec/tree_local_exec.dart';
 ///   -v, --version          打印版本
 ///   -h, --help             打印用法
 Future<void> main(List<String> args) async {
+  // 统一任务栏 / 通知的应用身份：必须赶在任何窗口之前（Windows 进程内口径）。
+  // 插件进程拿到的是同一个 id（`TREE_APP_USER_MODEL_ID`），各自在启动时应用。
+  applyAppUserModelId();
   if (args.contains('-v') || args.contains('--version')) {
     stdout.writeln(TreeCore.version);
     return;

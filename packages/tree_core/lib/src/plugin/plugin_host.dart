@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:tree_local_exec/tree_local_exec.dart';
 import 'package:tree_protocol/tree_protocol.dart' show PluginRpcMethods;
 
+import '../util/app_user_model.dart';
 import '../util/liveness.dart';
 import 'plugin_dependency.dart';
 import 'plugin_runtime.dart';
@@ -81,6 +82,9 @@ class PluginHost {
         environment: <String, String>{
           ...await cachedLoginEnvironment(log: log),
           ...config.env,
+          // 统一应用标识：插件在自己的启动例程里据此设置 AUMID（进程内 API，
+          // 核心替它设不了）。没读这个变量的老插件照旧工作。
+          kAppUserModelIdEnv: kAppUserModelId,
         },
         runInShell: Platform.isWindows && _needsShell(config.command),
       );

@@ -19,6 +19,13 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **任务栏归为同一个应用：核心与插件进程统一 AUMID**（**新增**
+  `packages/tree_core/lib/src/plugin/README.md` 不变量 33、`plugins/tree.ui.default/lib/README.md` 不变量 35）：
+  核心启动早期把自身 AUMID 设为 `Tree.Desktop`，并把 `TREE_APP_USER_MODEL_ID` 注入每个插件进程；
+  界面插件在 `runApp` 之前应用同一 id，多窗口因此归到同一个任务栏按钮。AUMID 是进程内 API
+  （`SetCurrentProcessExplicitAppUserModelID`），核心不能替子进程设置，只能交 id；非 Windows /
+  老插件 / FFI 失败均为空操作。
+
 - **右栏「模型信息」窗改为「agent 配置」四 tab**（**修改** `plugins/tree.ui.default/lib/README.md`
   不变量 28，窗口 id `modelInfo` 保留）：
   - 四个 tab：模型配置 / 工具配置 / 记忆管理 / 系统提示词；子面板 `IndexedStack` 常挂，
