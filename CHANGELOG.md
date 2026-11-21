@@ -19,6 +19,11 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **Markdown 的选择是一棵树，不再按块切碎**（**修改** `plugins/tree.ui.default/lib/README.md`
+  不变量 11）：`MarkdownView` 不再用 markdown 包自带的 `selectable: true`（「每块一个
+  `SelectableText`」，跨块拖选在块边界就断、Ctrl+C 只拿到半截），改成 `selectable: false` +
+  外层一个 `SelectionArea`——段落 / 标题 / 引用 / 表格 / 代码块同属一个选区；代码块因此改用
+  `Text.rich`（自建 `SelectableText` 会在选择树里另立一块）。链接点击不受影响（真点击用例钉住）。
 - **`read` 给二进制留出「看得见内容」的两条路**（**修改** `plugins/tree.agent/README.md`
   的工具口径，`ToolOutcome.images` 为新增通道）：
   - 按字节取：`read` 带 `offset` / `length` 时走执行站的 `raw` 通道，回
