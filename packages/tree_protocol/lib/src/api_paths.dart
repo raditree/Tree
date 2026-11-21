@@ -86,6 +86,32 @@ abstract final class ApiPaths {
   /// 重连是判死**之后**的动作，不引入任何静态时长上限。
   static const String agentSshReconnect = '/api/agents/{agentId}/ssh/reconnect';
 
+  // ── 分级记忆（AGENT-MEM，tree.agent 承接，D1~D11）──────────────────────
+  /// 记忆条目列表 / 手动新建（GET / POST）。
+  static const String agentMemory = '/api/agents/{agentId}/memory';
+
+  /// 单条记忆：编辑 / 修正（PATCH，version 自增）/ 移入 L4（DELETE）。
+  ///
+  /// 路径段名 `{memoryId}`；**不与 `/memory-config` 冲突**（后者是独立字面段）。
+  static const String agentMemoryItem = '/api/agents/{agentId}/memory/{memoryId}';
+
+  /// 记忆检索（POST：向量 / 混合，含 include_archive / query）。
+  static const String agentMemorySearch = '/api/agents/{agentId}/memory/search';
+
+  /// 记忆配置读写（GET / PATCH）。
+  ///
+  /// 刻意不用 `/memory/config`：`{memoryId}` 占位符会把 "config" 当成 id，
+  /// 因此配置用独立的 `memory-config` 段（一刀切不产生歧义）。
+  static const String agentMemoryConfig = '/api/agents/{agentId}/memory-config';
+
+  /// 管道状态（GET：上次消化水位 / 失败计数 / 降级标记）。
+  static const String agentMemoryPipeline =
+      '/api/agents/{agentId}/memory/pipeline/status';
+
+  /// 系统提示词快照只读查看器（GET）。
+  static const String promptSnapshot =
+      '/api/agents/{agentId}/sessions/{sessionId}/prompt-snapshot';
+
   // ── 执行器插件承接（非 delegated 契约集，仅登记前端调用面）─────────────
   /// 终端会话（`local_executor` / `ssh_executor` 插件申报）。
   ///
@@ -526,6 +552,16 @@ abstract final class ApiPaths {
     'POST $agentReset',
     'POST $agentCompact',
     'POST $agentSshReconnect',
+    // 分级记忆（9，AGENT-MEM：条目 5 + 配置 2 + 管道 1 + 快照 1）
+    'GET $agentMemory',
+    'POST $agentMemory',
+    'PATCH $agentMemoryItem',
+    'DELETE $agentMemoryItem',
+    'POST $agentMemorySearch',
+    'GET $agentMemoryConfig',
+    'PATCH $agentMemoryConfig',
+    'GET $agentMemoryPipeline',
+    'GET $promptSnapshot',
     // 提问（2）
     'GET $questions',
     'POST $questionAnswer',
@@ -668,6 +704,13 @@ abstract final class ApiPaths {
     agentReset,
     agentCompact,
     agentSshReconnect,
+    // 分级记忆（6 条路径；9 条方法路由）
+    agentMemory,
+    agentMemoryItem,
+    agentMemorySearch,
+    agentMemoryConfig,
+    agentMemoryPipeline,
+    promptSnapshot,
     questions,
     questionAnswer,
     files,

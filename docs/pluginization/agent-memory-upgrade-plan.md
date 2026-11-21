@@ -151,7 +151,7 @@ L0 全量注入阈值 `0.6`；归档阈值 `score < 0.15`；置信度缺省降�
 ### 4.4 配置项（**全部阈值都在 UI「agent 配置 → 记忆管理」页可配**，AGENT-MEM-D11）
 
 **拍板**：方案里出现的**每一个阈值 / 权重 / 预算 / TOP N 都是 `config.json` 字段**，没有硬编码常量；
-UI 的记忆管理页提供对应控件（数值输入 / 滑块），改完经 `PATCH .../memory/config` 即时落盘。
+UI 的记忆管理页提供对应控件（数值输入 / 滑块），改完经 `PATCH .../memory-config` 即时落盘。
 管道读配置取"当轮快照"——配置变更在**下一次管道 tick / 下一次快照重建**生效，不追溯已钉住的快照（D1）。
 
 | 配置键 | 默认 | 语义 / 出处 |
@@ -298,10 +298,12 @@ tree.agent 在 `kDeclaredRoutes` + `system.collect.api.routes` 追加（路径�
 | PATCH | `/api/agents/{agentId}/memory/{memoryId}` | 编辑 / 修正（自动 version+1） |
 | DELETE | `/api/agents/{agentId}/memory/{memoryId}` | 移入 L4 |
 | POST | `/api/agents/{agentId}/memory/search` | 向量 / 混合检索（含 `include_archive` / `query`） |
-| GET | `/api/agents/{agentId}/memory/config` | 读记忆配置 |
-| PATCH | `/api/agents/{agentId}/memory/config` | 写记忆配置 |
+| GET | `/api/agents/{agentId}/memory-config` | 读记忆配置 |
+| PATCH | `/api/agents/{agentId}/memory-config` | 写记忆配置 |
 | GET | `/api/agents/{agentId}/sessions/{sessionId}/prompt-snapshot` | 只读快照查看器 |
 | GET | `/api/agents/{agentId}/memory/pipeline/status` | 管道状态（上次消化水位 / 失败计数 / 降级标记） |
+
+> **路径歧义修正（M2 实施）**：配置端点刻意用 `memory-config` 而非 `memory/config`——后者与 `memory/{memoryId}` 段数相同，`{memoryId}` 占位符会把 "config" 当成记忆 id，PATCH 会误走「修正记忆」。同理 `memory/search` 也需在 item 分支显式排除 search 保留段。两处回归钉子见 `memory_delegate_test.dart`。
 
 - `packages/tree_protocol/lib/src/api_paths.dart`：上述加入 `delegated` 集合（`contractRoutes` 自动包含）；
   核心 `coreOwned` 35 条不动。
@@ -320,7 +322,7 @@ tree.agent 在 `kDeclaredRoutes` + `system.collect.api.routes` 追加（路径�
 | --- | --- | --- |
 | 模型配置 | 现有模型下拉 / 参数覆盖 / 模型 info 卡 + **新增** embedding 模型、提取 LLM 两个选择器 | `ModelInfoPanel` 现有逻辑（仅列 kind=chat）+ 模型池按 kind 过滤 |
 | 工具配置 | 现有工具勾选 + tool_groups | 原样迁入 |
-| 记忆管理 | 向量搜索 / 手动创建 / 编辑 / 删除（移入 L4）/ L4 归档浏览 / 管道状态；**全部阈值配置控件**（score 权重 / L0 阈值与 4k 预算 / 归档阈值 / 半衰期 / TOP N / 聚类余弦与 Jaccard / 可复用来源数与累加阈值 / 模型选择），分组展示 + 高级折叠 + 恢复默认 | 新 REST §8（含 `PATCH .../memory/config`）；字段全集见 §4.4 |
+| 记忆管理 | 向量搜索 / 手动创建 / 编辑 / 删除（移入 L4）/ L4 归档浏览 / 管道状态；**全部阈值配置控件**（score 权重 / L0 阈值与 4k 预算 / 归档阈值 / 半衰期 / TOP N / 聚类余弦与 Jaccard / 可复用来源数与累加阈值 / 模型选择），分组展示 + 高级折叠 + 恢复默认 | 新 REST §8（含 `PATCH .../memory-config`）；字段全集见 §4.4 |
 | 系统提示词 | 上半编辑自己的提示词源（`agent.system_prompt`），下半只读快照查看器 | §7.2 |
 
 - 旧 `.self/system_prompt.md` 的重置按钮（`file_panel.dart` / `api_service.dart:2565` reset）改为
