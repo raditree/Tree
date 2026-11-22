@@ -109,7 +109,7 @@
 **3.1.2 逻辑模式（Sembast 两 store 映射）**
 
 - `messages_display` store（列表页只读这张，记录小、可整段缓存）：key = `seq`（INTEGER，(agent,session) 内单调，**排序唯一依据**，替代 timestamp 排序），value 字段：
-  `session_id` / `msg_id` / `role` / `kind` / `timestamp` / `tool_name` / `tool_call_id` / `preview`（写入侧预生成的工具一行关键值，toolLineValue 前移）/ `content`（仅 kind=text 存正文——气泡即显示数据；tool/thinking 置空）/ `tool_running` / `answered` / `llm_hidden` / `subagent_id` / `subagent_name` / `subagent_level`。
+  `session_id` / `msg_id` / `role` / `kind` / `timestamp` / `tool_name` / `tool_call_id` / `preview`（写入侧预生成的一行摘要：工具取关键参数、thinking 取首行截断 40 字——切 agent 重载历史后卡片仍有一行内容）/ `content`（仅 kind=text 存正文——气泡即显示数据；tool/thinking 置空）/ `tool_running` / `answered` / `llm_hidden` / `subagent_id` / `subagent_name` / `subagent_level`。
   建 `(session_id, seq)` 索引（`useIndex` + `Sorter`）；`all` 视图 = 全 store 按 seq 有序读。
 - `messages_detail` store（点击才查）：key = `msg_id`，value = `{ payload }`（JSON：tool_arguments / tool_result / tool_arguments_raw / tool_result_for_model / thinking 正文 / attachments / questions / usage）。
 - `total`/`offset`/`has_more` 端点响应形状不变（display store `count(finder)` + seq 游标分页），UI 协议向后兼容。
@@ -141,13 +141,13 @@
 - **run** = 槽位表中连续的「**已完成工具 + 思考段**」段（`kind=='tool'` 或 `kind=='thinking'`），**含至少 1 条已完成工具即折叠**（定案 2026-11-01 二轮：「要不有就折叠」——展开不费事，用户主要想看的是文本消息而非具体工具调用；即使只有一次工具调用也赚了，因为组内思考段连带一起折叠）；
 - **分隔标志** = run 被"真正的中途消息"打断即闭合——即模型**文本正文**（kind=text）、用户消息、`ask_user_question`、`subagent_report`；**thinking 不再充当分隔，被吸收进组**；
 - **纯思考段**（组内只有 thinking）同样折叠（定案三轮：「收」），文案「折叠 m 段思考，点击展开 >」，无类型简述；
-- 跑着的/流式的工具与流式中的 thinking **永不参与折叠**（用户要看得见进行中状态），组在其边界闭合；`ask_user_question` 永不折叠（需作答）。
+- 跑着的/流式的工具与流式中的 thinking **永不参与折叠**（用户要看得见进行中状态），组在其边界闭合；`ask_user_question` 永不折叠（需作答）。**2026-11-22 修订**：agent 工作期间，底部 5 张工具/思考卡片一律豁免折叠（不只是正在运行的那一张），收工后恢复「有就折叠」。
 
 **3.2.2 折叠行与展开**
 
 - 折叠行文案：**「折叠 n 次工具调用（edit×a · write×b · terminal×c · grep×d · …）[· 含 m 段思考]，点击展开 >」**——n = 组内工具条数；括号内是**干了啥的简述**：按工具类型计数，类型口径复用既有 `toolLabel`/`toolStyleOf` 的分类（read/edit/write/terminal/grep/search…）；类型过多时按条数降序保留前几项、其余并入 `等×m`，整行超长走单行 ellipsis；组内思考段 m>0 时追加「含 m 段思考」（思考只计数、不分型，展开时随组一并显示）；**纯思考组**（无工具）文案为「折叠 m 段思考，点击展开 >」。
 - **简述零后端成本**：计数由渲染层对 run 内显示行现算——`tool_name` 本来就在显示数据里，详细数据不碰。单行高度，样式对齐 ToolCallCard 一行式。
-- **展开只有一处、只在中栏原地**：点击折叠行 → run 就地展开为 n 行；再次点击 → 收起。**全局同时只允许一个展开组**——点开新组时旧组自动收起（这就是"保持只有一处展开"与"别反倒成累赘"的落实：展开态是 O(1) 的单个 runId，渲染负担上限 = 一个 run + 视口）。
+- **展开只有一处、只在中栏原地**：点击折叠行 → run 就地展开为 n 行；再次点击 → 收起。**2026-11-22 修订**：全局**至多同时展开两个**组——点开第三个时，最早展开的那组自动收起（展开态是 O(1) 的 id + 下标小列表，渲染负担上限 = 两个 run + 视口）。
 - 与右栏详情的关系：折叠展开 = 中栏列出 n 行；点开单行详情 = 仍走 DetailSelection → 右栏（§3.1.3 改为即查库）。**两个动作不合并**：折叠展开绝不往右栏推，右栏也永不出现"展开折叠组"的入口。
 - **展开/收起锚点不变量（用户三轮点名，TC-COLLAPSE-01）**：折叠行以下方内容增长为唯一效果——折叠行在视口内时，展开/收起**不得让折叠行上方的内容产生任何位移**（高度增量只作用于组自身区域）；组横跨视口顶时，上方增量必须用既有 `padAboveStamp` 路径**精确补偿，净位移仍为 0**。不新造机制、不触发滚底/重锚。
 - run 索引表增量维护（监听槽位表变更：place/appendTail/evict/resetTail 五个入口各打一次标记），**不做每帧全表扫描**。
@@ -163,7 +163,7 @@
 | F1 存储 | Sembast store 实现、写读路径、jsonl 迁移、详情端点 | `plugins/tree.agent/lib/src/store/*`、`session_store.dart`、`conversation_store.dart`、`delegate.dart`、`tree.agent/pubspec.yaml`、`verify_agent_equivalence.dart` |
 | F2 协议/核心 | 路由申报 +1、契约文档与路由基线口径更新 | `agent_api_contract.md`、`system.collect.api.routes` 申报处 |
 | F3 UI 显示/详细 | DisplayMessage 拆分、显示缓存 ≤9999、点击即查详情（不缓存）、队友窗口接入 | `api_service.dart`、`models/message.dart`、`message_panel.dart`、`detail_selection.dart`、`right_panel_host.dart`、`teammates_window_page.dart` |
-| F4 UI 折叠 | run 映射层、折叠行组件、单展开态、**TC-COLLAPSE-01** | `message_list.dart`、`message_window.dart`（索引标记）、新 widget、`test/message_collapse_test.dart` |
+| F4 UI 折叠 | run 映射层、折叠行组件、至多两展开态、**TC-COLLAPSE-01** | `message_list.dart`、`message_window.dart`（索引标记）、新 widget、`test/message_collapse_test.dart` |
 
 **TC-COLLAPSE-01（用户 2026-11-01 三轮点名，必须包含）**：构造 100 条混杂消息（工具调用多种类型 × 文本 × 思考 × 提问交错），滚动到第 50 条位置、该处有连续若干次工具调用——点击展开后，**上方内容不发生任何位移**；再次折叠后，**上方内容仍不发生任何位移**。判定口径：取折叠行上方各行在渲染树中的像素 top，展开前/展开后/收起后三次采样逐行对比，差值必须为 0（widget test，`_builtTopsFromRenderTree` 现成可用，见 message_list.dart L666）。
 
@@ -186,7 +186,7 @@
 - **Q3**：采纳——显示缓存上限 9999 条；**2026-11-10 修正**：首屏不再按上限一次拉满，改为只拉末尾 `kInitialDisplayRows=200`、更早段交给窗口补拉 + 淘汰（长会话一次装满是 AppHang 根因，见 known-issues #47 / §3.1.4）。
 - **Q4（三轮定案，覆盖首轮 n>3）**：**有就折叠**——run 含 ≥1 条已完成工具即折叠；**思考段连带入组**（分隔标志只剩模型文本正文/用户消息/提问/汇报）；**纯思考段同样折叠**（「折叠 m 段思考，点击展开 >」）；折叠行追加**干了啥简述**（按工具类型计数 edit/write/terminal/grep/etc，渲染层现算）+「含 m 段思考」，§3.2。
 - **TC-COLLAPSE-01**（三轮点名）：100 条混杂消息滚到第 50 条处展开/收起，**上方内容两次都零位移**——已写入 §3.2.2 锚点不变量与 §4 F4 验收，实施漏掉即打回。
-- **Q5**：采纳——全局同时只展开一个折叠组，展开仅在中栏原地。「有就折叠」后几乎每段工具区都是组，**这条是渲染负担不回退的唯一保险，实施必须落实**。
+- **Q5**：采纳——全局同时只展开一个折叠组，展开仅在中栏原地。「有就折叠」后几乎每段工具区都是组，**这条是渲染负担不回退的唯一保险，实施必须落实**。（**2026-11-22 用户修订为至多两个**：一个不够用；超出时收最早展开的那组。）
 - **Q6**：作废——纯 Dart 方案无 native dll 打包问题。
 - **Q7**：采纳——jsonl 迁移后改名保留一个发布周期。
 
