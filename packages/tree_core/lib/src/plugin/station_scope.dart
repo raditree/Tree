@@ -308,9 +308,7 @@ abstract final class StationIsolation {
       // 订阅者只要自己的 mode 声明合法就收（team 留空 = 通配所有 team）。
       // 安全性由消息侧保证——只有核心能构造这个信封，且载荷不含 team 私有数据。
       if (!subscriber.isValidSubscriber) {
-        return StationIsolationVerdict.rejected(
-          '订阅者的 mode_key=${subscriber.modeKey} 非法（只能是 local | ssh，或留空表示通配）',
-        );
+        return _invalidSubscriberMode('订阅者', subscriber);
       }
       return const StationIsolationVerdict.ok();
     }
@@ -355,6 +353,22 @@ abstract final class StationIsolation {
   /// 空串占位（可读错误里用 ? 表示「未知/缺失」）。
   static String _or(String value) => value.isEmpty ? '?' : value;
 
+  /// 订阅声明的 mode 是否合法（空 = 通配，合法；拼错 = 拒绝）。
+  ///
+  /// 系统广播分支与 team/mode 相容判定共用这一处：两处各写一遍只会让诊断文案漂移，
+  /// 也会让「通用层领域的字段只减不增」门禁误算成新增。
+  static StationIsolationVerdict _invalidSubscriberMode(
+    String label,
+    StationScope subscriber,
+  ) {
+    if (subscriber.isValidSubscriber) {
+      return const StationIsolationVerdict.ok();
+    }
+    return StationIsolationVerdict.rejected(
+      '$label 的 mode_key=${subscriber.modeKey} 非法（只能是 local | ssh，或留空表示通配）',
+    );
+  }
+
   /// team + mode 的相容判定（消息 ↔ 订阅者，站点全局化后唯一的比对方向）。
   ///
   /// **订阅者侧为空 = 通配**（不设条件）；**消息侧为空 = 不可证明 ⇒ 拒绝**
@@ -365,11 +379,11 @@ abstract final class StationIsolation {
     required String ownerLabel,
     required String otherLabel,
   }) {
-    if (!owner.isValidSubscriber) {
-      return StationIsolationVerdict.rejected(
-        '$ownerLabel 的 mode_key=${owner.modeKey} 非法（只能是 local | ssh，或留空表示通配）',
-      );
-    }
+    final StationIsolationVerdict subscriberMode = _invalidSubscriberMode(
+      ownerLabel,
+      owner,
+    );
+    if (!subscriberMode.ok) return subscriberMode;
     if (other.teamId.trim().isEmpty) {
       return StationIsolationVerdict.rejected(
         '$otherLabel 缺少 team_id，拒绝投递（fail-closed）',
