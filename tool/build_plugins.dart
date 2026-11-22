@@ -5,6 +5,11 @@
 ///   dart run tool/build_plugins.dart --only compact  # 只编一个（开发回路；**索引与其余条目合并**）
 ///   dart run tool/build_plugins.dart --skip-selftest # 只编译（CI 里先验编译面）
 ///   dart run tool/build_plugins.dart --out 目录 --index 文件  # 改产物目录 / 索引落地
+///   dart run tool/build_plugins.dart --only tree.agent --install-dir "D:\app\Tree Desktop\plugins"
+///       # 编完顺手换到安装目录（与 --only 配对）：运行中的成品先改名为 .old-<时间> 再落新文件
+///       # （Windows 允许改运行中 exe 的名字，不允许原地覆盖）；.py 等未加锁的入口直接替换。
+///       换完仍需重启插件（plugin_hot_restart 的 restart）才会加载新成品。
+///   ... --install-target "…\plugins\tree.agent\tree_agent.exe"  # 同名多份时精确指定目标
 ///
 /// 为什么要有这一份，而不是每个插件一个 `build_<id>.dart`：
 /// `plugins/README.md` 那份合同把"一个目录 = 一个插件"写成了形状，而形状要有**一个
@@ -63,6 +68,17 @@ Future<void> main(List<String> args) async {
   );
   final bool skipSelfTest = args.contains('--skip-selftest');
   final String only = _arg(args, '--only') ?? '';
+  final String installDir = (_arg(args, '--install-dir') ?? '').trim();
+  final String installTarget = (_arg(args, '--install-target') ?? '').trim();
+  final bool installRequested = installDir.isNotEmpty || installTarget.isNotEmpty;
+  if (installRequested && only.isEmpty) {
+    stderr.writeln(
+      '[build_plugins] --install-dir / --install-target 必须与 --only 配对：'
+      '一次只换一个插件，避免把整批成品写进安装目录',
+    );
+    exitCode = 2;
+    return;
+  }
   // 只有**声明了 `app_version_define`** 的插件才需要它（见文件头那段理由），所以取不到
   // 也不算错——但一旦有插件声明，就必须有版本可注：拿 `0.0.0` 冒充会让插件自报一个假版本。
   final String? appVersion = _readAppVersion(root);
@@ -104,6 +120,11 @@ Future<void> main(List<String> args) async {
     }
     final List<String> built = <String>[];
     bool ok = true;
+    // 安装模式只换**启动入口**（exe / .py …），不拿同名数据文件去猜目标。
+    final Set<String> entryTargets = installRequested
+        ? manifest.entryTargets
+        : const <String>{};
+    int installed = 0;
     for (final _PluginFile file in manifest.files) {
       final File artifact = File(_join(outDir.path, file.target));
       // 需要 Dart 编译的形态：新口径 headless / ui + 历史 binary。
@@ -186,6 +207,21 @@ Future<void> main(List<String> args) async {
         }
         source.copySync(artifact.path);
       }
+      if (installRequested && entryTargets.contains(file.target)) {
+        final ({bool ok, String message}) result = _installBuiltArtifact(
+          artifact: artifact,
+          targetName: file.target,
+          installDir: installDir,
+          installTarget: installTarget,
+        );
+        if (!result.ok) {
+          failures.add('${manifest.id}：${result.message}');
+          ok = false;
+        } else {
+          installed++;
+          stdout.writeln('[build_plugins] [install] ${manifest.id}：${result.message}');
+        }
+      }
       built.add(file.target);
       indexEntries.add(
         manifest.indexEntry(target: file.target, artifact: artifact),
@@ -194,6 +230,13 @@ Future<void> main(List<String> args) async {
     if (!ok) continue;
     if (built.isEmpty) {
       failures.add('${manifest.id}：files 是空的（合同要求至少一个）');
+      continue;
+    }
+    if (installRequested && installed == 0) {
+      failures.add(
+        '${manifest.id}：找不到启动入口产物（command/args 与 files 对不上；'
+        '入口候选：${entryTargets.isEmpty ? '（空）' : entryTargets.join(' | ')}）',
+      );
     }
   }
 
@@ -405,6 +448,131 @@ String _join(String a, [String? b, String? c]) =>
 String _relative(Directory root, String path) =>
     path.startsWith(root.path) ? path.substring(root.path.length + 1) : path;
 
+/// 把编好的入口成品**一次性**换进安装目录（运行中的成品也能换）。
+///
+/// Windows 上正在运行的 exe 不能覆盖，但**可以改名**：先把旧文件改成 `.old-<时间>`，
+/// 再把新产物复制成 `.part-<时间>` 并改名就位。`.py` 这类没被进程长期占用的入口
+/// 走同一条路（改名失败时退回直接覆盖）。任一步失败都尽量把旧文件放回原处，
+/// 并把原因交给调用方——"文件换了但插件起不来"比"这次没换"更难查。
+({bool ok, String message}) _installBuiltArtifact({
+  required File artifact,
+  required String targetName,
+  required String installDir,
+  required String installTarget,
+}) {
+  if (!artifact.existsSync()) {
+    return (ok: false, message: '产物不存在：${artifact.path}');
+  }
+  String destination;
+  if (installTarget.isNotEmpty) {
+    destination = File(installTarget).absolute.path;
+  } else {
+    final Directory dir = Directory(installDir);
+    if (!dir.existsSync()) {
+      return (ok: false, message: '安装目录不存在：${dir.path}');
+    }
+    final List<File> matches = <File>[
+      for (final FileSystemEntity entity in dir.listSync(
+        recursive: true,
+        followLinks: false,
+      ))
+        if (entity is File &&
+            _basename(entity.path) == targetName &&
+            !_basename(entity.path).contains('.part-') &&
+            !_basename(entity.path).contains('.old-'))
+          entity,
+    ];
+    if (matches.isEmpty) {
+      return (
+        ok: false,
+        message: '安装目录里找不到 $targetName（这个插件没装在这里？'
+            '或用 --install-target 指定目标文件）',
+      );
+    }
+    if (matches.length > 1) {
+      return (
+        ok: false,
+        message: '安装目录里有 ${matches.length} 份 $targetName'
+            '（${matches.map((File f) => f.path).join(' | ')}）：'
+            '请用 --install-target 指定要换哪一份',
+      );
+    }
+    destination = matches.single.path;
+  }
+  if (_samePath(artifact.path, destination)) {
+    return (ok: true, message: '源与目标是同一文件，跳过复制（重启插件即可生效）');
+  }
+
+  final String stamp = DateTime.now().microsecondsSinceEpoch.toString();
+  final String backup = '$destination.old-$stamp';
+  final String part = '$destination.part-$stamp';
+  final File dest = File(destination);
+  // 上一次换文件留下的 `.old-*`：能删就删（运行中的旧进程还占着时会失败，忽略）。
+  try {
+    final Directory parent = dest.parent;
+    if (parent.existsSync()) {
+      final String prefix = '${_basename(destination)}.old-';
+      for (final FileSystemEntity entity in parent.listSync()) {
+        if (entity is File && _basename(entity.path).startsWith(prefix)) {
+          try {
+            entity.deleteSync();
+          } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
+
+  bool movedAside = false;
+  try {
+    if (dest.existsSync()) {
+      try {
+        dest.renameSync(backup);
+        movedAside = true;
+      } on FileSystemException {
+        // 改名失败（少数文件系统 / 权限）：保留旧文件，下面用删除+改名兜底。
+      }
+    }
+    artifact.copySync(part);
+    if (dest.existsSync()) {
+      dest.deleteSync(); // 被占用时这里会抛：说明既不能改名也不能覆盖，别硬来。
+    }
+    File(part).renameSync(destination);
+    if (movedAside) {
+      try {
+        File(backup).deleteSync();
+      } catch (_) {} // 旧进程还在跑 ⇒ 下次安装再清。
+    }
+    return (
+      ok: true,
+      message: '已替换 $destination'
+          '（${movedAside ? '旧文件改名为 ${_basename(backup)}，' : ''}'
+          '重启该插件后加载新成品）',
+    );
+  } catch (error) {
+    try {
+      if (File(part).existsSync()) File(part).deleteSync();
+    } catch (_) {}
+    if (movedAside && !dest.existsSync()) {
+      try {
+        File(backup).renameSync(destination);
+      } catch (_) {}
+    }
+    return (
+      ok: false,
+      message: '替换 $destination 失败（旧文件已尽量保留 / 回滚）：$error',
+    );
+  }
+}
+
+bool _samePath(String a, String b) {
+  String norm(String p) {
+    final String absolute = File(p).absolute.path.replaceAll('/', r'\');
+    return Platform.isWindows ? absolute.toLowerCase() : absolute;
+  }
+
+  return norm(a) == norm(b);
+}
+
 /// 一条 `plugin.json`（**开发期元数据**，字段与 plugins/README.md 的表一一对应）。
 class _PluginManifest {
   _PluginManifest({
@@ -543,6 +711,14 @@ class _PluginManifest {
   /// 从源目录原样取。
   List<_PluginFile> get files {
     final String commandBase = _stripExe(command);
+    // 只有需要 Dart 编译的 runtime 才把 command 那一条映射到 `<id>_plugin.dart`；
+    // python 的 command 就是那个 `.py` 文件本身，必须按源目录同名复制（否则会去找
+    // 一个不存在的 `<id>_plugin.dart`）。
+    final bool compiled = const <String>{
+      'headless',
+      'ui',
+      'binary',
+    }.contains(runtime);
     final List<_PluginFile> out = <_PluginFile>[];
     for (final String name in fileNames) {
       final bool isCommand = _stripExe(name) == commandBase;
@@ -551,13 +727,33 @@ class _PluginManifest {
           target: Platform.isWindows ? name : _stripExe(name),
           // command 那一条的“源”就是 Dart 入口（下面主循环会编译它）；
           // 其余条目是随包数据文件，名字就是源目录里的文件名。
-          source: isCommand ? '${id}_plugin.dart' : name,
+          source: compiled && isCommand ? '${id}_plugin.dart' : name,
           isCommand: isCommand,
         ),
       );
     }
     return out;
   }
+
+  /// **启动入口**在产物清单里的目标名（安装模式只换它们）。
+  ///
+  /// 为什么认 command + args 里的 basename，而不是“第一条 files”：`.py` 插件的
+  /// `command` 是解释器（`python`）、脚本在 `args` 里；只看 `isCommand` 会一个都装不上。
+  Set<String> get entryTargets {
+    final Set<String> bases = <String>{
+      _basename(command),
+      ...args.map(_basename),
+    };
+    final Set<String> stripped = bases.map(_stripExe).toSet();
+    bool hit(String name) =>
+        bases.contains(name) || stripped.contains(_stripExe(name));
+    return <String>{
+      for (final _PluginFile file in files)
+        if (hit(_basename(file.target)) || hit(_basename(file.source)))
+          file.target,
+    };
+  }
+
 
   /// Dart 入口（约定：`plugins/<id>/<id>_plugin.dart`）；不存在返回 null。
   String? get dartEntry {

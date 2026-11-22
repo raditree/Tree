@@ -19,13 +19,12 @@
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
-- **换运行中插件成品走两段式：挂起释放锁 + resume**（**修改** `packages/tree_core/lib/src/plugin/README.md`
-  不变量 26、`plugins/self_updater/README.md` 不变量 1/2）：`plugin.suspend` 带
-  `release_lock: true` 时转储后让进程退出并**等退出确认**（不 kill），生命周期落
-  `suspended`、快照留在池里；`plugin.resume` 按上一世快照拉起新一世。`applyConfigs`
-  对挂起项**不自动拉起**，`plugin.state` 回 `command` / `args` 供调用方定位成品。
-  agent 工具侧 `suspend` 固定带 `release_lock: true`，新增 `resume`，并拒绝对自己挂起
-  （退出后没有入口再发 resume）。
+- **换运行中插件成品走「构建工具一次性替换 + 重启」**（**修改** `plugins/self_updater/README.md`
+  不变量 1/2）：`dart run tool/build_plugins.dart --only <id> --install-dir <plugins 目录>`
+  在编完并自检后，把运行中的旧入口（exe）改名为 `.old-<时间>`、再落新成品（Windows 允许
+  改运行中 exe 的名字，不允许原地覆盖）；`.py` 等未被长期占用的入口走同一条复制路径。
+  换完再由 `plugin_hot_restart` 的 `restart` 加载新成品（不支持挂起的插件按冷启动）。
+  agent 工具侧不提供 suspend/resume 两段式——那会把"谁能发 resume"变成额外前提。
 - **工具读到的图像写进会话库，后面轮次能回放**（**修改** `plugins/tree.agent/README.md`
   的 `read`/图像口径）：`ToolOutcome.images` 改成带字节的 `ToolImagePayload{path, mime, base64}`
   （工具侧 4 MiB base64 上限，超了只报尺寸与字节数）；`AgentToolEnd.images` 用纯 Map 过境，

@@ -102,15 +102,14 @@ void main() {
       );
     });
 
-    test('命令 → 点位：12 条平台面命令，每条恰好属于一个执行站点位', () {
+    test('命令 → 点位：11 条平台面命令，每条恰好属于一个执行站点位', () {
       final Set<String> commands = StationPoints.allCommands;
-      expect(commands.length, 12, reason: '$commands');
+      expect(commands.length, 11, reason: '$commands');
       expect(commands, <String>{
-        // 插件族（20261015-hot-restart 阶段 1；resume 随两段式换文件新增）
+        // 插件族（20261015-hot-restart 阶段 1）
         'plugin.list',
         'plugin.restart',
         'plugin.suspend',
-        'plugin.resume',
         'plugin.state',
         'plugin.toolCall',
         'plugin.stateDump',

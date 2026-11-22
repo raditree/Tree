@@ -2577,85 +2577,6 @@ class PluginBus {
     );
   }
 
-  /// `plugin.resume`：把**已挂起**的插件拉起新一世（默认取回上一世快照）。
-  ///
-  /// 与 [hotRestart] 的分工：热重启是「转储→退出→立刻拉起」一把梭，中间没有让调用方
-  /// 换文件的窗口；本方法只负责第二段（拉起），第一段是 `plugin.suspend` 带
-  /// `release_lock: true`（转储 + 退出 + 等确认）。两段之间 `plugins/` 里的成品
-  /// 不再被进程占用，换成新成品后再调本方法就完成了"换文件"。
-  ///
-  /// 三条判定：
-  /// - 条目必须还在且 `enabled: true`（停用态要跑请走开关，不是 resume）；
-  /// - 上一世必须**确认退出**（否则文件仍被锁，拉起会变成双实例）；
-  /// - 已经在跑 ⇒ `ok:true / already_running:true`，不重复拉起。
-  Future<Map<String, dynamic>> resumePlugin(String pluginId) async {
-    load();
-    final String id = pluginId.trim();
-    final PluginConfig? pluginConfig = config(id);
-    if (pluginConfig == null) {
-      return <String, dynamic>{
-        'ok': false,
-        'error': '没有插件条目 $id（plugins.yaml 里找不到 ⇒ 无从拉起）',
-      };
-    }
-    if (!pluginConfig.enabled) {
-      return <String, dynamic>{
-        'ok': false,
-        'error': '插件 $id 的条目已停用（enabled: false）：先启用再 resume'
-            '（resume 只负责把挂起的那一世拉起来，不替你改开关）',
-      };
-    }
-    if (pluginConfig.runtimeKind == PluginRuntimeKind.ui) {
-      // UI 插件不走挂起换文件：最后一个界面退出会触发核心收尾（车道 M 的生命周期口径）。
-      return <String, dynamic>{
-        'ok': false,
-        'error': '插件 $id 是 UI 插件：挂起/恢复不适用于界面进程'
-            '（最后一个界面退出会触发核心收尾）；换界面成品请走安装通道',
-      };
-    }
-    for (final PluginHost straggler in _reaping) {
-      if (straggler.config.id == id && !straggler.exitedConfirmed) {
-        return <String, dynamic>{
-          'ok': false,
-          'error': '插件 $id 的上一世进程还没确认退出（文件可能仍被锁）：'
-              '等它退出后再 resume，或由用户在面板上「强制停止」',
-        };
-      }
-    }
-    if (_isRunning(id)) {
-      return <String, dynamic>{
-        'ok': true,
-        'plugin_id': id,
-        'resumed': false,
-        'already_running': true,
-        'generation': generationOf(id),
-        'lifecycle': lifecycleOf(id).wire,
-        'note': '插件 $id 已经在跑 ⇒ 不需要 resume（要换一世请用 plugin.restart）',
-      };
-    }
-    // 表里残留的已退出实例先摘干净：_startOne 见到同 id 会直接返回，那是假成功。
-    if (_hasInstance(id)) await _disconnect(id);
-    final String dumpId = _dumpIdOfCurrentGeneration(id) ?? '';
-    _setLifecycle(id, PluginLifecycleState.restarting);
-    await _startOne(pluginConfig, resumeDumpId: dumpId);
-    await refreshToolDefinitions();
-    final bool ok = _hasInstance(id);
-    return <String, dynamic>{
-      'ok': ok,
-      if (!ok) 'error': errorOf(id) ?? '插件 $id 拉起后没有实例',
-      'plugin_id': id,
-      'resumed': ok && dumpId.isNotEmpty,
-      'dump_id': dumpId,
-      'generation': generationOf(id),
-      'lifecycle': lifecycleOf(id).wire,
-      'note': ok
-          ? (dumpId.isEmpty
-              ? '插件 $id 已拉起（没有可续跑的快照 ⇒ 冷启动）'
-              : '插件 $id 已拉起并取回快照 $dumpId')
-          : '插件 $id 拉起失败（按失败隔离处理，不牵连其它插件）',
-    };
-  }
-
   /// 等一份快照落池：与「进程确认退出」「心跳判失活」赛跑，**不与时长赛跑**（D8）。
   ///
   /// 为什么不需要定时轮询也不用超时：三个事件里任何一个都能给出确定结论——
@@ -3088,10 +3009,7 @@ class PluginBus {
         return await _pluginSuspend(
           pluginId,
           deferred: pluginId.isNotEmpty && pluginId == sourcePluginId,
-          releaseLock: args['release_lock'] == true,
         );
-      case 'plugin.resume':
-        return await resumePlugin(pluginId);
       case 'plugin.stateDump':
         return _pluginStateDump(pluginId, args);
       case 'plugin.stateFetch':
@@ -3185,36 +3103,15 @@ class PluginBus {
     };
   }
 
-  /// `plugin.suspend`：请求挂起（转储 + 记 `suspended`）。
+  /// `plugin.suspend`：请求挂起（转储 + 记 `suspended`），**不代为退出也不拉起下一世**。
   ///
-  /// 缺省**不代为退出也不拉起下一世**：`suspend` 是“把可续跑状态交出来”这个动作，
-  /// 而“换一世”是 restart 的职责。两个强绑在一起的话，“我只想看一下快照多大”
-  /// 也会把插件弄掉。
-  ///
-  /// `release_lock: true` 是**两段式换文件**的第一段（见 §6.5.1）：转储完成后
-  /// 让这一世优雅退出并**等退出确认**（不 kill），文件锁随进程消失；生命周期落
-  /// `suspended`（不是 stopped，快照还等着 resume 取回）。退出没在判活预算内确认
-  /// ⇒ `ok:false / released:false`，调用方不许接着覆盖文件。
+  /// 为什么这样切：`suspend` 是“把可续跑状态交出来”这个动作，而“换一世”是 restart
+  /// 的职责。两个强绑在一起的话，“我只想看一下快照多大”也会把插件弄掉。
   Future<Map<String, dynamic>> _pluginSuspend(
     String pluginId, {
     required bool deferred,
-    bool releaseLock = false,
   }) async {
     Future<Map<String, dynamic>> run() async {
-      final PluginConfig? cfg = config(pluginId);
-      if (cfg == null) {
-        return <String, dynamic>{
-          'ok': false,
-          'error': '没有插件条目 $pluginId ⇒ 无得可挂起（要看它的状态请用 plugin.state）',
-        };
-      }
-      if (cfg.runtimeKind == PluginRuntimeKind.ui) {
-        return <String, dynamic>{
-          'ok': false,
-          'error': '插件 $pluginId 是 UI 插件：挂起/恢复不适用于界面进程'
-              '（最后一个界面退出会触发核心收尾）；换界面成品请走安装通道',
-        };
-      }
       final PluginHost? host = _hosts[pluginId];
       if (host == null) {
         return <String, dynamic>{
@@ -3227,54 +3124,16 @@ class PluginBus {
         return <String, dynamic>{'ok': false, 'error': ack.reason};
       }
       final String? dumpId = await _awaitDump(host, pluginId);
-      if (!releaseLock) {
-        _setLifecycle(pluginId, PluginLifecycleState.suspended);
-        return <String, dynamic>{
-          'ok': true,
-          'plugin_id': pluginId,
-          'suspended': true,
-          'released': false,
-          'dump_id': dumpId,
-          'generation': generationOf(pluginId),
-          'note': dumpId == null
-              ? '插件 ack 了挂起，但没有递快照进来（下一世按冷启动继续）'
-              : '快照已入池；本命令**不代为退出**，要换一世请用 plugin.restart'
-                  '（要换文件请带 release_lock: true）',
-        };
-      }
-      // 第一段：转储已到手，现在让这一世退出。先置 restarting 保住订阅与暂存队列
-      // （_disconnect 只在 restarting 时不移除保活），退出确认后再落 suspended。
-      _setLifecycle(pluginId, PluginLifecycleState.restarting);
-      await _disconnect(pluginId);
-      final Duration budget =
-          host.liveness.staleWindow + host.liveness.interval;
-      bool exited = host.exitedConfirmed;
-      if (!exited) {
-        try {
-          await host.exited.timeout(budget);
-          exited = host.exitedConfirmed;
-        } on TimeoutException {
-          exited = false;
-        }
-      }
       _setLifecycle(pluginId, PluginLifecycleState.suspended);
       return <String, dynamic>{
-        'ok': exited,
-        if (!exited)
-          'error': '插件 $pluginId 已转储，但进程没在判活预算内确认退出'
-              '（文件可能仍被锁）：不要现在覆盖文件；等它退出后重试，'
-              '或由用户在面板上「强制停止」',
+        'ok': true,
         'plugin_id': pluginId,
         'suspended': true,
-        'released': exited,
-        'exited': exited,
         'dump_id': dumpId,
         'generation': generationOf(pluginId),
-        'note': exited
-            ? '进程已退出、文件锁已释放'
-                  '（${dumpId == null ? '没有快照' : '快照 $dumpId 已入池'}）；'
-                  '换完文件用 plugin.resume 拉起'
-            : '转储已完成，但退出未确认：文件锁可能还在',
+        'note': dumpId == null
+            ? '插件 ack 了挂起，但没有递快照进来（下一世按冷启动继续）'
+            : '快照已入池；本命令**不代为退出**，要换一世请用 plugin.restart',
       };
     }
 
@@ -3526,18 +3385,6 @@ class PluginBus {
         continue;
       }
       if (!running) {
-        if (lifecycleOf(config.id) == PluginLifecycleState.suspended) {
-          // 挂起（释放文件锁）是**显式两段式**的第一段：调用方正在换成品，对账不许
-          // 把它自动拉起来把窗口关掉；只有 plugin.resume 能结束这一段。
-          unchanged.add(
-            PluginReconcileAction(
-              kind: PluginReconcileKind.unchanged,
-              pluginId: config.id,
-              reason: '已挂起（文件锁已释放），等待 plugin.resume；对账不自动拉起',
-            ),
-          );
-          continue;
-        }
         // 进程退出 / 被关掉留下的残留实例先摘干净：_startOne 见到"实例表里已经有
         // 这个 id"会直接返回，那样会把一个死进程当成已就绪（假成功）。
         if (_hasInstance(config.id)) await _disconnect(config.id);
@@ -6409,7 +6256,6 @@ abstract final class PluginToolSurface {
     'plugin.list',
     'plugin.restart',
     'plugin.suspend',
-    'plugin.resume',
     'plugin.state',
   };
 
