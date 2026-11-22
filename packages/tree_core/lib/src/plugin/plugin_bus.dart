@@ -2358,7 +2358,8 @@ class PluginBus {
     if (cfg == null) return;
     final StationScope scope = _broadcastScopeOf(cfg);
     if (!scope.isValid) {
-      // 不静默：为什么这条广播没发出去必须能查到（不变量 6）。
+      // 兜底（正常不可达）：_broadcastScopeOf 已把证明不了归属的声明收敛成
+      // systemNotice。留一行可读日志，避免将来改动把通知静默丢掉。
       log?.call(
         '插件生命周期广播跳过（$pluginId 的 ${scope.describe()} 不能证明归属，'
         'fail-closed）：${from.wire} → ${to.wire}',
@@ -2414,11 +2415,14 @@ class PluginBus {
     if (station.subscribers.isEmpty) return; // 快路径：没人订阅，零开销
     final PluginConfig? cfg = config(action.pluginId);
     final StationScope scope = cfg == null
-        ? const StationScope()
+        // 条目已经被删除时对账仍会给 stopped：此时没有任何插件声明可借，
+        // 但「某插件被删掉」本身就是核心级的清单变更（载荷无 team 私有数据），
+        // 用系统广播信封照常告知订阅者。
+        ? StationScope.systemNotice
         : _broadcastScopeOf(cfg);
     if (!scope.isValid) {
-      // 条目已经被删除时对账仍会给 stopped —— 那时候插件自己证明不了归属，
-      // 只能用核心已经解析出的那一份声明；证明不了就不发，但要说得出口。
+      // 兜底（正常不可达）：_broadcastScopeOf 已把证明不了归属的声明收敛成
+      // systemNotice。留一行可读日志，避免将来改动把通知静默丢掉。
       log?.call(
         '清单变更广播跳过（${action.pluginId} 的 ${scope.describe()} 不能证明归属，'
         'fail-closed）：${action.kind.name}',
@@ -2461,20 +2465,42 @@ class PluginBus {
   ///
   /// 为什么不能像工具广播那样用调用点上下文：插件的生命周期不属于某个会话，它是
   /// 这个插件实例自己的事；拿声明做信封才能回答「这件事归哪个 team」。
+  ///
+  /// **证明不了归属时退回 [StationScope.systemNotice]（而不是不发）**：生命周期与
+  /// 清单变更都是**核心发起的系统通知**，载荷只有 plugin_id / lifecycle / action /
+  /// generation 这些核心级事实，不含 team 私有业务数据。未绑定 team 的全局插件
+  /// （`granularity: team` + `scope: {}`，tree.agent 即此形态）本来就没有 team 可
+  /// 证明，按业务消息的口径 fail-closed 会把「插件重启了」整条丢掉——这与隔离要保护
+  /// 的东西（团队业务数据）无关。业务消息仍走原校验，不受这里影响。
   StationScope _broadcastScopeOf(PluginConfig cfg) {
     final StationScope declared = _scopeOf(cfg);
-    if (StationModeKey.isValid(declared.modeKey)) return declared;
-    final String agent = declared.agentId;
-    if (agent.isEmpty) return declared;
-    final String mode = agentModeKeyResolver?.call(agent) ?? '';
-    return StationModeKey.isValid(mode)
-        ? StationScope(
-            teamId: declared.teamId,
-            agentId: declared.agentId,
-            sessionId: declared.sessionId,
-            modeKey: mode,
-          )
-        : declared;
+    StationScope resolved = declared;
+    if (!StationModeKey.isValid(declared.modeKey) && declared.agentId.isNotEmpty) {
+      final String mode = agentModeKeyResolver?.call(declared.agentId) ?? '';
+      if (StationModeKey.isValid(mode)) {
+        resolved = StationScope(
+          teamId: declared.teamId,
+          agentId: declared.agentId,
+          sessionId: declared.sessionId,
+          modeKey: mode,
+        );
+      }
+    }
+    return resolved.isValid ? resolved : _broadcastFallback(resolved);
+  }
+
+  /// 声明证明不了归属 ⇒ 用系统广播信封（仍保留可读原因便于排查配置）。
+  StationScope _broadcastFallback(StationScope declared) {
+    if (declared.teamId.trim().isEmpty) {
+      // 空 team 是**预期形态**（全局插件），不是配置错误：不刷日志（每个跃迁都会
+      // 走到这里）。真正的配置错误（mode 写错）在下面留一行。
+      return StationScope.systemNotice;
+    }
+    log?.call(
+      '插件生命周期/清单变更广播改用系统归属（声明 ${declared.describe()} 的 mode '
+      '不能证明归属）：载荷不含 team 私有数据，系统通知照常投递',
+    );
+    return StationScope.systemNotice;
   }
 
   /// 已发出的生命周期广播条数（用例与面板用；与点位 readme 的「每个跃迁一条」对照）。
@@ -2921,6 +2947,11 @@ class PluginBus {
     final Map<String, dynamic> args = arguments ?? const <String, dynamic>{};
     switch (command) {
       case 'plugin.list':
+        // `include_tools`：把插件申报的工具一并带走。tree.agent 的采集期归并要用它
+        // 把 `tools/list`（无 team 归属、不订收集站）申报的工具并进 agent 工具目录。
+        // 默认**不带**：控制面调用方只想知道"有哪些插件、活没活"，每个插件都塞一份
+        // 工具 schema 只会把回包撑大。
+        final bool includeTools = args['include_tools'] == true;
         return <String, dynamic>{
           'ok': true,
           'plugins': <Map<String, dynamic>>[
@@ -2934,6 +2965,15 @@ class PluginBus {
                 'generation': generationOf(cfg.id),
                 'suspendable': cfg.canSuspend,
                 'health': healthOf(cfg.id)['health'],
+                if (includeTools)
+                  'tools': <Map<String, dynamic>>[
+                    for (final PluginToolInfo tool in toolsOf(cfg.id))
+                      <String, dynamic>{
+                        'name': tool.name,
+                        'description': tool.description,
+                        'parameters': tool.inputSchema,
+                      },
+                  ],
               },
           ],
         };

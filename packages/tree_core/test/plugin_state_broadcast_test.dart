@@ -16,8 +16,8 @@
 // 4. 热重启补三条（restarting → booting → ready），`generation` 随之 +1；
 // 5. 失活标记也广播一条，带 `missed_heartbeats`，而 **lifecycle 仍是 ready**
 //    ——三个轴各管各的，活性判定不许把阶段改掉（D11）；
-// 6. 证明不了归属的插件（声明里没 team）⇒ **显式跳过并写下原因**，不静默；
-//    没人订阅时走快路径（零开销、也不算发过）。
+// 6. 证明不了 **team** 的全局插件（声明里没 team，如 tree.agent 的 `scope: {}`）
+//    走系统广播信封照常送达；业务消息（普通 publish）缺 team 仍然 fail-closed。
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -223,20 +223,72 @@ void main() {
     expect(instance['lifecycle'], PluginLifecycleState.ready.wire);
   });
 
-  test('证明不了归属的插件：广播被显式跳过并写下原因（fail-closed，不静默）', () async {
-    final PluginBus bus = await startBus(yaml(id: 'noteam', scope: '{}'));
-    expect(received, isEmpty, reason: '没有 team 归属 ⇒ 一条都不推');
+  test('空 scope / granularity=team 的全局插件（tree.agent 形态）：每次跃迁都送达，载荷齐全', () async {
+    // tree.agent 的真实形态：`granularity: team` + `scope: {}`（没有 team 可证明）。
+    // 生命周期是**核心发起的系统通知**，不能因为插件没绑定 team 就整条丢掉——
+    // 否则 UI 永远看不到它重启到了哪个阶段。
+    final PluginBus bus = await startBus(yaml(scope: '{}'));
+    await pumpEventQueue(); // 广播是单向 unawaited：等投递落地再断言
+    expect(transitions(), <String>[
+      'stopped→booting',
+      'booting→ready',
+    ], reason: '每个跃迁恰好一条；日志：${logs.join(' | ')}');
     expect(
-      logs.any((String l) => l.contains('插件生命周期广播跳过')),
+      received.first.scope.isSystemNotice,
       isTrue,
-      reason: '为什么没发出去必须能查到；日志：${logs.join(' | ')}',
+      reason: '证明不了 team ⇒ 用系统广播信封（显式全局归属，而不是静默丢弃）',
     );
-    expect(
-      logs.any((String l) => l.contains('不能证明归属')),
-      isTrue,
-      reason: '原因要说清是 fail-closed，不是坏了',
+
+    final Map<String, dynamic> booting = payloadOf(received.first);
+    expect(booting['point'], StationHubIds.broadcastPluginState);
+    expect(booting['plugin_id'], pluginId);
+    expect(booting['lifecycle'], PluginLifecycleState.booting.wire);
+    expect(booting['previous'], PluginLifecycleState.stopped.wire);
+    expect(booting.containsKey('missed_heartbeats'), isTrue);
+    expect(booting['buffer'], isA<Map<String, dynamic>>());
+
+    final Map<String, dynamic> ready = payloadOf(received.last);
+    expect(ready['lifecycle'], PluginLifecycleState.ready.wire);
+    expect(ready['previous'], PluginLifecycleState.booting.wire);
+    expect(ready['generation'], 1);
+    expect((ready['buffer']! as Map<String, dynamic>)['queued'], 0);
+    expect(bus.pluginStateBroadcasts, 2);
+
+    received.clear();
+    final PluginHotRestartResult result = await bus.hotRestart(pluginId);
+    await pumpEventQueue(); // 同上：等三条跃迁投递落地
+    expect(result.ok, isTrue, reason: result.reason);
+    expect(transitions(), <String>[
+      'ready→restarting',
+      'restarting→booting',
+      'booting→ready',
+    ], reason: '重启三段都要送达（前端据此显示「重启中」）；日志：${logs.join(' | ')}');
+    expect(payloadOf(received.first)['generation'], 1, reason: '进入 restarting 时还是上一世');
+    expect(payloadOf(received.last)['generation'], 2, reason: '回到 ready 已是新一世');
+    for (final StationRequest request in received) {
+      expect(
+        payloadOf(request)['plugin_id'],
+        pluginId,
+        reason: '每条跃迁都要带 plugin_id（UI 按它归位）',
+      );
+      expect(request.stationId, StationHubIds.broadcastPluginState);
+    }
+  });
+
+  test('业务消息仍 fail-closed：缺 team 的普通 publish 照旧被拒（不放宽隔离）', () async {
+    final PluginBus bus = await startBus(yaml(scope: '{}'));
+    final BroadcastStation station = bus.stations.broadcastPointFor(
+      StationHubIds.broadcastTurnDone,
+    )!;
+    // 只放宽「核心自己发起的系统通知」：普通业务广播没有 team 仍然证明不了归属。
+    final StationPublishResult result = await station.publish(
+      topic: 'turn.done',
+      scope: const StationScope(),
+      payload: <String, dynamic>{'event': 'turn.done'},
     );
-    expect(bus.pluginStateBroadcasts, 0);
+    expect(result.boardSeq, 0, reason: '被拒的消息不入公告板');
+    expect(result.delivered, 0);
+    expect(result.skipped.join('；'), contains('team_id'));
   });
 
   test('没人订阅时走快路径：不计数、不投递、也不报错', () async {

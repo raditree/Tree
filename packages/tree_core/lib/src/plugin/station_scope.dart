@@ -6,6 +6,8 @@
 ///
 /// 判定方向一律 **fail-closed**（不能证明归属即拒绝）：
 /// 1. **消息信封**必须可证明归属：`team_id` 非空 + `mode_key` 合法（local | ssh）；
+///    唯一例外是核心自己构造的 [StationScope.systemNotice]（生命周期 / 清单变更等
+///    系统通知，见该类注释）——业务数据面消息拿不到这个信封；
 /// 2. 「消息 ↔ 订阅者」的 **team + mode 必须相容**：订阅者声明了就必须精确相等，
 ///    **为空 = 这一维不设条件（通配）**——空 team 的订阅者作用于**所有 team**，
 ///    空 mode 的订阅者对 local / ssh 都收（与事件派发 `dispatchAgentEvent` 的
@@ -50,7 +52,41 @@ class StationScope {
     this.agentId = '',
     this.sessionId = '',
     this.modeKey = StationModeKey.local,
-  });
+  }) : isSystemNotice = false;
+
+  /// 系统广播信封（全局归属）：不能证明 team 的画面也必须能送到订阅者。
+  ///
+  /// 只允许核心自己用 [systemNotice] 创建；插件侧只经 [parse] 解析 JSON，
+  /// 解析出的永远是普通 scope（[isSystemNotice] == false），因此插件无法把一个
+  /// 自建广播伪装成系统广播来绕过 team / mode 隔离。
+  const StationScope._systemNotice()
+    : teamId = systemTeamId,
+      agentId = '',
+      sessionId = '',
+      modeKey = StationModeKey.local,
+      isSystemNotice = true;
+
+  /// 系统广播的 team 哨兵（仅作可读标识；投递判定看 [isSystemNotice]，不看字符串）。
+  ///
+  /// 不选空串：公告板 / 快照里需要看得出「这条广播是核心发的系统通知」，
+  /// 而不是「团队未知」。
+  static const String systemTeamId = '__tree_core__';
+
+  /// **核心自己发起的系统广播**的信封（插件生命周期 / 清单变更）。
+  ///
+  /// 为什么需要它：这两类载荷只有 `plugin_id` / `lifecycle` / `action` / `generation`
+  /// 等核心级事实，**不含任何 team 私有业务数据**；而未绑定 team 的全局插件
+  /// （如 `granularity: team` + `scope: {}`）本来就没有 team 可证明，若要求 team
+  /// 非空就会把「插件重启了」这条系统通知整条丢掉。因此给它一个显式的全局归属：
+  /// 消息侧能自证「这是核心发布的系统广播」，订阅侧照常按自己的声明收（team 为空的
+  /// 通配订阅者全部可收）。
+  ///
+  /// 这不是放宽业务消息：中转 / 执行 / 收集 / agent 事件仍走原来的
+  /// `team 非空 + mode 合法` 校验（见 [StationIsolation.checkMessageScope]）。
+  static const StationScope systemNotice = StationScope._systemNotice();
+
+  /// 是否为 [systemNotice]（系统广播信封）。
+  final bool isSystemNotice;
 
   /// 团队 id（隔离主键；站点消息必须非空）。
   final String teamId;
@@ -220,9 +256,13 @@ abstract final class StationIsolation {
   /// - `team_id` 必须非空：解析不出归属的消息谁都投不进去（fail-closed）；
   /// - `mode_key` 必须合法（local | ssh）：它决定这次操作打本地还是 SSH 工作空间。
   ///
+  /// 唯一的例外是 [StationScope.systemNotice]：核心自己发起的生命周期 / 清单
+  /// 变更通知带的是全局哨兵归属（只能由核心构造），不是「团队未知」，因此 team
+  /// 这一道放行；mode 仍要求合法。业务数据面消息永远拿不到这个信封。
+  ///
   /// 这里**不比对**任何订阅者：投递判定统一在 [checkSubscriber]。
   static StationIsolationVerdict checkMessageScope(StationScope message) {
-    if (message.teamId.trim().isEmpty) {
+    if (!message.isSystemNotice && message.teamId.trim().isEmpty) {
       return const StationIsolationVerdict.rejected(
         '消息缺少 team_id，拒绝投递（fail-closed：无法证明归属）',
       );
@@ -263,6 +303,17 @@ abstract final class StationIsolation {
     required StationScope message,
     required StationScope subscriber,
   }) {
+    if (message.isSystemNotice) {
+      // 系统广播是**全局**的：没有 team / mode / agent / session 可以比对，
+      // 订阅者只要自己的 mode 声明合法就收（team 留空 = 通配所有 team）。
+      // 安全性由消息侧保证——只有核心能构造这个信封，且载荷不含 team 私有数据。
+      if (!subscriber.isValidSubscriber) {
+        return StationIsolationVerdict.rejected(
+          '订阅者的 mode_key=${subscriber.modeKey} 非法（只能是 local | ssh，或留空表示通配）',
+        );
+      }
+      return const StationIsolationVerdict.ok();
+    }
     final StationIsolationVerdict base = _checkTeamAndMode(
       owner: subscriber,
       other: message,

@@ -175,6 +175,47 @@ void main() {
     expect(config['path'], contains('plugins.yaml'));
   });
 
+  test('plugin.list include_tools：把 tools/list 申报的工具一并带回（默认不带）', () async {
+    final PluginBus bus = await busWith(
+      'enabled: true\n'
+      'plugins:\n'
+      '  - id: sample\n'
+      '    name: 样例插件\n'
+      '    command: "${Platform.resolvedExecutable.replaceAll('\\', '/')}"\n'
+      '    args: ["${script.replaceAll('\\', '/')}"]\n'
+      '    granularity: team\n',
+    );
+    addTearDown(bus.close);
+
+    Future<Map<String, dynamic>> list({bool includeTools = false}) =>
+        bus.handlePluginCommand(
+          command: 'plugin.list',
+          pluginId: '',
+          sourcePluginId: 'tree.agent',
+          arguments: <String, dynamic>{
+            if (includeTools) 'include_tools': true,
+          },
+        );
+
+    // 不给开关：控制面回包保持原样（不塞工具 schema）
+    final Map<String, dynamic> plain = await list();
+    final Map<String, dynamic> plainEntry =
+        (plain['plugins'] as List<dynamic>).single as Map<String, dynamic>;
+    expect(plainEntry['plugin_id'], 'sample');
+    expect(plainEntry['running'], isTrue);
+    expect(plainEntry.containsKey('tools'), isFalse);
+
+    // 给开关：采集方（tree.agent）拿到 tools/list 申报的工具声明
+    final Map<String, dynamic> withTools = await list(includeTools: true);
+    final Map<String, dynamic> entry =
+        (withTools['plugins'] as List<dynamic>).single as Map<String, dynamic>;
+    expect(
+      (entry['tools'] as List<dynamic>)
+          .map((dynamic t) => (t as Map<String, dynamic>)['name']),
+      <String>['echo', 'slow'],
+    );
+  });
+
   test('GET /api/plugin/snapshot：坏插件呈现 disabled + 原因；未接入总线返回空集', () async {
     final ({CoreServer server, _Client client, PluginBus bus}) ctx =
         await serve(
