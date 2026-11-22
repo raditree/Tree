@@ -60,7 +60,7 @@
 | D-1 | 本地 zip 安装（L-10） | **本期补端点**：`POST /api/plugin/install/local`，复用仓库通道的安装后处理（known-issues #38 已改状态） |
 | D-2 | `scope` 去领域化（L-23） | **本期只做侦查，不做实现**：报告见 [pluginization/scope-de-domainization-recon.md](pluginization/scope-de-domainization-recon.md)，下期按 §5 的 S0~S4 执行 |
 | D-3 | 功能裁剪（L-27） | **维持现状（36 条功能面）**：候选裁剪项仍有实现与调用方（`token-rate` 等），缺的是使用数据而非代码清理；不随迁移做 |
-| D-4 | 发版版本号 | **当期为 `1.0.5+1`**（`1.0.5` 对应插件化收口，build 号重新从 1 起）。后续发版见 [project-status.md](project-status.md) / [work-log.md](work-log.md)（2026-11-10 已发 `1.0.7+1` / 插件 `1.0.6`） |
+| D-4 | 发版版本号 | **当期为 `1.0.5+1`**（`1.0.5` 对应插件化收口，build 号重新从 1 起）。后续发版见 [project-status.md](project-status.md) / [work-log.md](work-log.md)（2026-11-10 已发 `1.0.7+1` / 插件 `1.0.6`；2026-11-22 已发 `1.0.8+1` / 插件 `1.0.7`，UI 插件 `1.0.18`） |
 | D-5 | 数据接管范围（L-05） | **仅 `agents.yaml` + 会话历史**；工作空间是用户文件，接管风险与回滚成本都高，本轮不进 |
 | D-6 | 图像内联与 JSON 上限（契约 Q-3） | **两层保证**：所有内联图像归一到长边 `[360p, 1024p]`（等比压缩/拉伸）→ 再以 JSON 上限（建议 4 MiB）兜底，超限走 `result_path`（契约 §7 已记） |
 | D-7 | REST 面错误结构（契约 Q-4） | **统一为 `{status, code, message}`**，REST 面同批做，不另开片 |

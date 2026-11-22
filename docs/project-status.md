@@ -3,7 +3,7 @@
 > 只回答三件事：**现在什么阶段**、**几条车道在跑**、**每条车道下一步做什么**。
 > 过去式 → [work-log.md](work-log.md)；文档索引 → [README.md](README.md)。
 
-**当前：快速迭代**（按切片交付新能力；本期主线 PL-COMPLETE 生产线功能补齐）｜ 版本线 `1.0.7+1`
+**当前：快速迭代**（按切片交付新能力；本期主线 PL-COMPLETE 生产线功能补齐）｜ 版本线 `1.0.8+1`
 **出口**：PC-1~PC-10 切片全合入 + 全量测试绿 + 无阻塞缺陷（真模型 E2E 待有模型池环境）→ 稳定性迭代 / 发版窗口
 
 ---
@@ -28,7 +28,7 @@
 | **A UI 移仓** | MIG-UI-7 清理与真机验收（S6） | 进行中 | 车道 D 发版 | [ui-source-migration-recon.md](pluginization/ui-source-migration-recon.md) §6 |
 | **B 核心收窄** | — | 空闲（S7 已完成） | 待新任务（S9 归车道 C） | 同上 §2.5 |
 | **C 去插件化** | CORE-DEPLUG-1 | 排队（最后做） | 默认界面发现 → ssh 能力判定 | 同上 §2.5 |
-| **D 发版** | REL-1.0.7 | 已完成（桌面 `v1.0.7+1` / 插件 `v1.0.6`，GitHub + Gitee 资产已传） | 覆盖安装验证 | [work-log.md](work-log.md)（2026-11-10 REL-1.0.7） |
+| **D 发版** | REL-1.0.8 | 已完成源码 tag（桌面 `v1.0.8+1` / 插件 `v1.0.7`，两仓 GitHub + Gitee 已推） | 出包与 Release 资产上传 | [work-log.md](work-log.md)（2026-11-22 REL-1.0.8） |
 | **E 稳定性** | STAB-PL-1~9 产线与模型池问题侦查 + 落地（D1~D7 全部完成，含 D7-5 数据副本回归） | 进行中 | 真机验收产线文件窗 / 角色配置 | [production-line-stability-recon.md](pluginization/production-line-stability-recon.md) |
 | **G 设置页与配色** | — | 已完成（SET-UI-1~4） | 待新任务 | [ui-settings-layout-and-neutral-theme-recon.md](pluginization/ui-settings-layout-and-neutral-theme-recon.md) §5 |
 | **H 标准开发流生产线** | **Task 1~11 全部落地，PC-1~10 功能完整**：执行驱动与状态真值、结构硬门、归一化预检写入 + 复合就绪门、1 分钟理解（LLM #1 摘要 + 双查询 + RRF + `evidence_id` + 60s partial）、任务输入/附件（`.input` 落盘 + sha256 + 图片边界 + 视觉/非视觉 + PDF/Office 只存）、记忆端口（`agent.memory.get/record`，产线只存 hash/sources）、任务拆分器（PG-03~07 + plan-vN）、计划 7 块 + REQ 追踪 + 起草/批判/修正 + DEC + BG-01~08、UI 四入口 + 准备四步 + 计划审查 + 右栏 `productionTask` + 结构/归一化页 + `broadcast.task_state`（单调 seq + 3s 轮询）、稳定性（租约/fencing、幂等、事件日志/对账、独立 gate runner + `gate.json` 封签、SLO 指标） | 进行中（功能完整，PC-1~10 全部落地；剩余仅真模型 E2E） | 在有模型池/密钥的环境执行真模型 E2E（AG-11 / TC-PL-C15）；确定性 E2E 已覆盖全链路与异常五路径，前置与证据留存见 `plugins/tree.production.line/tool/e2e_real_model.md` | [production-line-product-form.md](pluginization/production-line-product-form.md) ＋ [production-line-completion-recon.md](pluginization/production-line-completion-recon.md) ＋ [production-line-gates.md](pluginization/production-line-gates.md) |

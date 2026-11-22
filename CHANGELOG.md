@@ -15,10 +15,20 @@
 > 下面的 `### Added` / `Changed` / `Fixed` / `Docs` 是**首个版本（从零重写）的总览**：
 > 断言上百条无法逐条列举，保留总览形态，不再往里加条目。
 
-## [未发布] — 2026-11-08
+## [1.0.8+1] — 2026-11-22
 
 ### 断言变化（新增 / 修改的 README 不变量）
 
+- **中栏消息流是「反向 ListView + 向上分页 + 锚点保持」的连续窗口**（**修改**
+  `plugins/tree.ui.default/lib/README.md` 不变量 19）：整份会话不再是一张带占位槽的全局槽位表——
+  列表 `reverse: true`、局部下标 0 = 最新，已渲染内容恒为一段**连续**的全局下标区间，全局下标挂在
+  每一行上；更旧的页用 `before=<窗口最旧一条 id>` 单链追加在末尾（已布局子项零位移，
+  `padAboveStamp` / `contentShiftStamp` / `maxScrollExtent` 估算补偿整体退役）；首屏 200 条、
+  一页 51 条、只裁旧侧（视口最旧 − 51，展开中的折叠组整段钉住）；阅读期尾巴冻结 + 缓冲，
+  「回到底部」带「N 条新消息」角标；滑块按全局下标升序 `first`/`last` 与真实画出的行数算几何，
+  窗口外用 `from=` 重锚 + `at=` 定位，落点反馈校正 ≤3 次；折叠组展开 / 收起改为**被点行顶边固定**
+  的单点锚点（D3）。删除 `lib/ui/services/message_window.dart` 与两个旧测试文件，新增
+  `message_feed.dart` / `message_feed_test.dart` / `message_feed_coordinate_test.dart`。
 - **左栏常驻的是「会话」，Agent 列表降为按需挤出的选择器**（**新增**
   `plugins/tree.ui.default/lib/README.md` 不变量 36，同批改 `docs/team.md` §7）：
   活动栏第一颗键改成「会话」（左栏 `_leftPanel == 0` 这一格画会话列表），第二颗才是
