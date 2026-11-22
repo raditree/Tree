@@ -181,16 +181,19 @@
     用例：[test/plugin_lifecycle_test.dart](../../../test/plugin_lifecycle_test.dart)、
     [test/plugin_hot_apply_test.dart](../../../test/plugin_hot_apply_test.dart)（行为不得变）。
 
-26. **`plugin.*` 六条命令分两套归属口径，快照两条不进 agent tool**（2026-10-15，D10/D9）：
+26. **`plugin.*` 命令分两套归属口径，快照两条不进 agent tool**（2026-10-15，D10/D9）：
     D10 定稿为「A+B 混合」：**不新增 RPC method**（本任务只新增 `suspend` 一个，由
     [tree_protocol 的门禁](../../../../tree_protocol/lib/src/plugin_rpc_methods.dart) 钉住），
     转储/取回走已有的 `station/command` ⇒ 再没有“method 不存在”这层天然护栏，命令表与归属
     必须自己钉牢。两套口径**刻意不合并**（合并就会一边假严、一边真松）：
-    - 控制面四条（`list`/`restart`/`suspend`/`state`）：`scope.team_id` 证明不了就拒（fail-closed）；
+    - 控制面五条（`list`/`restart`/`suspend`/`resume`/`state`）：`scope.team_id` 证明不了就拒（fail-closed）；
     - 快照两条（`stateDump`/`stateFetch`）：发起者**必须是插件本人**且只能动自己的键（它们的闸门是
       “谁在说话”，而不是“目标 agent 属于哪个 team”——快照本来就没有 agent，所以它们在
       `ExecuteStationMounts._handle` 里**绕开四元组解析**，这是写明在代码里的故意面）。
-    `PluginToolSurface` 把“哪四条可以被申报成 agent tool / 哪两条不得”定成常量（而不是“等做 tool 时再说”）。
+    `plugin.suspend` 带 `release_lock: true` 时是**两段式换文件**的第一段：转储后让进程退出并等
+    退出确认（不 kill），生命周期落 `suspended`、快照留在池里；`plugin.resume` 才拉起新一世。
+    `applyConfigs` 对 `suspended` 的条目**不自动拉起**（否则换文件窗口会被一次无关配置写盘关掉）。
+    `PluginToolSurface` 把“哪五条可以被申报成 agent tool / 哪两条不得”定成常量（而不是“等做 tool 时再说”）。
     自重启不许挂死：目标 == 发起者时用 `Timer.run` **先应答再动手**（microtask 不够：回包本身就在
     当前回合的微任务队列里，抢在它前面写 `suspend` 等于没修）。
     用例：[test/plugin_hot_restart_station_test.dart](../../../test/plugin_hot_restart_station_test.dart)。
