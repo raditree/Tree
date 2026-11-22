@@ -652,7 +652,7 @@ for line in sys.stdin:                          # 读循环：只读，不干活
 | `tool.call` | `tool`, `arguments?`, `relay?`（默认 false）, `run_id?` / `call_id?`（**只在整轮接管 `loop.run` 里用**，见 §5.6：`run_id` = 那一轮的 `request_id`） | `{tool, result, is_error, relayed}` | 执行**任意工具**（内置 / MCP / 插件工具同一入口）。带了 `run_id` 而它**不在册**（那一轮已收尾 / 属于别的插件）⇒ **这次调用被拒**，核心同时替你播上 `tool_start` / `tool_end` 卡片 |
 | `session.rename` | `title`（必填）, `session_id?` | `{renamed, title, session_id}` | 会话重命名（前端即时刷新标题） |
 | `ssh.reconnect` | `agent_id?` | `{ok, agent_id, stale?}` | 重建目标 agent 的远端（SSH）链路；与 REST /api/agents/{id}/ssh/reconnect、右栏文件面板「重连」按钮同一实现 |
-| `plugin.list` | — | `{ok, plugins:[{plugin_id, name, enabled, running, lifecycle, generation, suspendable, health}]}` | 看全部插件（需能证明 `team_id`） |
+| `plugin.list` | `include_tools?`（默认 false） | `{ok, plugins:[{plugin_id, name, enabled, running, lifecycle, generation, suspendable, health, tools?}]}`；`tools` 仅在 `include_tools: true` 时出现，元素为 `{name, description, parameters}` | 看全部插件（需能证明 `team_id`）。`include_tools` 是给采集方（`tree.agent`）用的：把 `tools/list`（无 team 归属）申报的工具在采集期按调用点 team 并进 agent 工具目录 |
 | `plugin.state` | `plugin_id` | `{ok, …, lifecycle, generation, suspendable, snapshots[], kill_reason, last_error}` | 看一个插件的运行态（只读） |
 | `plugin.restart` | `plugin_id`, `keep_state?`（缺省 true） | `{ok, resumed, dump_id, generation, lifecycle, reason}` | **热重启**（见 §6.5）；目标就是自己时核心**先应答再动手**，回包带 `deferred: true` |
 | `plugin.suspend` | `plugin_id` | `{ok, suspended, dump_id, generation, note}` | 请求转储并记 `suspended`；**不代为退出**，也不拉起下一世 |
@@ -801,6 +801,10 @@ plugins:
 | `plugin_id` | 目标插件；`list` 可省略。填自己的 id 就是“重启我自己”，这是**允许**的 |
 | `keep_state` | `restart` 时是否尝试续跑（缺省 `true`；目标没声明 `suspension: keep` 就按冷启动，回包会写明） |
 | `wait_ready` | `restart` 后再读一次 `plugin.state`，把新一世的阶段/代际附进结果（缺省 `true`；重启自己时无效） |
+
+`restart` 只是按配置里的启动命令把**已经装好的成品**重新拉起来：**不编译、不打包、不安装**。
+改完插件源码后必须先构建产物（`dart run tool/build_plugins.dart --only <id>`）并更新/安装到
+`plugins/`，再 `restart` 才会生效；跳过构建直接重启，重启的还是旧成品。
 
 它自己不碰任何插件状态，只是把动作转成执行站 `plugin.*` 命令，所以下面这些**对所有插件都成立**：
 
