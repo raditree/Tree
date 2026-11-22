@@ -230,10 +230,10 @@
 
 28. **「热重启一个插件」是一项能力，不是一次手工操作**（2026-10-15 阶段 3，D9/D2/D8）：
     agent 侧的对外面由**三张常量表**定死，不靠下一个写 tool 的人记得：
-    `PluginToolSurface.agentToolCommands` = 可申报的控制面四条、`lifecycleOnlyCommands` =
+    `PluginToolSurface.agentToolCommands` = 可申报的控制面五条、`lifecycleOnlyCommands` =
     永不进工具表的快照两条、`auditedCommands` = 前者。
-    - **一个 tool + `action` 参数**（`plugin_hot_restart`）而不是四个 tool：四个 tool 会
-      把模型工具表撑出四行同族条目，而它们本来就是同一个动作的四种问法。`action` 的
+    - **一个 tool + `action` 参数**（`plugin_hot_restart`）而不是五个 tool：五个 tool 会
+      把模型工具表撑出五行同族条目，而它们本来就是同一个动作的五种问法。`action` 的
       枚举**由映射表推导**（改成手写的固定表就会漏项：模型按说明书填了合法值却被拒，
       而这种错只有运行时才看得见）。
     - **自重启不许挂死**：目标 == 发起者 ⇒ **先应答再动手**（`Timer.run` 排到下一事件

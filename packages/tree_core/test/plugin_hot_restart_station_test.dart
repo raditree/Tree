@@ -117,7 +117,7 @@ void main() {
     );
   });
 
-  test('插件点位的七条命令都真的挂上了挂载位置（表驱动，不是硬编码）', () {
+  test('插件点位的八条命令都真的挂上了挂载位置（表驱动，不是硬编码）', () {
     final StationPointSpec spec = StationPoints.byId(
       StationHubIds.executePlugin,
     )!;
@@ -128,6 +128,7 @@ void main() {
       'plugin.list',
       'plugin.restart',
       'plugin.suspend',
+      'plugin.resume',
       'plugin.state',
       'plugin.toolCall',
       'plugin.stateDump',
@@ -214,7 +215,7 @@ void main() {
   });
 
   // ── 5：两套归属口径 ───────────────────────────────────────────────────
-  test('控制面四条：scope 没有 team_id ⇒ 证明不了归属就拒（fail-closed）', () async {
+  test('控制面五条：scope 没有 team_id ⇒ 证明不了归属就拒（fail-closed）', () async {
     for (final String command in PluginToolSurface.agentToolCommands) {
       final StationCommandResult denied = await run(
         command,
@@ -226,10 +227,11 @@ void main() {
     }
   });
 
-  test('控制面四条：要指名 plugin_id（plugin.list 除外）', () async {
+  test('控制面五条：要指名 plugin_id（plugin.list 除外）', () async {
     for (final String command in <String>[
       'plugin.restart',
       'plugin.suspend',
+      'plugin.resume',
       'plugin.state',
     ]) {
       final StationCommandResult denied = await run(command);
@@ -370,7 +372,7 @@ void main() {
   });
 
   // ── 7（阶段 3 新增）：审计面 ───────────────────────────────────────
-  test('审计面就是控制面四条（常量决定，不靠下一个写代码的人记得）', () async {
+  test('审计面就是控制面五条（常量决定，不靠下一个写代码的人记得）', () async {
     final List<String> logs = <String>[];
     final PluginBus audited = PluginBus(
       configFile: configFile,
@@ -383,7 +385,7 @@ void main() {
     );
     expect(audited.mountExecuteStations(mounts), isNull);
 
-    // 常量层面：审计面**正好是**控制面四条（少一条 = 有一种重启事后查不到），
+    // 常量层面：审计面**正好是**控制面五条（少一条 = 有一种重启事后查不到），
     // 而快照两条不审计也是写定的（它们每一世都要下一次，记进去只会把日志刷满）。
     expect(
       PluginToolSurface.auditedCommands,

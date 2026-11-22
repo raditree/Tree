@@ -759,9 +759,32 @@ plugins:
 * **不落盘**：快照只在核心进程内存里，核心退了就没有。不要把会话事实唯一地寄存在
   插件状态里（消息与工具结果由核心落库在先）。
 * **不要给 `plugin.stateDump` / `plugin.stateFetch` 申报 agent tool**：它们是生命周期
-  原语，不是给模型使唤的能力（可申报的四条见 `PluginToolSurface.agentToolCommands`）。
+  原语，不是给模型使唤的能力（可申报的五条见 `PluginToolSurface.agentToolCommands`）。
 * **不要指望时长**：没有任何"多少毫秒内必须转储完"的上限，也没有"慢了就杀"。反过来，
   装死也不划算——连续 N 拍（缺省 3×I）没有任何入站报文会被判失活，那时核心会收尸。
+
+#### 6.5.1 两段式换文件：`plugin.suspend`（`release_lock`）+ `plugin.resume`
+
+Windows 上**正在运行的 exe 不能覆盖**，而热重启是一把梭（转储→退出→立刻拉起），中间没有
+"文件锁已释放但新一世还没起"的窗口。要换成品（尤其是 agent 改了源码重新构建后）走两段：
+
+1. `plugin.suspend` 带 `arguments.release_lock: true`：按上面的时序转储 → `shutdown` →
+   **等进程确认退出**（事件，不是时长；核心**不 kill**）。成功后生命周期是 `suspended`，
+   快照留在内存池里，`plugins/` 里的文件锁随进程消失；条目仍 `enabled: true`。
+2. 覆盖 `plugins/` 里的成品（复制到临时名 + 原子改名，别原地半截写）。
+3. `plugin.resume`：按上一世的快照拉起新一世（代际 +1；没有快照则冷启动并写明）。
+   站点请求在挂起期间照常入队（有界暂存），恢复后 FIFO 重放。
+
+边界（都是写进实现的，不是靠自觉）：
+
+* **挂起不是停用**：条目开关不动；`applyConfigs` 对 `suspended` 的插件**不自动拉起**
+  （否则一次无关的配置写盘就会把换文件窗口关掉），只等显式 `resume`。
+* **退出未确认就不算释放**：进程在判活预算内没退出 ⇒ 回 `ok:false / released:false` 并说明
+  "文件可能仍被锁"，调用方**不要**接着覆盖；用户可在面板走「强制停止」（唯一强杀入口）。
+* **不要挂起正在驱动本次会话的插件**：进程一退，发起方就没有入口再发 `resume` 了
+  （agent 工具侧因此直接拒绝对 `self_updater` 自己挂起）。UI 插件也不适用这条路
+  （最后一个界面退出会触发核心收尾），换界面成品仍走安装通道。
+* 挂起只在**核心进程内存**里记账：换文件期间核心重启 ⇒ 快照丢失，插件按冷启动拉起。
 
 最小可运行参考实现：[`plugins/suspendable/suspendable_plugin.dart`](../plugins/suspendable/suspendable_plugin.dart)
 （Dart，住插件仓；`dart run plugins/suspendable/suspendable_plugin.dart --selftest` 用假核心把
@@ -797,14 +820,16 @@ plugins:
 
 | 参数 | 语义 |
 |---|---|
-| `action` | `list` / `state` / `restart` / `suspend`（四个问法对应四条执行站命令） |
+| `action` | `list` / `state` / `restart` / `suspend` / `resume`（五个问法对应五条执行站命令） |
 | `plugin_id` | 目标插件；`list` 可省略。填自己的 id 就是“重启我自己”，这是**允许**的 |
 | `keep_state` | `restart` 时是否尝试续跑（缺省 `true`；目标没声明 `suspension: keep` 就按冷启动，回包会写明） |
-| `wait_ready` | `restart` 后再读一次 `plugin.state`，把新一世的阶段/代际附进结果（缺省 `true`；重启自己时无效） |
+| `wait_ready` | `restart` / `resume` 后再读一次 `plugin.state`，把新一世的阶段/代际附进结果（缺省 `true`；重启自己时无效） |
 
 `restart` 只是按配置里的启动命令把**已经装好的成品**重新拉起来：**不编译、不打包、不安装**。
 改完插件源码后必须先构建产物（`dart run tool/build_plugins.dart --only <id>`）并更新/安装到
 `plugins/`，再 `restart` 才会生效；跳过构建直接重启，重启的还是旧成品。
+要换掉正在运行的成品（文件被锁）走两段：`suspend`（工具侧固定带 `release_lock: true`，
+转储后进程退出）→ 覆盖文件 → `resume`，见 §6.5.1。
 
 它自己不碰任何插件状态，只是把动作转成执行站 `plugin.*` 命令，所以下面这些**对所有插件都成立**：
 

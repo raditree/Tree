@@ -5,7 +5,7 @@ import 'station_runtime.dart';
 /// `plugin.*` 族的**统一入口**（插件热重启控制面 + 执行器挂载/工具转发）：由
 /// `PluginBus` 实现。
 ///
-/// 覆盖命令：`plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.state`
+/// 覆盖命令：`plugin.list` / `plugin.restart` / `plugin.suspend` / `plugin.resume` / `plugin.state`
 /// / `plugin.stateDump` / `plugin.stateFetch` / `plugin.toolCall` / `plugin.mount`。
 /// 这一族的实现只能是 `PluginBus`：插件实例表、generation 计数、快照内存池都在它
 /// 那里，挂载位置层因此不拿任何插件状态、只负责**归属校验 + 分派**。
@@ -174,7 +174,7 @@ class ExecuteStationMounts {
   /// - `plugin.stateDump` / `plugin.stateFetch`：**发起者必须是插件**，且只能对
   ///   **自己**的快照下命令（`plugin_id` 与发起者不一致直接拒绝）。它们的闸门是
   ///   「谁在说话」而不是「目标 agent 属于哪个 team」——快照本来就没有 agent；
-  /// - 其余命令（list / restart / suspend / state / mount / toolCall）：控制别人的
+  /// - 其余命令（list / restart / suspend / resume / state / mount / toolCall）：控制别人的
   ///   插件必须有可证明的 team 归属，`scope.team_id` 为空 ⇒ fail-closed 拒绝。
   ///
   /// 本层**不碰插件实例表**：具体做什么全部交给 [pluginManager]（= `PluginBus`），

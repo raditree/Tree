@@ -229,16 +229,18 @@ abstract final class StationPoints {
       kind: StationKind.execute,
       label: '插件管理',
       description:
-          '执行站·插件族：plugin.list / plugin.restart / plugin.suspend / plugin.state /'
+          '执行站·插件族：plugin.list / plugin.restart / plugin.suspend / plugin.resume / plugin.state /'
           ' plugin.stateDump / plugin.stateFetch（插件热重启控制面）+ plugin.mount（把执行站命令挂到本插件）/ plugin.toolCall（把一次工具调用原样转给指定插件）',
       alias: 'plugin',
       readme:
-          '插件族（plugin.list / plugin.restart / plugin.suspend / plugin.state / plugin.toolCall /'
-          ' plugin.stateDump / plugin.stateFetch）：这一族管的是**插件自己**。'
+          '插件族（plugin.list / plugin.restart / plugin.suspend / plugin.resume / plugin.state /'
+          ' plugin.toolCall / plugin.stateDump / plugin.stateFetch）：这一族管的是**插件自己**。'
           '它在插件调 `station/command` 时被触发，不在核心内部自动跑。'
           '回包口径：成功回 `{ok:true, ...结论}`，失败回可读中文原因（不假装做过）；'
           '`stateDump` / `stateFetch` 的回包额外带 `dump_id`，供下一次取回与消费对账。'
-          '限制：`plugin.list` / `plugin.restart` / `plugin.state` 按请求 scope 判归属，'
+          '`plugin.suspend` 带 `release_lock: true` 时会转储后让进程退出并等退出确认'
+          '（释放插件成品的文件锁），之后用 `plugin.resume` 拉起并取回快照——这是换文件的两段式。'
+          '限制：`plugin.list` / `plugin.restart` / `plugin.resume` / `plugin.state` 按请求 scope 判归属，'
           '证明不了 team 就拒；`plugin.stateDump` / `plugin.stateFetch` 是**团队级命令**'
           '（发起者是插件本身，没有 agent 归属），因此只认「只能动以发起者 pluginId '
           '开头的快照」这一条归属口径，且两者**不申报成 agent tool**——它们是生命周期'
@@ -247,6 +249,7 @@ abstract final class StationPoints {
         'plugin.list',
         'plugin.restart',
         'plugin.suspend',
+        'plugin.resume',
         'plugin.state',
         'plugin.toolCall',
         'plugin.stateDump',
