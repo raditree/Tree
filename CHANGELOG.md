@@ -1203,7 +1203,7 @@
   否则消息流会在 40px 宽的视口里重排、滚动位置被夹回去。
 
 - **消息窗口半径 200 → 51**（修改 [lib/README.md](lib/README.md) 不变量 19 ⑤、
-  [ui/services/message_window.dart](lib/ui/services/message_window.dart) 的 `kMessageWindowRadius`、
+  `ui/services/message_window.dart` 的 `kMessageWindowRadius`（该文件已在 1.0.8 随反向列表重写删除）、
   [ui/widgets/message_panel.dart](lib/ui/widgets/message_panel.dart) 的 `_historyPageSize` / `_cacheMargin`，
   **用户要求 2026-10-04**：「现在中间页懒加载 +-200 条消息，有点卡，改 +-50 条」）：
   页大小 / 视口外多留 / 末尾常驻**三个口径收敛成同一个数**（补页量 > 保留半径会让"刚补回的一页

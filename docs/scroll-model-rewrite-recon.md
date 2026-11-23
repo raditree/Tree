@@ -19,7 +19,7 @@
 
 | 零件 | 坐标 | 作用 |
 |---|---|---|
-| 全局槽位表 `slots`（null = 88px 占位） | [message_window.dart](../plugins/tree.ui.default/lib/ui/services/message_window.dart) | 按**全局下标**寻址整份会话；`place/evict/gapsFor` |
+| 全局槽位表 `slots`（null = 88px 占位） | `message_window.dart`（已删除，替换为 `message_feed.dart`） | 按**全局下标**寻址整份会话；`place/evict/gapsFor` |
 | 逐格估算 `maxScrollExtent` | [message_list.dart](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart#L1535-L1606) | `_rebuildExtentPlan` + `_extentBelow` + `_measuredExtent` |
 | 底部锚定控制器/位置 | [message_list.dart](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart#L308-L559) | 布局期钉底、首帧贴底、`shiftAbove` 实测补偿、帧后重试 |
 | 实测锚点补偿 | [message_list.dart](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart#L1070-L1290) | `_builtTopsFromRenderTree` / `_resolveShiftAbove` / `_retryShift` / `_assertShiftTarget` |
@@ -169,7 +169,7 @@ UI 入口 [api_service.dart L629-L707](../plugins/tree.ui.default/lib/io/api_ser
 ### 2.7 定位与滑块 seek（V2）
 
 1. **目标在窗口内**：本地下标已知 ⇒ 用 `MessageSeekCorrection`（保留，
-   由 [message_window.dart](../plugins/tree.ui.default/lib/ui/services/message_window.dart) 移入 `message_feed.dart`）
+   由 `message_window.dart` 移入 `message_feed.dart`）
    做"估算 → 跳跃 → 观测落点 → 割线修正"，≤3 次、容差 3 条。
    步长初值改为 `窗口实测平均高`（`总实测高 / 已量行数`），不再用 88px 占位。
 2. **目标在窗口外（滑块拖拽松手 / 点击轨道）**：`from=` 取目标页 → `resetAround` →
@@ -329,7 +329,7 @@ UI 入口 [api_service.dart L629-L707](../plugins/tree.ui.default/lib/io/api_ser
 ## 附：本档引用的关键代码坐标
 
 - 现行估算与补偿：[message_list.dart L1535-L1606](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart#L1535-L1606)、[L308-L559](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart#L308-L559)、[L1070-L1290](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart#L1070-L1290)
-- 窗口模型：[message_window.dart](../plugins/tree.ui.default/lib/ui/services/message_window.dart)
+- 窗口模型：`message_window.dart`（已删除）→ [message_feed.dart](../plugins/tree.ui.default/lib/ui/services/message_feed.dart)
 - 面板补页/淘汰/定位：[message_panel.dart L1112-L1380](../plugins/tree.ui.default/lib/ui/widgets/message_panel.dart#L1112-L1380)
 - 滑块几何：[message_scrollbar.dart L80-L140](../plugins/tree.ui.default/lib/ui/widgets/message_scrollbar.dart#L80-L140)
 - 分页服务端：[conversation_store.dart L50-L115](../plugins/tree.agent/lib/src/conversation_store.dart#L50-L115)
