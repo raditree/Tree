@@ -204,8 +204,8 @@ LLM 段要求 `auto` 且成功后转 `auto_final`——同一会话最多一次�
 
 | 切片 | 内容 | 门禁 |
 | --- | --- | --- |
-| **T1** | 规则段 + 钩子接线 + 广播（默认开，无配置面） | `dart analyze`（tree.agent）0 → 该包全量测试 → `tree_protocol` 访问控制（无改动也跑） |
-| **T2** | LLM 精修段 + 配置项 + 降级 | 同上；补 TC-TITLE-08~11 |
+| **T1** | 规则段 + 钩子接线 + 广播（默认开，无配置面）— **已落地（插件仓 `e6984b9`）** | `dart analyze`（tree.agent）0 → 该包全量测试 → `tree_protocol` 访问控制（无改动也跑） |
+| **T2** | LLM 精修段 + 配置项 + 降级 — **已落地（插件仓 `cf5df22`）**；补 TC-TITLE-08~11 | 同上 |
 | **T3** | 配置 REST + UI 设置卡片 + 默认会话可改名 | 同上，另跑 `tree.ui.default` analyze 与相关 widget 测试；涉及 UI 才跑 flutter |
 
 每个切片独立提交（`plugins` 仓）；文档仓同步更新 `project-status.md` 与 `work-log.md`。
