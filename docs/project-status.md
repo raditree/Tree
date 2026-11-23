@@ -37,9 +37,10 @@
 | **K 插件设置服务 tree.settings** | — | 已完成（K1~K5；真核心黑盒随 DN-2 联调） | 新任务 | [plugin-settings-recon.md](pluginization/plugin-settings-recon.md) §7 |
 | **L UI 圆角化** | RND-UI-1 + S1~S4 已落地（UI 插件 `f208763`；版本随发版车道 D） | 已完成 | 真机视觉验收（深/浅、240px 窄栏、tab 溢出） | [ui-roundness-visual-upgrade-recon.md](pluginization/ui-roundness-visual-upgrade-recon.md) §4 |
 | **M 核心与 UI 生命周期** | 最后一个 UI 进程退出 ⇒ 核心收尾剩余插件并退出；全部停用/卸载/从未连上 ⇒ 保持引导页模式 | 已完成 | 真机 E2E-14（托盘退出 / 直接结束 UI 进程 / 全部停用） | [ui-pluginization.md](pluginization/ui-pluginization.md) §4.1.1 ＋ `ui-pluginization_acceptance.md` D-13/E-16/E2E-14 |
-| **N 记忆与上下文治理** | **M1~M5 全部完成**：存储骨架 / REST / 异步管道 / 工具 + 快照段 / agent 配置页（模型 / 工具 / 记忆 / 提示词四 tab，记忆阈值全部可配，系统提示词快照只读查看） | 已完成 | 真机验收 agent 配置页与记忆管理；D1~D11 全拍板 | [agent-memory-recon.md](pluginization/agent-memory-recon.md) ＋ [agent-memory-upgrade-plan.md](pluginization/agent-memory-upgrade-plan.md) §10 |
+| **N 记忆与上下文治理** | **M1~M6 全部完成**：存储骨架 / REST / 异步管道 / 工具 + 快照段 / agent 配置页 / 衰减改全局乘数 + embedding 分槽与混合检索 + 合并提升续命 + 归档保留原层级。验证：`tree.agent` analyze 0、memory 8 套件 74 项全绿；UI analyze 0、`agent_config_panel_test` 3 项全绿 | 已完成 | 排期 known-issues #55；#54 提示词 provider 接线独立修复 | [agent-memory-recon.md](pluginization/agent-memory-recon.md) ＋ [agent-memory-upgrade-plan.md](pluginization/agent-memory-upgrade-plan.md) §10/§11.2 |
 | **O 热重启可靠性** | P0~P3 已落地：tree.agent 真实转储/续跑（中断轮次收尾、pending 重放）、生命周期系统广播、UI 运行态与末尾页自愈、suspend 全程日志 | 已完成 | 真机复验「agent 自调 plugin_hot_restart 不再卡住」 | [work-log.md](work-log.md)（2026-11-22 热重启） |
 | **P 中栏滚动模型重写** | **R2~R3 完成**（反向 ListView + `before=` 向上分页 + 阅读期缓冲/角标 + 折叠单点锚点，D1~D3 已拍板；旧槽位表模型删除，`dart analyze` 0、全量 1057 项绿）；R8 文档收尾进行中 | 进行中 | R4 新侧落后裁剪实测补偿 → R5 seek 精修 → R7 chunk 不整面板 `setState` | [scroll-model-rewrite-recon.md](scroll-model-rewrite-recon.md) §4 |
+| **Q 会话自动命名** | TITLE-AUTO-T1 已落地（规则段 + `title_source`），插件仓 `e6984b9` | 进行中 | T2 LLM 精修 → T3 配置面与默认会话改名 | [session-auto-title-plan.md](pluginization/session-auto-title-plan.md) §10 |
 
 **车道 H 门控覆盖**（冻结版 [production-line-gates.md](pluginization/production-line-gates.md)）：
 LG-01~07 就绪门（结构 / 文档归一化 / 包图 / 文档图 / 代码索引 / 测试映射 / 复合就绪）；
