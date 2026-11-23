@@ -34,6 +34,7 @@
 | [conversation-sembast-and-collapse-recon.md](conversation-sembast-and-collapse-recon.md) | **会话存储 Sembast 化 + 中栏工具折叠侦查与拍板**：显示/详细双 store、seq 排序键、jsonl 一次性迁移、详情端点、N>3 折叠组与 TC-COLLAPSE-01 零位移判据（F1~F4 执行规格） |
 | [scroll-model-rewrite-recon.md](scroll-model-rewrite-recon.md) | **中栏消息列表滚动模型重写（路线 2，实施中）**：反向 ListView + `before` 向上分页 + 锚点保持；取消全局槽位表 / `maxScrollExtent` 估算 / `padAboveStamp`·`contentShiftStamp` 补偿层；`MessageFeed` 连续窗口与全局下标、尾巴冻结与缓冲、实测裁剪、`at=`/`from=` 重锚、滑块几何只读 `total`、折叠单点锚点校正；I-1~I-8 不变量、R1~R8 切片与 TC-COLLAPSE-01 在新模型下的判据 |
 | [pluginization/session-auto-title-plan.md](pluginization/session-auto-title-plan.md) | **会话自动命名（TITLE-AUTO）方案**：路线 3 两段式（首条消息规则即时出标题 → 首轮收尾 LLM 精修一次）；复用 `session.rename` 写库 + `session_renamed` 广播，核心/协议零改动；哨兵值 + pending 值双判据保护手动改名；默认会话、配置面、T1~T3 切片与 TC-TITLE-01~14，D1~D4 待拍板 |
+| [pluginization/agent-context-handover-and-snapshot-recon.md](pluginization/agent-context-handover-and-snapshot-recon.md) | **上下文 handover 与系统提示词快照留档（车道 R）**：`prompts.jsonl` 版本化留档（含摘要的 `effective_system`、sha256 去重、REST 历史/版本查询）；`handover` 工具写 pending、轮边界显式摘要 + 显式切点重建（同一模型，不换模型）；不做 head；S1~S3 切片、切点算法与测试清单 |
 | [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) | **SSH 执行器「中转站」协议**：core ⇄ ssh_executor 插件 ⇄ tree_agent 三层的消息面、错误码、分块帧、版本协商、后台任务落盘台账与 PTY 契约（中转站 =「处理拓展点位」：首选 `ssh.execute` 点位投递、`tunnel.*` 作兼容层） |
 | [known-issues.md](known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证 / 遗留），按发现顺序编号 |
 | [../CHANGELOG.md](../CHANGELOG.md) | 版本变更记录（自首个开源版本 1.0.0 起） |
