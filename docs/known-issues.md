@@ -3116,3 +3116,27 @@ Tree 的 agent shell 里 `gh` 之类仍然找不到；只有整套重启才可�
 三处 provider——提示词 tab 的写入口不依赖它们，而快照查看器恰好会把"Spec 索引 / 已选全文 /
 基础段为空"如实显示出来（段来源里缺这几段）。因此本条仍按独立修复排期，M5 不宣称已修。
 
+---
+
+## #55 记忆治理剩余项（M6 只修四项，以下暂缓）
+
+**状态**：已登记、未修复（2026-11-23，M6 范围外）。
+
+M6 已修：时间衰减改全局乘数、embedding 按模型分槽并接入检索、合并/提升刷新 `lastDecayAt`、
+归档保留 `original_level`。以下仍待处理：
+
+1. **`relevance` 固定 0.5**：管道提取、`memory in`、REST 新建都写死 0.5，四维里这一维没有区分度；
+   是否按 L3 topics / 会话输入动态计算需要单独拍板。
+2. **子 agent 记忆可写不注入**：`memory` 工具按 `invocation.agentId` 正常写 `memory/<sub_id>`，
+   但 `AgentRuntime.refreshMemorySection` 用 `store.agent` 解析不到 `sub_…`，记忆段恒为空。
+3. **管道水位在内存**：`_watermarks` 进程内保存，重启后从 0 重扫；靠 L2 合并幂等兜底，
+   但会重复调用摘要 / 提取 LLM。
+4. **L3 overview 向量仍是单值**：`overview.json.embedding` 不按模型分槽，切换 embedding 模型
+   且摘要未变化时不会重算；L3 向量也未参与检索排序。
+5. **旧记录向量没有模型 id**：历史单值 `embedding` 读入 legacy 槽（空 key），无法识别所属模型；
+   首次切到当前模型时会重新生成，旧槽只保留不参与检索。
+6. **向量回填无独立限流 / 进度**：每个 tick 最多补 64 条、每批 16 条，库大或切换模型后需要多个
+   tick 才能补齐；`pipeline/status` 只显示上次 tick 的 `embedded` 计数，没有总量与进度。
+7. **#54 三个提示词 provider 仍未接线**（Spec 索引 / 已选 Spec 全文 / 工作空间提示词文件），
+   与本条独立，见上一条。
+

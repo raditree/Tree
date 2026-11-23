@@ -393,3 +393,16 @@ M3 提交后自查，发现五处"实现与方案/自身注释不符"，已在�
 | 新 id 用真实时钟 | `_newId` 用 `DateTime.now()`，测试不可控 | 改用注入时钟 `_now` | 全量测试可复现 |
 
 排查口径：这五处都是**注释/文档说 A、代码做 B**——正是"文档与代码冲突以代码为准，但偏差要记档"那条侦察纪律要抓的形态。M4/M5 落地时同样先自查再提交。
+
+### 11.2 M6 修订（2026-11-23，用户拍板）
+
+M1~M5 验收后暴露四处口径问题，本期只修这四项，其余记入 known-issues：
+
+| ID | 拍板 | 落地 |
+| --- | --- | --- |
+| **D12** | 时间衰减从「四维加权项」改为**全局乘数**：`score = normalize(w_i·importance + w_c·confidence + w_r·relevance) × 2^(-age/halfLife)`；`weights.time` 移除，三项按和归一；L0 frozen | `memory_config.dart` / `memory_record.dart` / UI 配置 |
+| **D13** | embedding **按模型分槽**：`records.embeddings{model_id: vector}`；切换模型不删旧槽，当前模型缺向量由 tick 回填；L2 候选落库前批量向量化，去重优先 cosine，缺向量回退 Jaccard；`search`/`recall` 走 cosine + lexical + score 混合，无查询向量回退 lexical；模型按当前 config/模型池每次解析，不在 build 时缓存 | `memory_record/db/pipeline/wiring/delegate/tool` |
+| **D14** | `lastDecayAt` 在**同内容合并、L1 提升、修正**三处都刷新为当前时间（活跃即续命） | `memory_pipeline.dart` |
+| **D15** | 归档时保存 `original_level`，`restore` 缺省恢复到原层级；旧数据没有该字段时回退 L2 | `memory_record.dart` / `memory_db.dart` |
+
+**暂不处理（记入 known-issues）**：`relevance` 固定 0.5 无区分度；子 agent 可写记忆但不注入；管道水位在内存、重启后从 0 重扫；L3 overview 向量仍是单值且不随模型切换；旧记录的单值 `embedding` 无模型 id（迁移为 legacy 槽）；向量回填没有独立限流与进度。
