@@ -42,7 +42,7 @@
 | **P 中栏滚动模型重写** | **R2~R3 完成**（反向 ListView + `before=` 向上分页 + 阅读期缓冲/角标 + 折叠单点锚点，D1~D3 已拍板；旧槽位表模型删除，`dart analyze` 0、全量 1057 项绿）；R8 文档收尾进行中 | 进行中 | R4 新侧落后裁剪实测补偿 → R5 seek 精修 → R7 chunk 不整面板 `setState` | [scroll-model-rewrite-recon.md](scroll-model-rewrite-recon.md) §4 |
 | **Q 会话自动命名** | **T1~T3 全部落地**：规则段 + `title_source`（`e6984b9`）、LLM 精修 + 配置项（`cf5df22`）、配置接口 + 设置卡片 + 默认会话可重命名（`87c6fff`）；记忆 LLM 已泛化为「后台异步处理模型」并作为标题精修缺省模型（`899f538`），且模型链局部优先（`88aec20`） | 已完成 | 真机视觉验收：首条消息即时标题 / 首轮后精修 / 手动改名不被覆盖 / 设置卡片三处即时保存 | [session-auto-title-plan.md](pluginization/session-auto-title-plan.md) §10 |
 | **R 上下文 handover 与快照留档** | **S1~S3 全部落地**：`prompts.jsonl` 版本化留档（initial/compact/handover/legacy + sha256 去重）、`handover` 工具 + pending 记录 + 轮边界整体替换（`replaceContext`，不动压缩语义）、`prompt-snapshot` 的 `history` / `?version=N`；tree.agent analyze 0、全量 **685** 项绿 | 已完成 | UI 提示词面板版本选择（S4，可后置） | [agent-context-handover-and-snapshot-recon.md](pluginization/agent-context-handover-and-snapshot-recon.md) §6 |
-| **S 飞书远程控制 UI 插件** | FEISHU-RECON 侦查完成：核心零改动可承载（多 UI / 广播站 / REST 委派 / 透明置顶窗口）；飞书需内置 Go sidecar 接官方长连接；悬浮球=单窗口（非真无窗口）；非 manage ⇒ 只剩球时会开引导页、球在线时核心不随默认 UI 退出 | 待开始（D1~D8 待拍板） | 拍板后按 S1~S5 开工（先 S1 骨架 + S2 sidecar） | [feishu-remote-control-ui-recon.md](pluginization/feishu-remote-control-ui-recon.md) §10/§11 |
+| **S 飞书远程控制 UI 插件** | FEISHU-DECIDE：D1~D8 已拍板并回写方案——声明 `plugin.manage` + 最小 UI 启停封装 + 引导页逃生口；不做 agent 配置（避免双实现）；单消息 60s 保活原地更新；内置 Go sidecar 接官方长连接；球常驻 + 托盘「退出 TREE」 | 待开始（已拍板） | 按 S1→S5 开工（先 S1 骨架与管理封装，再 S2 sidecar） | [feishu-remote-control-ui-recon.md](pluginization/feishu-remote-control-ui-recon.md) §10/§11 |
 
 **车道 H 门控覆盖**（冻结版 [production-line-gates.md](pluginization/production-line-gates.md)）：
 LG-01~07 就绪门（结构 / 文档归一化 / 包图 / 文档图 / 代码索引 / 测试映射 / 复合就绪）；
