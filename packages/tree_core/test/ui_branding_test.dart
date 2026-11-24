@@ -1,6 +1,8 @@
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
+import 'package:tree_core/src/plugin/plugin_bus.dart';
 import 'package:tree_core/src/plugin/ui_branding.dart';
 
 /// 片 E / 5.5：`system.collect.ui.branding` 的闸门与生效顺序。
@@ -331,6 +333,68 @@ void main() {
       Directory(icon.path).createSync();
       expect(await registry.revalidateActive(), isNull);
       expect(registry.active, isNull);
+    });
+  });
+  group('允许目录包含 UI 插件自身的安装根（runtime: ui 的 command 所在目录）', () {
+    late Directory appRoot;
+    late Directory otherRoot;
+    late PluginBus bus;
+    late List<String> busLogs;
+
+    setUp(() async {
+      appRoot = await Directory.systemTemp.createTemp('tree_brand_uiroot_');
+      otherRoot = await Directory.systemTemp.createTemp('tree_brand_other_');
+      busLogs = <String>[];
+      // 随包形态：`tree_ui.exe` 与核心同目录，不在 plugins/ 之下。
+      File('${appRoot.path}/plugins.yaml').writeAsStringSync(
+        'enabled: true\n'
+        'plugins:\n'
+        '  - id: ui.default\n'
+        "    command: '${p.join(appRoot.path, 'tree_ui.exe')}'\n"
+        '    runtime: ui\n'
+        '    enabled: false\n',
+      );
+      bus = PluginBus(configFile: '${appRoot.path}/plugins.yaml', log: busLogs.add);
+      // 基线只给另一处目录：UI 安装根是否被算进来完全取决于 runtime: ui 的解析。
+      bus.configureBrandingDirs(<String>[otherRoot.path]);
+    });
+
+    tearDown(() async {
+      if (appRoot.existsSync()) await appRoot.delete(recursive: true);
+      if (otherRoot.existsSync()) await otherRoot.delete(recursive: true);
+    });
+
+    File writeIconInRoot() {
+      final File file = File(
+        p.join(appRoot.path, 'data', 'flutter_assets', 'assets', 'tray_icon.ico'),
+      );
+      file.parent.createSync(recursive: true);
+      file.writeAsBytesSync(_ico(<int>[16, 32, 48, 256]));
+      return file;
+    }
+
+    test('安装根内的图标被接受，无需把它显式加进白名单', () async {
+      final File icon = writeIconInRoot();
+      await bus.declareUiBranding('ui.default', <String, dynamic>{
+        'icon': icon.path,
+        'role': 'exe',
+      });
+      expect(bus.activeBranding?.pluginId, 'ui.default');
+      expect(bus.activeBranding?.icon, icon.path);
+      expect(busLogs.where((String l) => l.contains('品牌申报被拒')), isEmpty);
+    });
+
+    test('安装根之外仍然拒收（放宽只针对该 UI 插件的安装根）', () async {
+      final File evil = File('${otherRoot.path}/evil.ico');
+      evil.writeAsBytesSync(_ico(<int>[16, 32, 48, 256]));
+      // 空白名单 = 没有任何允许目录：otherRoot 里的图标必须被拒。
+      bus.configureBrandingDirs(const <String>[]);
+      await bus.declareUiBranding('ui.default', <String, dynamic>{
+        'icon': evil.path,
+        'role': 'exe',
+      });
+      expect(bus.activeBranding, isNull);
+      expect(busLogs.any((String l) => l.contains('品牌申报被拒')), isTrue);
     });
   });
 }

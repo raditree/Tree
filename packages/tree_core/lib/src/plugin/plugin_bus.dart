@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:path/path.dart' as p;
 import 'package:tree_protocol/tree_protocol.dart'
     show
         ApiMetaBranding,
@@ -212,8 +213,35 @@ class PluginBus {
   /// 核心只读文件、只记账：**绝不改写 exe 的 PE 资源**。
   late final UiBrandingRegistry branding = UiBrandingRegistry(log: log);
 
+  /// 品牌闸门的基础允许目录（核心启动时注入；测试可显式给临时目录）。
+  ///
+  /// 生效口径 = 本表 **+ 每条 `runtime: ui` 插件的安装根**（见 [_refreshBrandingDirs]）：
+  /// 随包界面与核心同目录（`tree_ui.exe` + `plugin.json`），不在 `plugins/` 之下，
+  /// 只认 `plugins/` 会把它的品牌申报全部拒掉。
+  List<String> _brandingBaseDirs = const <String>[];
+
   /// 配置品牌闸门允许的插件目录（核心启动时注入；测试可显式给临时目录）。
+  ///
+  /// 这里**只**落基础目录：不读 `plugins.yaml`，否则会在核心启动那一刻把配置
+  /// 钉成快照（之后写盘的条目不生效）。UI 安装根在申报 / 重校验时再并进来。
   void configureBrandingDirs(Iterable<String> dirs) {
+    _brandingBaseDirs = dirs.where((String d) => d.trim().isNotEmpty).toList();
+    branding.configureAllowedDirs(_brandingBaseDirs);
+  }
+
+  /// 重算生效允许目录：基础目录 + UI 插件自身的安装根（`command` 所在目录）。
+  ///
+  /// 每次品牌申报前重算而不是启动时算一次：插件可以热装、可以改 `command`，
+  /// 缓存一份会让刚装上的界面继续被拒。只按 `runtime: ui` 归类，**不认具体
+  /// plugin id**；相对 `command`（PATH 里找的那种）没有可证明的安装根，跳过。
+  void _refreshBrandingDirs() {
+    final Set<String> dirs = <String>{..._brandingBaseDirs};
+    for (final PluginConfig config in configs()) {
+      if (config.runtimeKind != PluginRuntimeKind.ui) continue;
+      final String command = config.command.trim();
+      if (command.isEmpty || !p.isAbsolute(command)) continue;
+      dirs.add(p.dirname(command));
+    }
     branding.configureAllowedDirs(dirs);
   }
 
@@ -237,6 +265,8 @@ class PluginBus {
   /// - [payload] 为空 ⇒ 撤回该插件（回退上一条 / 默认）。
   /// - 闸门失败 ⇒ **撤销**该插件原有申报并记可读日志（不留旧图）。
   Future<void> declareUiBranding(String pluginId, Object? payload) async {
+    // 重算允许目录：热装 / 改过 command 的界面插件不该沿用启动那一刻的白名单。
+    _refreshBrandingDirs();
     // 每次应用前重校验：文件被删 / 不可读 ⇒ 回默认 + 一条可读日志。
     await branding.revalidateActive();
     if (payload == null) {
@@ -252,6 +282,7 @@ class PluginBus {
 
   /// 应用前重校验当前品牌（loader / 测试可显式调用）。
   Future<void> revalidateUiBranding() async {
+    _refreshBrandingDirs();
     await branding.revalidateActive();
   }
 
