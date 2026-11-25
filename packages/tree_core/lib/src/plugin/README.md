@@ -433,6 +433,17 @@
     随进程关闭，作业内进程连同之后 fork 的孙进程由内核统一终止；核心自己绝不加入该作业。
     非 Windows / 创建或 Assign 失败一律降级为空操作，只记日志，不阻断插件启动。
 
+36. **核心数据根 `TREE_DATA_ROOT` 对无头插件也注入（与 UI 插件同口径）**（2026-11-25，
+    [plugin_host.dart](plugin_host.dart)、[plugin_bus.dart](plugin_bus.dart)）：
+    `PluginHost.start(dataRoot:)` 在 `Process.start` 的环境里注入 `TREE_DATA_ROOT`
+    （空串 = 未接线，**不写这个键**，老插件照旧工作），`PluginBus._spawn` 传
+    `dataDir`。此前只有 [ui_host.dart](ui_host.dart) 注入，无头插件只能等第一条带
+    `data_dir` 的委派请求才绑得上配置根——现场后果是 `mcp` 插件启动时读不到
+    `<数据根>/config/mcp.yaml`，它启动期贡献的工具表只剩 4 个元工具，UI 的 agent
+    工具目录里看不到任何 MCP 工具（要等用户打开 MCP 配置页才有了配置，而工具表
+    早已采过）。同一份数据根口径现在只有一处例外：`TREE_CORE_URL` /
+    `TREE_CORE_TOKEN` / `TREE_UI_WINDOW_ID` 只给界面进程。
+
 ## 测试
 
 ```bash

@@ -3140,3 +3140,49 @@ M6 已修：时间衰减改全局乘数、embedding 按模型分槽并接入检�
 7. **#54 三个提示词 provider 仍未接线**（Spec 索引 / 已选 Spec 全文 / 工作空间提示词文件），
    与本条独立，见上一条。
 
+
+---
+
+## #56 MCP 工具在 UI / agent 工具表里长期缺项（数据根没注入 + 20s 握手超时）
+
+**状态**：**已修复**（2026-11-25；核心 `plugin_host` 注入 `TREE_DATA_ROOT`、mcp 插件 0.4.1）。
+
+### 现象
+
+- 右栏「MCP 配置」里 `web-search`（`npx -y mcp-remote https://search.parallel.ai/mcp`）条目一直在，
+  但 UI 的 **agent 配置 → 工具** 里始终看不到 `mcp__web-search__web_search` 这类工具。
+- `GET /api/mcp/services` 时快时慢，慢的时候整条请求要 20s，回包 `tools: []` 且
+  `errors: {"web-search": "TimeoutException after 0:00:20.000000: Future not completed"}`。
+- `mcp` 插件日志（`logs/plugins/mcp.log`）只有一句「未拿到 TREE_DATA_ROOT：config/mcp.yaml 将在
+  首次 /api/mcp/services 请求时按委派信封的 data_dir 延迟加载」。
+
+### 根因 1（核心）：`TREE_DATA_ROOT` 只注入 UI 插件，无头插件拿不到
+
+`ui_host.dart` 注入、`plugin_host.dart` 不注入。而 `mcp` / `production.line` / `settings` /
+`storage` 都读这个变量当配置根的回退。于是 mcp 插件启动时 `servers()` 为空 ⇒ 收集站只贡献
+4 个元工具（`mcp` / `mcp_resources` / `mcp_prompts` / `mcp_context`），文件里的服务要等
+**某条 REST 委派**把 `data_dir` 送进来才绑得上——而工具表那时早已采集过。
+
+### 根因 2（插件）：20s 上界卡在握手分布的尾部，且失败后没人再试
+
+实测同一台机器上 `npx -y mcp-remote <url>`：第一次 8.1s、第二次 10.3s、以核心目录为 cwd 时
+13.7s（冷缓存更久），而 20s 预算还要盖住 **initialize + 三轮 */*list 分页**。超时后
+`Future.timeout` 只是让调用方不再等：`_initialize()` 仍在后台跑，`client.close()` 之后抛出的是
+无人接的异步异常；而错误信息里丢了子进程 stderr（真实原因全在那儿）。失败还会进 30s 退避
+窗口，但**没有后台重试**——连接只由启动 / GET / `tools/call` 三处触发，用户不打开 MCP 配置页
+就再没人试。
+
+### 修复
+
+1. `PluginHost.start(dataRoot:)` 注入 `TREE_DATA_ROOT`（空 = 不写这个键），`PluginBus._spawn`
+   传 `dataDir`；新增 `plugin_test.dart` 用例（真子进程 + `--env-dump`）。
+2. mcp 插件：握手窗口默认 60s、`TREE_MCP_HANDSHAKE_TIMEOUT_MS` 可覆盖；超时改成**真取消**
+   （先关进程，再翻译成可读错误），错误里附子进程 stderr 末段。
+3. mcp 插件：失败按 30s→60s→120s→240s→300s 退避**后台重试**，`close()` / 停用 / 删服务即取消。
+4. mcp 插件：收集站订阅移到连接之前（订阅毫秒级、连接几十秒级），连接改后台补齐。
+
+### 验证
+
+- `cd plugins/mcp && dart analyze && dart test`（22 passed，新增 3 例：握手超时带 stderr、
+  握手窗口解析、后台重试）。
+- `cd packages/tree_core && dart test test/plugin_test.dart`（7 passed，新增数据根注入用例）。

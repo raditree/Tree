@@ -6144,6 +6144,9 @@ class PluginBus {
       heartbeatInterval: heartbeatInterval,
       coreVersion: coreVersion,
       resumeDumpId: resumeDumpId,
+      // 数据根：与 UI 插件同口径注入（见 `PluginHost.start` 的 [dataRoot]）。
+      // 插件启动期就要读 `<数据根>/config/*.yaml`，不能只等委派信封的 `data_dir`。
+      dataRoot: dataDir,
       onNotification: (Map<String, dynamic> notification) =>
           _emitPluginEvent(config.id, notification),
       // stderr 的**落盘**副本：日志 API 的数据源就是这份文件（见 PluginLogSink）。

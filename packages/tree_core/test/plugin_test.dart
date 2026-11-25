@@ -82,6 +82,50 @@ void main() {
     expect(await host.ping(), isTrue);
   });
 
+  test('宿主：注入 TREE_DATA_ROOT（与 UI 插件同口径）；未接线时不注入', () async {
+    // 现场回归：mcp 插件启动时读不到数据根 ⇒ `config/mcp.yaml` 加载推迟到第一条
+    // 带 `data_dir` 的委派请求，启动期贡献的工具表因此缺项（UI 的 agent 工具目录里
+    // 看不到 MCP 工具）。无头插件与 UI 插件必须同一口径注入。
+    Future<Map<String, String>> dumpEnv({String dataRoot = ''}) async {
+      final String dump = p.join(
+        temp.path,
+        'env-${dataRoot.isEmpty ? 'empty' : 'root'}.json',
+      );
+      final PluginHost host = await PluginHost.start(
+        PluginConfig(
+          id: 'sample',
+          name: '样例插件',
+          command: Platform.resolvedExecutable,
+          args: <String>[script, '--env-dump', dump],
+          env: <String, String>{'PROBE_ENV': 'marker-1'},
+        ),
+        dataRoot: dataRoot,
+      );
+      addTearDown(host.close);
+      final Stopwatch watch = Stopwatch()..start();
+      while (!File(dump).existsSync()) {
+        if (watch.elapsed > const Duration(seconds: 10)) {
+          fail('插件没有写出环境快照（${watch.elapsed.inMilliseconds}ms）');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      return (jsonDecode(File(dump).readAsStringSync()) as Map<dynamic, dynamic>)
+          .map((dynamic k, dynamic v) => MapEntry(k.toString(), '$v'));
+    }
+
+    final Map<String, String> wired = await dumpEnv(dataRoot: r'C:\tree-data');
+    expect(wired['TREE_DATA_ROOT'], r'C:\tree-data');
+    expect(wired['PROBE_ENV'], 'marker-1', reason: 'config.env 仍逐键注入');
+    expect(wired['TREE_APP_USER_MODEL_ID'], isNotEmpty);
+
+    final Map<String, String> plain = await dumpEnv();
+    expect(
+      plain['TREE_DATA_ROOT'],
+      isEmpty,
+      reason: '未接线时不注入（插件读到的是"没接线"，不是一个空串路径）',
+    );
+  });
+
   test('宿主：工具调用无静态超时；进程退出才以可读错误失败', () async {
     // M9 §1.1：取消静态总时长上限——插件不回应时调用**一直等**（不会因时间被杀）。
     // 这里让插件进程直接退出，验证在途调用以可读错误显式失败（不静默、不永久挂起）。

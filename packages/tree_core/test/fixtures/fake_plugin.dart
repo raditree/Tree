@@ -44,6 +44,7 @@ import 'dart:io';
 /// - --api-delegate-status N / --api-delegate-body TEXT：text 模式的状态码 / 正文。
 /// - --api-result-size N：result 模式写一个 N 字节文件并只回 `result_path`。
 /// - --api-result-path PATH：escape 模式直接回这个路径（越界校验用例）。
+/// - --env-dump PATH：启动时把核心注入的关键环境变量写成 JSON（AUMID / 数据根 / 自定义键）。
 void main(List<String> args) {
   String eventsFile = '';
   String pingGateFile = '';
@@ -85,6 +86,8 @@ void main(List<String> args) {
   String uiTeam = '';
   // 启动时往 stderr 写一行：验证核心把插件 stderr 落进插件日志文件。
   String stderrLine = '';
+  // 环境快照落盘：核心注入的键（AUMID / 数据根）与 `config.env` 在真进程里是否到位。
+  String envDumpFile = '';
   for (int i = 0; i < args.length - 1; i++) {
     if (args[i] == '--events-file') eventsFile = args[i + 1];
     if (args[i] == '--ignore-ping-until') pingGateFile = args[i + 1];
@@ -112,10 +115,24 @@ void main(List<String> args) {
     }
     if (args[i] == '--api-result-path') apiResultPath = args[i + 1];
     if (args[i] == '--stderr-line') stderrLine = args[i + 1];
+    if (args[i] == '--env-dump') envDumpFile = args[i + 1];
   }
   // SSH 执行接管者默认显式订 `ssh.execute`（留空 relay 只订工具前/后）。
   if (sshExecuteFamily && relayPoint.isEmpty) relayPoint = 'ssh.execute';
   if (stderrLine.isNotEmpty) stderr.writeln(stderrLine);
+  if (envDumpFile.isNotEmpty) {
+    // 只导出测试关心的键：整份环境写盘既慢又容易带上无关的平台差异。
+    File(envDumpFile).writeAsStringSync(
+      jsonEncode(<String, String>{
+        for (final String key in <String>[
+          'TREE_DATA_ROOT',
+          'TREE_APP_USER_MODEL_ID',
+          'PROBE_ENV',
+        ])
+          key: Platform.environment[key] ?? '',
+      }),
+    );
+  }
 
   /// 插件**主动**发起的请求：id → 等待核心响应的 completer。
   final Map<Object?, Completer<Map<String, dynamic>>> pendingRequests =

@@ -54,12 +54,19 @@ class PluginHost {
   /// 方向必须没提错：`hello` 是**核心→插件**的请求，所以这个信息只能出现在它的
   /// **参数**里（而不是“hello 响应”——响应是插件自己写的，它无从得知核心池里有什么）。
   /// **为空时不写这个键**：老插件的 hello 参数集与改动前逐字一致（D3 向后兼容）。
+  ///
+  /// [dataRoot]：核心数据根。接线了就注入 `TREE_DATA_ROOT`——**与 [UiHost.start]
+  /// 同口径**。无头插件也靠它找 `<数据根>/config/*.yaml` 这类配置（mcp /
+  /// production.line / settings / storage 都读这个变量，缺了就只能等第一条带
+  /// `data_dir` 的委派请求才绑得上）：插件启动期贡献的工具表会因此缺项。
+  /// 空串 = 未接线（老口径），该键不注入。
   static Future<PluginHost> start(
     PluginConfig config, {
     Duration timeout = const Duration(seconds: 20),
     Duration heartbeatInterval = LivenessTracker.defaultInterval,
     String coreVersion = '',
     String resumeDumpId = '',
+    String dataRoot = '',
     void Function(Map<String, dynamic> notification)? onNotification,
     Future<Map<String, dynamic>> Function(
       String method,
@@ -86,6 +93,9 @@ class PluginHost {
           // 统一应用标识：插件在自己的启动例程里据此设置 AUMID（进程内 API，
           // 核心替它设不了）。没读这个变量的老插件照旧工作。
           kAppUserModelIdEnv: kAppUserModelId,
+          // 数据根：与 UI 插件同一口径（`TREE_DATA_ROOT`，不接受 config.env 覆盖）。
+          // 空 = 未接线，键不注入（老插件照旧工作，不会读到一个空串路径）。
+          if (dataRoot.trim().isNotEmpty) 'TREE_DATA_ROOT': dataRoot.trim(),
         },
         runInShell: Platform.isWindows && _needsShell(config.command),
       );
