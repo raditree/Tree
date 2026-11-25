@@ -5,8 +5,8 @@ import 'dart:io';
 ///
 /// UI 已是 `runtime: ui` 插件，发布物不再是"桌面安装包"，而是树里的一份插件产物：
 /// ```
-/// tree-ui-default-{ver}.zip
-///   tree_ui.exe          # 界面可执行体（打包链已把它从 Tree.exe 改名过来）
+/// <id 点换横线>-{ver}.zip
+///   <清单里的 command>   # 界面可执行体（默认 tree_ui.exe）
 ///   flutter_windows.dll
 ///   *.dll
 ///   data/
@@ -16,6 +16,7 @@ import 'dart:io';
 ///
 /// 用法（仓库根目录）：
 ///   dart run tool/package_ui_plugin.dart [--build]
+///   dart run tool/package_ui_plugin.dart --ui-dir plugins/tree.ui.feishu --build
 ///
 /// 选项：
 ///   --build               先跑 `flutter build windows --release`（默认用已有产物）
@@ -24,11 +25,15 @@ import 'dart:io';
 ///   --out DIR             产物目录（默认 dist，相对仓库根）
 ///   --index FILE          要合并进索引的文件（默认 build/plugins/plugin-index.json）
 ///   --no-index            只打包，不动发布索引
-///   --version x.y.z       插件版本（默认取 UI 的 pubspec.yaml 的 `+` 之前部分）
+///   --version x.y.z       插件版本（默认取 pubspec.yaml 的 `+` 之前部分）
 ///   --no-zip              只准备目录，不压缩
 ///
+/// 清单以 `<ui-dir>/plugin.json` 为准（id / 名称 / command / requires / granularity）；
+/// 缺清单时退回 `tree.ui.default` 的默认值。需要 Go sidecar 的插件可在
+/// `<ui-dir>/tool/build_sidecar.dart` 放构建脚本，打包前会自动调用。
+///
 /// 排除：`*.pdb`、核心 `tree_core.exe`、引导壳（`Tree.exe` / `tree_launcher.exe`）
-/// 与目标机 agent（`agents/`）。界面可执行体只收一份，固定叫 `tree_ui.exe`。
+/// 与目标机 agent（`agents/`）。界面可执行体只收一份，名字取清单里的 `command`。
 ///
 /// **索引条目（2026-11-01）**：UI 带 `data/` 与几十个 dll，扁平 `files[]` 装不下，
 /// 所以这条以 `archive` 形态进索引（整包 zip + 包内 `plugin.json`）。装机端
@@ -72,6 +77,23 @@ Future<void> _package(List<String> args) async {
     );
   }
   final Map<String, String> pubspecData = _readPubspec(pubspec);
+  final File manifestSource = File(_join(uiDir.path, 'plugin.json'));
+  Map<String, dynamic> sourceManifest = <String, dynamic>{};
+  if (manifestSource.existsSync()) {
+    try {
+      final Object? decoded = jsonDecode(manifestSource.readAsStringSync());
+      if (decoded is Map) {
+        sourceManifest = decoded.map(
+          (Object? k, Object? v) => MapEntry(k.toString(), v),
+        );
+      }
+    } catch (error) {
+      throw _UsageError('plugin.json 读不动（${manifestSource.path}）：$error', 2);
+    }
+  }
+  final String pluginId = '${sourceManifest['id'] ?? kPluginId}'.trim();
+  final String pluginName = '${sourceManifest['name'] ?? kPluginName}'.trim();
+  final String targetExe = '${sourceManifest['command'] ?? kTargetExe}'.trim();
   final String version =
       options.version ?? _versionOf(pubspecData['version'] ?? '0.0.0');
   final String appExeName = '${_binaryName(uiDir)}.exe';
@@ -90,15 +112,31 @@ Future<void> _package(List<String> args) async {
       throw _UsageError('flutter build windows 失败（exit=$code）', code);
     }
   }
+  // 需要 Go sidecar 的 UI 插件自带构建脚本（插件仓内），这里只负责调用；
+  // 产物直接落到 release 目录，后面的收集逻辑会把它一起打进包。
+  final File sidecarBuilder = File(
+    _join(uiDir.path, 'tool/build_sidecar.dart'),
+  );
+  if (sidecarBuilder.existsSync()) {
+    stdout.writeln('== 构建 sidecar ==');
+    final int code = await _runLive(
+      'dart',
+      <String>['run', 'tool/build_sidecar.dart'],
+      uiDir.path,
+    );
+    if (code != 0) {
+      throw _UsageError('sidecar 构建失败（exit=$code）', code);
+    }
+  }
 
   final File appExe = File(_join(releaseDir.path, appExeName));
   // 打包链已把界面改名为 tree_ui.exe（见 package_windows.dart ①b）；直接用
-  // `flutter build` 的目录则还是 Tree.exe，两种都收，落到包里统一叫 tree_ui.exe。
-  final File uiSource = File(_join(releaseDir.path, kTargetExe));
+  // `flutter build` 的目录则还是 Tree.exe，两种都收，落到包里统一叫清单里的 command。
+  final File uiSource = File(_join(releaseDir.path, targetExe));
   final File resolvedSource = uiSource.existsSync() ? uiSource : appExe;
   if (!resolvedSource.existsSync()) {
     throw _UsageError(
-      '找不到界面可执行文件：$kTargetExe 或 $appExeName\n'
+      '找不到界面可执行文件：$targetExe 或 $appExeName\n'
       '先构建或传 --release-dir（默认 build/windows/x64/runner/Release）。',
       3,
     );
@@ -106,7 +144,7 @@ Future<void> _package(List<String> args) async {
 
   final Directory outDir = Directory(_join(root.path, options.out));
   outDir.createSync(recursive: true);
-  final Directory staging = Directory(_join(outDir.path, kPluginId));
+  final Directory staging = Directory(_join(outDir.path, pluginId));
   if (staging.existsSync()) staging.deleteSync(recursive: true);
   staging.createSync(recursive: true);
 
@@ -133,12 +171,12 @@ Future<void> _package(List<String> args) async {
       continue;
     }
     if (lower == 'plugin.json') continue; // 下面按本包的版本重写
-    if (lower == kTargetExe) continue; // 界面可执行体在循环外单独收一次
+    if (lower == targetExe.toLowerCase()) continue; // 界面可执行体在循环外单独收一次
     entity.copySync(_join(staging.path, name));
     copied += 1;
   }
-  resolvedSource.copySync(_join(staging.path, kTargetExe));
-  stdout.writeln('   可执行体：${_basename(resolvedSource.path)} → $kTargetExe');
+  resolvedSource.copySync(_join(staging.path, targetExe));
+  stdout.writeln('   可执行体：${_basename(resolvedSource.path)} → $targetExe');
   copied += 1;
   if (copied == 0) {
     throw _UsageError('发行目录是空的：${releaseDir.path}', 3);
@@ -146,15 +184,24 @@ Future<void> _package(List<String> args) async {
 
   final File manifest = File(_join(staging.path, 'plugin.json'));
   manifest.writeAsStringSync(
-    const JsonEncoder.withIndent('  ').convert(_manifest(version)),
+    const JsonEncoder.withIndent('  ').convert(
+      _manifest(
+        version: version,
+        pluginId: pluginId,
+        pluginName: pluginName,
+        targetExe: targetExe,
+        source: sourceManifest,
+      ),
+    ),
   );
-  stdout.writeln('   plugin.json（$kPluginId $version）');
+  stdout.writeln('   plugin.json（$pluginId $version）');
 
   String? zipPath;
   if (options.noZip) {
     stdout.writeln('   目录：${staging.path}');
   } else {
-    zipPath = _join(outDir.path, 'tree-ui-default-$version.zip');
+    final String zipName = '${pluginId.replaceAll('.', '-')}-$version.zip';
+    zipPath = _join(outDir.path, zipName);
     if (File(zipPath).existsSync()) File(zipPath).deleteSync();
     stdout.writeln('== 打包 zip（tar -a）==');
     final int code = await _runLive('tar', <String>[
@@ -168,7 +215,7 @@ Future<void> _package(List<String> args) async {
     if (code != 0) {
       throw _UsageError('压缩失败（exit=$code）', code);
     }
-    await _verifyZip(root, zipPath);
+    await _verifyZip(root, zipPath, targetExe, pluginId);
     stdout.writeln(
       '   产物：$zipPath'
       '（${(File(zipPath).lengthSync() / 1024 / 1024).toStringAsFixed(1)} MB）',
@@ -179,25 +226,38 @@ Future<void> _package(List<String> args) async {
       );
       final int added = _mergeIndex(
         indexFile,
-        version,
-        _basename(zipPath),
-        File(zipPath).lengthSync(),
+        version: version,
+        fileName: _basename(zipPath),
+        bytes: File(zipPath).lengthSync(),
+        pluginId: pluginId,
+        pluginName: pluginName,
+        targetExe: targetExe,
+        source: sourceManifest,
       );
       stdout.writeln(
-        '   索引：${indexFile.path}（tree.ui.default ${added == 0 ? '已是最新' : '已写入'}）',
+        '   索引：${indexFile.path}（$pluginId ${added == 0 ? '已是最新' : '已写入'}）',
       );
     }
   }
 }
 
-/// 把 `tree.ui.default` 合并进发布索引（`schema: 1` + `plugins[]`）。
+/// 把 UI 插件合并进发布索引（`schema: 1` + `plugins[]`）。
 ///
 /// 为什么用 **archive** 而不是 `files[]`：索引对每项 `target` 要求纯文件名，而 UI
 /// 包里有 `data/…` 与几十个 dll；`files[]` 表达不了目录，装上去只会缺文件。
 /// 整包形态在装机端由 `PluginDownloader._installArchive` 落到 `plugins/<id>/`。
 ///
 /// 返回本次写入的条数（0 = 已经有一条同版本的，什么都没改）。
-int _mergeIndex(File indexFile, String version, String archive, int bytes) {
+int _mergeIndex(
+  File indexFile, {
+  required String version,
+  required String fileName,
+  required int bytes,
+  required String pluginId,
+  required String pluginName,
+  required String targetExe,
+  required Map<String, dynamic> source,
+}) {
   Map<String, dynamic> document = <String, dynamic>{
     'schema': 1,
     'plugins': <dynamic>[],
@@ -219,31 +279,26 @@ int _mergeIndex(File indexFile, String version, String archive, int bytes) {
   final List<dynamic> plugins = rawPlugins is List
       ? List<dynamic>.of(rawPlugins)
       : <dynamic>[];
+  final Map<String, dynamic> manifest = _manifest(
+    version: version,
+    pluginId: pluginId,
+    pluginName: pluginName,
+    targetExe: targetExe,
+    source: source,
+  );
   final Map<String, dynamic> entry = <String, dynamic>{
-    'id': kPluginId,
-    'name': kPluginName,
-    'version': version,
-    'description': 'Tree 的默认图形界面（runtime: ui）。',
-    'runtime': 'ui',
-    'command': kTargetExe,
-    'args': <String>[],
-    'granularity': 'team',
-    'scope': <String, dynamic>{},
-    'requires': <String, dynamic>{
-      'api': '>=1.0 <2.0',
-      'plugins': kUiPluginDependencies,
-    },
-    'archive': archive,
+    ...manifest,
+    'archive': fileName,
     'archive_bytes': bytes,
-  };
+  }..remove('files');
   final int index = plugins.indexWhere(
-    (Object? item) => item is Map && '${item['id']}'.trim() == kPluginId,
+    (Object? item) => item is Map && '${item['id']}'.trim() == pluginId,
   );
   if (index >= 0) {
     final Map<String, dynamic> previous = (plugins[index] as Map)
         .map((Object? k, Object? v) => MapEntry(k.toString(), v));
     if ('${previous['version']}' == version &&
-        '${previous['archive']}' == archive &&
+        '${previous['archive']}' == fileName &&
         (previous['archive_bytes'] as num?)?.toInt() == bytes) {
       return 0;
     }
@@ -260,27 +315,50 @@ int _mergeIndex(File indexFile, String version, String archive, int bytes) {
   return 1;
 }
 
-Map<String, dynamic> _manifest(String version) => <String, dynamic>{
-  'id': kPluginId,
-  'name': kPluginName,
-  'version': version,
-  'description': 'Tree 的默认图形界面（runtime: ui）。',
-  'runtime': 'ui',
-  'command': kTargetExe,
-  'args': <String>[],
-  // UI 插件的"只跑一个实例"由 UiHost 保证（每个插件 id 一个宿主进程）；
-  // granularity 只影响 headless 的实例编组，这里沿用契约内的默认值。
-  'granularity': 'team',
-  'scope': <String, dynamic>{},
-  'requires': <String, dynamic>{
-    'api': '>=1.0 <2.0',
-    'plugins': kUiPluginDependencies,
-  },
-  'files': <String>['**'],
-};
+/// 生成落进包里的 `plugin.json`：以源清单为准（名称 / 依赖 / 粒度都可不同），
+/// 只在 id、版本、command 上用本次打包的确定值。
+Map<String, dynamic> _manifest({
+  required String version,
+  required String pluginId,
+  required String pluginName,
+  required String targetExe,
+  required Map<String, dynamic> source,
+}) {
+  final Object? rawRequires = source['requires'];
+  final Map<String, dynamic> requires = rawRequires is Map
+      ? rawRequires.map((Object? k, Object? v) => MapEntry(k.toString(), v))
+      : <String, dynamic>{
+          'api': '>=1.0 <2.0',
+          'plugins': kUiPluginDependencies,
+        };
+  return <String, dynamic>{
+    'id': pluginId,
+    'name': pluginName,
+    'version': version,
+    'description': '${source['description'] ?? 'Tree 的图形界面（runtime: ui）。'}',
+    'runtime': 'ui',
+    'command': targetExe,
+    'args': source['args'] is List ? source['args'] : <String>[],
+    // UI 插件的"只跑一个实例"由 UiHost 保证（每个插件 id 一个宿主进程）；
+    // granularity 只影响 headless 的实例编组，这里沿用源清单 / 契约默认值。
+    'granularity': '${source['granularity'] ?? 'team'}',
+    'scope': source['scope'] is Map
+        ? source['scope']
+        : <String, dynamic>{},
+    'requires': requires,
+    'files': source['files'] is List
+        ? source['files']
+        : <String>['**'],
+  };
+}
 
-/// 校验 zip 里**必须有** `tree_ui.exe` 与 `plugin.json`，且**不能有**被排除项。
-Future<void> _verifyZip(Directory root, String zipPath) async {
+/// 校验 zip 里**必须有**界面可执行体与 `plugin.json`，且**不能有**被排除项。
+Future<void> _verifyZip(
+  Directory root,
+  String zipPath,
+  String targetExe,
+  String pluginId,
+) async {
   final ProcessResult result = await Process.run('tar', <String>[
     '-tf',
     zipPath,
@@ -296,9 +374,9 @@ Future<void> _verifyZip(Directory root, String zipPath) async {
       .map((String name) => name.split('/').first)
       .where((String name) => name.isNotEmpty)
       .toSet();
-  for (final String required in <String>[kTargetExe, 'plugin.json']) {
+  for (final String required in <String>[targetExe, 'plugin.json']) {
     if (!roots.contains(required)) {
-      throw _UsageError('压缩包缺少 $required（内容：${roots.join(', ')}）', 4);
+      throw _UsageError('$pluginId 压缩包缺少 $required（内容：${roots.join(', ')}）', 4);
     }
   }
   for (final String banned in <String>[
@@ -371,7 +449,17 @@ Future<int> _runLive(String exe, List<String> args, String workingDirectory) asy
   return process.exitCode;
 }
 
-String _join(String left, String right) => '$left${Platform.pathSeparator}$right';
+/// 拼路径：`right` 已经是绝对路径（盘符 / 前导斜杠）时原样返回。
+///
+/// 调用方（如 `package_windows --bundle-ui`）可能把 `--out` 传成绝对路径，
+/// 直接字符串拼接会得到 `<repo>\E:\...` 这种不存在的路径。
+String _join(String left, String right) {
+  if (right.startsWith('/') || right.startsWith(r'\') ||
+      RegExp(r'^[A-Za-z]:[\\/]').hasMatch(right)) {
+    return right;
+  }
+  return '$left${Platform.pathSeparator}$right';
+}
 
 String _basename(String path) => path.split(RegExp(r'[\\/]')).last;
 

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
 import 'plugin_config_store.dart';
@@ -29,6 +30,9 @@ const String kBundledSnapshotKey = 'bundled_snapshot';
 /// - `<exeDir>/plugins/plugin-index.json` 存在（只有全量版会带它）；
 /// - 该条目声明的每个 `files[].target` 都真在 `plugins/` 里，且字节数与索引一致
 ///   （打包链漏拷 / 半截文件 ⇒ 不写一条注定起不来的配置）；
+/// - **目录形态**（带到 `data/` 与几十个 dll 的 UI 插件）：索引给 `archive` +
+///   `archive_bytes`，本函数把压缩包解到 `plugins/<id>/` 再登记，命令指向解出来的
+///   那份；`enabled` 默认 **false**（替代界面不该在用户没点过的情况下自己弹窗）。
 /// - `plugins.yaml` 里**没有**这一条 ⇒ 新登记；已有 `source: bundled` 的条目按
 ///   「版本或成品指纹变化」**原地升级**；用户手改过的（签名对不上）与别的来源
 ///   （local / release）一律不动。
@@ -79,13 +83,23 @@ List<String> seedBundledPlugins({
 
   final List<String> seeded = <String>[];
   for (final _BundledEntry entry in byId.values) {
-    if (entry.runtime == 'ui') continue; // 界面走 seedDesktopUiPlugin，不在这里登记
+    // 扁平 UI 条目（只有 exe、没有 data/ 与 dll）不是完整界面：默认界面由
+    // seedDesktopUiPlugin 单独管，索引里误放也不在这里登记；目录形态（archive）
+    // 才是可随包分发的替代界面（如飞书悬浮球），下面按「默认停用」登记。
+    if (entry.runtime == 'ui' && entry.archive.isEmpty) continue;
     final Map<String, dynamic>? existing = store.readEntry(entry.id);
     if (existing == null) {
       final String? missing = entry.missingArtifact(dir);
       if (missing != null) {
         log?.call('随包插件 ${entry.id} 跳过：$missing');
         continue;
+      }
+      if (entry.archive.isNotEmpty) {
+        final String? error = _installArchive(entry, dir);
+        if (error != null) {
+          log?.call('随包插件 ${entry.id} 跳过：$error');
+          continue;
+        }
       }
       final Map<String, dynamic> config = entry.toConfigEntry(
         dir,
@@ -100,6 +114,54 @@ List<String> seedBundledPlugins({
         continue;
       }
       seeded.add(entry.id);
+      continue;
+    }
+
+    // **路径失效修复**（不换版本、只改指向）：安装方式混用后最常见的一种死法 ——
+    // 先按目录形态（`plugins/<id>/<exe>`）装过，后来全量包把成品换成扁平
+    // （`plugins/<exe>`）并清掉了旧目录；`plugins.yaml` 仍指旧路，核心每次启动
+    // 都只报「系统找不到指定的文件」，对用户来说就是“插件坏了”。
+    //
+    // 口径刻意收得比升级更紧：
+    // - 只在**命令指向的文件真的不在盘上**时动手（可用路径一律不碰，含用户的
+    //   `source: local` 自建版本）；
+    // - 只在随包成品**齐且字节数对**时动手（不写一条注定起不来的配置）；
+    // - 只在**版本一致**时动手：条目没写版本、或与随包版本不同，都说明“盘上那份
+    //   不是这一条对应的成品”，替用户换就是在擅自升降级 —— 只留一行日志。
+    // 修完不参与下面的随包升级判定（来源仍是用户/发布源的，核心不替它换代）。
+    final String storedCommand = '${existing['command'] ?? ''}'.trim();
+    if (storedCommand.isEmpty || !File(storedCommand).existsSync()) {
+      final String storedVersion = '${existing['repo_version'] ?? ''}'.trim();
+      final String? missing = entry.missingArtifact(dir);
+      if (missing != null) {
+        log?.call('插件 ${entry.id} 的命令已失效，随包成品也不可用：$missing');
+      } else if (storedVersion.isEmpty || storedVersion != entry.version) {
+        log?.call(
+          '插件 ${entry.id} 的命令已失效，但版本无法确认'
+          '（条目 ${storedVersion.isEmpty ? '未写' : storedVersion}'
+          ' ≠ 随包 ${entry.version}）：不改它的路径',
+        );
+      } else {
+        String? installError;
+        if (entry.archive.isNotEmpty) {
+          installError = _installArchive(entry, dir);
+        }
+        if (installError != null) {
+          log?.call('插件 ${entry.id} 命令修复失败：$installError');
+        } else {
+          final String repaired = entry.commandPath(dir);
+          final PluginStoreResult result = store.update(
+            entry.id,
+            <String, dynamic>{'command': repaired},
+          );
+          if (result.ok) {
+            seeded.add(entry.id);
+            log?.call('插件 ${entry.id} 的命令已失效，已重指到随包成品：$repaired');
+          } else {
+            log?.call('插件 ${entry.id} 命令修复失败：${result.error}');
+          }
+        }
+      }
       continue;
     }
 
@@ -143,6 +205,13 @@ List<String> seedBundledPlugins({
     final bool bytesChanged = storedDigest != digest;
     if (!versionChanged && !bytesChanged) continue;
 
+    if (entry.archive.isNotEmpty) {
+      final String? error = _installArchive(entry, dir);
+      if (error != null) {
+        log?.call('随包插件 ${entry.id} 升级失败：$error');
+        continue;
+      }
+    }
     final Map<String, dynamic> next = entry.toConfigEntry(
       dir,
       source: kBundledPluginSourceValue,
@@ -165,11 +234,67 @@ List<String> seedBundledPlugins({
   return seeded;
 }
 
+/// 把索引声明的压缩包解到 `plugins/<id>/`（目录形态的插件，主要是 UI）。
+///
+/// 先解到临时目录再整体换位：解包失败时旧目录保持原样（Windows 上正在运行的
+/// 插件会锁 exe/dll，替换失败就留到下次启动再试，绝不接受半截目录）。
+/// 返回 null = 成功且 command 已在解出来的目录里；否则是可读原因。
+String? _installArchive(_BundledEntry entry, String dir) {
+  final File zip = File(p.join(dir, entry.archive));
+  final Directory target = Directory(p.join(dir, entry.id));
+  final Directory staging = Directory(p.join(dir, '.${entry.id}.installing'));
+  try {
+    if (staging.existsSync()) staging.deleteSync(recursive: true);
+    staging.createSync(recursive: true);
+    final Archive archive = ZipDecoder().decodeBytes(zip.readAsBytesSync());
+    for (final ArchiveFile file in archive) {
+      if (!file.isFile) continue;
+      final String? name = _normalizeArchiveName(file.name);
+      if (name == null) return '压缩包里有越界路径：${file.name}';
+      final File out = File(p.join(staging.path, name));
+      out.parent.createSync(recursive: true);
+      out.writeAsBytesSync(file.content as List<int>);
+    }
+    if (target.existsSync()) target.deleteSync(recursive: true);
+    staging.renameSync(target.path);
+  } catch (error) {
+    try {
+      if (staging.existsSync()) staging.deleteSync(recursive: true);
+    } catch (_) {
+      // 临时目录清不掉不影响主流程：下次启动会先清再解。
+    }
+    return '解包失败（${entry.archive}）：$error';
+  }
+  if (entry.command.isEmpty) return '索引没有声明 command';
+  final File command = File(p.join(target.path, entry.command));
+  if (!command.existsSync()) return '压缩包里没有 command：${entry.command}';
+  return null;
+}
+
+/// zip 条目名归一化：只接受相对路径，丢掉 `./` 与空段，拒绝 `..` / 盘符 / 绝对路径。
+String? _normalizeArchiveName(String raw) {
+  final String name = raw.replaceAll('\\', '/');
+  if (name.isEmpty || name.startsWith('/') || name.contains(':')) return null;
+  final List<String> parts = <String>[];
+  for (final String part in name.split('/')) {
+    if (part.isEmpty || part == '.') continue;
+    if (part == '..') return null;
+    parts.add(part);
+  }
+  if (parts.isEmpty) return null;
+  return parts.join('/');
+}
+
 /// 成品指纹：按 target 排序后对每个文件取「长度 + 内容哈希」。
 ///
 /// 只读随包目录里的成品（几 MB），在「已有 source: bundled 条目」时才计算；
 /// 用 FNV-1a 32 位而不是引入 crypto 依赖：这里只需要“变了没有”，不需要密码学强度。
 String _artifactDigest(_BundledEntry entry, String dir) {
+  if (entry.archive.isNotEmpty) {
+    final File zip = File(p.join(dir, entry.archive));
+    final List<int> bytes = zip.readAsBytesSync();
+    return '${entry.archive}:${bytes.length}:${_fnvHex(bytes)};';
+  }
   final List<String> targets = entry.files.keys.toList()..sort();
   final StringBuffer out = StringBuffer();
   for (final String target in targets) {
@@ -239,6 +364,8 @@ class _BundledEntry {
     required this.suspension,
     required this.requires,
     required this.files,
+    this.archive = '',
+    this.archiveBytes = 0,
   });
 
   final String id;
@@ -255,6 +382,11 @@ class _BundledEntry {
 
   /// target → 声明字节数（0 = 不校验）。
   final Map<String, int> files;
+
+  /// 目录形态的插件包（UI 带 `data/` 与几十个 dll，扁平装不下）：
+  /// 压缩包放在 `plugins/` 下，解到 `plugins/<id>/` 后 command 再指向里面。
+  final String archive;
+  final int archiveBytes;
 
   static _BundledEntry? parse(Map<dynamic, dynamic> json) {
     final String id = '${json['id'] ?? ''}'.trim();
@@ -279,6 +411,8 @@ class _BundledEntry {
       suspension: '${json['suspension'] ?? ''}',
       requires: json['requires'],
       files: _readFiles(json['files']),
+      archive: '${json['archive'] ?? ''}'.trim(),
+      archiveBytes: (json['archive_bytes'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -303,6 +437,16 @@ class _BundledEntry {
 
   /// 返回第一个不可用的原因（null = 成品齐且字节数对得上）。
   String? missingArtifact(String dir) {
+    if (archive.isNotEmpty) {
+      final File zip = File(p.join(dir, archive));
+      if (!zip.existsSync()) return '插件包不在盘上：$archive';
+      if (archiveBytes > 0 && zip.lengthSync() != archiveBytes) {
+        return '插件包字节数不符：$archive'
+            '（${zip.lengthSync()} ≠ $archiveBytes）';
+      }
+      if (command.isEmpty) return '索引没有声明 command';
+      return null;
+    }
     if (files.isEmpty) return '索引里没有 files 声明';
     if (command.isEmpty || !files.containsKey(command)) {
       return 'command（$command）不在 files 里';
@@ -319,6 +463,10 @@ class _BundledEntry {
     return null;
   }
 
+  /// 配置里 command 该落的绝对路径：目录形态在 `plugins/<id>/` 里，扁平就在 `plugins/`。
+  String commandPath(String dir) =>
+      archive.isNotEmpty ? p.join(dir, id, command) : p.join(dir, command);
+
   Map<String, dynamic> toConfigEntry(String dir, {required String source}) =>
       <String, dynamic>{
         'id': id,
@@ -326,10 +474,12 @@ class _BundledEntry {
         if (description.isNotEmpty) 'description': description,
         // 索引里的 command 是纯文件名（构建链已校验），落盘必须换成绝对路径：
         // 核心拉起插件时不经过 shell，相对路径会按“核心的工作目录”解析。
-        'command': p.join(dir, command),
+        'command': commandPath(dir),
         'args': args,
         'env': <String, String>{},
-        'enabled': true,
+        // 替代界面（runtime: ui）随包登记时默认停用：全量包不该在用户没点过
+        // 的情况下多弹一个窗口/悬浮球。无头插件维持“装了就能用”的既有口径。
+        'enabled': runtime != 'ui',
         'granularity': granularity,
         'scope': scope,
         if (suspension.isNotEmpty) 'suspension': suspension,

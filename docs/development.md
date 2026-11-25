@@ -246,6 +246,11 @@ dart run tool/package_windows.dart --flutter "<flutter.bat 的路径>"
 dart run tool/package_ui_plugin.dart --build
 # 产物：dist/tree-ui-default-<版本>.zip + build/plugins/plugin-index.json 的 tree.ui.default 条目
 
+# 其它 UI 插件（id / 名称 / command / 依赖都取自该目录的 plugin.json）
+dart run tool/package_ui_plugin.dart --ui-dir plugins/tree.ui.feishu --build --no-index
+# 若插件目录带 tool/build_sidecar.dart（例如 tree.ui.feishu 的 Go sidecar），
+# 打包工具会先调用它，把二进制一并收进 zip。
+
 # 只要核心单文件
 dart run tool/build_core.dart            # → dist/tree_core.exe（约 10 MB）
 
@@ -267,6 +272,9 @@ dart run tool/package_windows.dart --installer --iscc "C:\Program Files (x86)\In
 
 # 两个安装包一起出：普通版 + 全量版（全量版自带 build/plugins 里的全部插件成品）
 dart run tool/package_windows.dart --installer --bundle-plugins
+# 全量版额外带一个**目录形态**的 UI 插件（如飞书悬浮球）：出 zip → 按 archive 进索引，
+# 首次启动解到 plugins/<id>/ 并登记为**停用**（替代界面不自己弹窗，用户自己开）
+dart run tool/package_windows.dart --installer --bundle-plugins --bundle-ui plugins/tree.ui.feishu
 # 产物：
 #   dist/installer/tree-desktop-<版本>-windows-x64-setup.exe       （普通版）
 #   dist/installer/tree-desktop-<版本>-windows-x64-full-setup.exe  （全量版）
@@ -287,7 +295,8 @@ dart run tool/package_windows.dart --installer --bundle-plugins
    成品只从发布仓库装，②e 的断言会在发行目录里发现成品时直接失败。要出「全量版」时加
    `--bundle-plugins`：脚本先跑 `build_plugins`，把全部成品与 `plugin-index.json` 拷进
    **另一份** `dist/full-release/`，核心首次启动按“索引在 + 成品齐 + 字节数对 + 用户没写过
-   这一条”自动登记并启用（插件 README 不变量 34）——两个版本目录互不污染；
+   这一条”自动登记（无头插件启用；`--bundle-ui` 带进来的 UI 插件登记为停用）——两个版本
+   目录互不污染；
 5. 写 `使用说明.txt`（数据目录、可手改的配置文件、常见问题）；
 6. **自检**：真启动一次打包好的核心，读到握手再让它优雅退出；
 7. 压 zip 到 `dist/`。

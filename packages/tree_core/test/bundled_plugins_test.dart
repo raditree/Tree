@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:tree_core/tree_core.dart';
@@ -58,6 +59,36 @@ void main() {
     'granularity': 'team',
     'scope': <String, dynamic>{},
   };
+
+  /// 写一个目录形态的插件包（UI 插件：exe + dll + data/）。
+  List<int> writeArchive(
+    String dir,
+    String name,
+    Map<String, String> files,
+  ) {
+    final Archive archive = Archive();
+    for (final MapEntry<String, String> item in files.entries) {
+      final List<int> bytes = utf8.encode(item.value);
+      archive.addFile(ArchiveFile(item.key, bytes.length, bytes));
+    }
+    final List<int> encoded = ZipEncoder().encode(archive);
+    File(p.join(dir, name)).writeAsBytesSync(encoded);
+    return encoded;
+  }
+
+  Map<String, dynamic> archiveEntry({int? bytes, String version = '0.1.0'}) =>
+      <String, dynamic>{
+        'id': 'tree.ui.feishu',
+        'name': '飞书远程控制',
+        'version': version,
+        'runtime': 'ui',
+        'command': 'app.exe',
+        'args': <String>[],
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        'archive': 'tree-ui-feishu-0.1.0.zip',
+        'archive_bytes': bytes ?? 0,
+      };
 
   test('成品齐、字节数对 ⇒ 登记为绝对路径并启用', () {
     final String dir = pluginsDir();
@@ -208,6 +239,179 @@ void main() {
       isEmpty,
     );
     expect(s.readEntry('demo')!['command'], mine);
+  });
+
+  test('命令指向的文件消失（目录形态被扁平成品覆盖）⇒ 按同版本随包成品重指，其余不动', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe');
+    writeIndex(dir, <Map<String, dynamic>>[entry()]);
+    final PluginConfigStore s = store();
+    // 现场：先按目录形态装过（plugins/demo/demo.exe），后来全量包换成扁平成品，
+    // 旧目录被清掉，plugins.yaml 仍指旧路。
+    expect(
+      s.create(<String, dynamic>{
+        'id': 'demo',
+        'command': p.join(dir, 'demo', 'demo.exe'),
+        'args': <String>[],
+        'enabled': false,
+        'granularity': 'team',
+        'scope': <String, dynamic>{},
+        'source': 'local',
+        'repo_version': '1.2.3',
+      }).ok,
+      isTrue,
+    );
+    final List<String> logged = <String>[];
+
+    final List<String> seeded = seedBundledPlugins(
+      store: s,
+      executableDir: temp.path,
+      log: logged.add,
+    );
+
+    expect(seeded, <String>['demo']);
+    final Map<String, dynamic> saved = s.readEntry('demo')!;
+    expect(saved['command'], p.join(dir, 'demo.exe'));
+    expect(saved['enabled'], isFalse, reason: '开关是用户状态，修路径不覆盖');
+    expect(saved['source'], 'local', reason: '只修指向，不改来源');
+    expect(
+      logged.any((String m) => m.contains('已重指到随包成品')),
+      isTrue,
+    );
+  });
+
+  test('命令失效但随包版本不同 ⇒ 不擅自换二进制（只留日志）', () {
+    final String dir = pluginsDir();
+    writeArtifact(dir, 'demo.exe');
+    writeIndex(dir, <Map<String, dynamic>>[entry(version: '2.0.0')]);
+    final PluginConfigStore s = store();
+    final String stale = p.join(dir, 'demo', 'demo.exe');
+    expect(
+      s.create(<String, dynamic>{
+        'id': 'demo',
+        'command': stale,
+        'source': 'local',
+        'repo_version': '1.2.3',
+      }).ok,
+      isTrue,
+    );
+    final List<String> logged = <String>[];
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path, log: logged.add),
+      isEmpty,
+    );
+    expect(s.readEntry('demo')!['command'], stale);
+    expect(logged.any((String m) => m.contains('版本无法确认')), isTrue);
+  });
+
+  test('命令失效且随包成品缺失 ⇒ 不改配置（不写注定起不来的条目）', () {
+    final String dir = pluginsDir();
+    writeIndex(dir, <Map<String, dynamic>>[entry()]); // 索引有、成品没落盘
+    final PluginConfigStore s = store();
+    final String stale = p.join(dir, 'demo', 'demo.exe');
+    expect(
+      s.create(<String, dynamic>{
+        'id': 'demo',
+        'command': stale,
+        'source': 'local',
+        'repo_version': '1.2.3',
+      }).ok,
+      isTrue,
+    );
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      isEmpty,
+    );
+    expect(s.readEntry('demo')!['command'], stale);
+  });
+
+  test('目录形态（archive）⇒ 解到 plugins/<id>/ 后登记，UI 默认停用', () {
+    final String dir = pluginsDir();
+    final List<int> zip = writeArchive(
+      dir,
+      'tree-ui-feishu-0.1.0.zip',
+      <String, String>{
+        './app.exe': 'exe',
+        './data/flutter_assets/hint.txt': 'data',
+      },
+    );
+    writeIndex(dir, <Map<String, dynamic>>[archiveEntry(bytes: zip.length)]);
+    final PluginConfigStore s = store();
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      <String>['tree.ui.feishu'],
+    );
+    final Map<String, dynamic> saved = s.readEntry('tree.ui.feishu')!;
+    expect(saved['command'], p.join(dir, 'tree.ui.feishu', 'app.exe'));
+    expect(saved['runtime'], 'ui');
+    expect(saved['enabled'], isFalse, reason: '替代界面不该自己弹窗');
+    expect(
+      File(p.join(dir, 'tree.ui.feishu', 'data', 'flutter_assets', 'hint.txt'))
+          .existsSync(),
+      isTrue,
+    );
+    // 幂等：解过一次就不再动（也不会把用户后来打开的开关关回去）。
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      isEmpty,
+    );
+  });
+
+  test('目录形态：命令失效 + 同版本 ⇒ 重新解包并重指，开关与来源保留', () {
+    final String dir = pluginsDir();
+    final List<int> zip = writeArchive(
+      dir,
+      'tree-ui-feishu-0.1.0.zip',
+      <String, String>{'./app.exe': 'exe'},
+    );
+    writeIndex(dir, <Map<String, dynamic>>[archiveEntry(bytes: zip.length)]);
+    final PluginConfigStore s = store();
+    final String command = p.join(dir, 'tree.ui.feishu', 'app.exe');
+    expect(
+      s.create(<String, dynamic>{
+        'id': 'tree.ui.feishu',
+        'command': command,
+        'runtime': 'ui',
+        'source': 'local',
+        'repo_version': '0.1.0',
+        'enabled': false,
+      }).ok,
+      isTrue,
+    );
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      <String>['tree.ui.feishu'],
+    );
+    final Map<String, dynamic> saved = s.readEntry('tree.ui.feishu')!;
+    expect(saved['command'], command);
+    expect(saved['source'], 'local');
+    expect(saved['enabled'], isFalse);
+    expect(File(command).existsSync(), isTrue);
+  });
+
+  test('目录形态：插件包字节数不符 ⇒ 不解包也不登记', () {
+    final String dir = pluginsDir();
+    final List<int> zip = writeArchive(
+      dir,
+      'tree-ui-feishu-0.1.0.zip',
+      <String, String>{'./app.exe': 'exe'},
+    );
+    writeIndex(
+      dir,
+      <Map<String, dynamic>>[archiveEntry(bytes: zip.length + 1)],
+    );
+    final PluginConfigStore s = store();
+
+    expect(
+      seedBundledPlugins(store: s, executableDir: temp.path),
+      isEmpty,
+    );
+    expect(s.readEntry('tree.ui.feishu'), isNull);
+    expect(Directory(p.join(dir, 'tree.ui.feishu')).existsSync(), isFalse);
   });
 
   test('成品缺失 / 字节数不符 ⇒ 跳过并给出原因', () {

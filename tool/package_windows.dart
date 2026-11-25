@@ -30,6 +30,9 @@ import 'package:tree_protocol/tree_protocol.dart';
 ///                        plugin-index.json 一起打进发行目录（首次启动自动登记启用）
 ///   --plugins-dir dir     插件成品目录（默认 build/plugins；只在 --bundle-plugins 时用）
 ///   --skip-plugins-build  全量版复用已有插件产物（不重跑 tool/build_plugins.dart）
+///   --bundle-ui dir       随全量版带一个目录形态的 UI 插件（可重复；如
+///                        `plugins/tree.ui.feishu`）。出 zip 并按 archive 进索引，
+///                        首启解到 plugins/<id>/，**默认停用**，用户自己开。
 ///   --no-zip             只准备便携目录，不压缩
 ///   --skip-verify        跳过"启动打包好的核心读握手"自检
 Future<void> main(List<String> args) async {
@@ -342,6 +345,26 @@ Future<void> _package(List<String> args) async {
       );
     }
 
+    // 随包 UI 插件：目录形态（exe + dll + data/），复用发布同一条打包器。
+    // 产物 zip 落在 pluginsBuild，条目按 `archive` 形态并进索引；核心首启时
+    // 解到 `plugins/<id>/` 并登记为**停用**（替代界面不自己弹窗）。
+    for (final String uiSource in options.bundleUi) {
+      stdout.writeln('== 打包随包 UI 插件（$uiSource）==');
+      final int code = await _runLive(dart, <String>[
+        'run',
+        'tool/package_ui_plugin.dart',
+        '--ui-dir',
+        uiSource,
+        '--out',
+        pluginsBuild,
+        '--index',
+        pluginIndex.path,
+      ], root.path);
+      if (code != 0) {
+        await _fail('UI 插件打包失败（$uiSource，exit=$code）', code);
+      }
+    }
+
     fullReleasePath = _join(outDir.path, 'full-release');
     final Directory fullRelease = Directory(fullReleasePath);
     if (fullRelease.existsSync()) fullRelease.deleteSync(recursive: true);
@@ -477,6 +500,23 @@ void _assertBundledPluginsComplete(String pluginsDir) {
     if (item is! Map) continue;
     final String id = '${item['id'] ?? ''}';
     ids.add(id);
+    // 目录形态的 UI 插件带 `archive` + `archive_bytes`（没有 files[]）：
+    // 校验压缩包在盘上且字节数对得上即可，解包的事交给核心首启。
+    final String archive = '${item['archive'] ?? ''}'.trim();
+    if (archive.isNotEmpty) {
+      final File artifact = File(_join(pluginsDir, archive));
+      if (!artifact.existsSync()) {
+        throw StateError('全量版缺少插件包：$archive（插件 $id）');
+      }
+      final int declared = (item['archive_bytes'] as num?)?.toInt() ?? 0;
+      if (declared > 0 && artifact.lengthSync() != declared) {
+        throw StateError(
+          '全量版插件包字节数不符：$archive'
+          '（${artifact.lengthSync()} ≠ $declared，插件 $id）',
+        );
+      }
+      continue;
+    }
     final Object? files = item['files'];
     if (files is! List || files.isEmpty) {
       throw StateError('全量版索引条目 $id 没有 files 声明');
@@ -1246,6 +1286,7 @@ class _Options {
     this.bundlePlugins = false,
     this.pluginsDir,
     this.skipPluginsBuild = false,
+    this.bundleUi = const <String>[],
   });
 
   final String? flutter;
@@ -1270,6 +1311,10 @@ class _Options {
   /// 全量版复用已有插件产物（不重跑 `tool/build_plugins.dart`）。
   final bool skipPluginsBuild;
 
+  /// 随全量版分发的 UI 插件源码目录（目录形态，如 `plugins/tree.ui.feishu`）。
+  /// 走 `tool/package_ui_plugin.dart` 出 zip 并按 `archive` 形态并进索引。
+  final List<String> bundleUi;
+
   static _Options parse(List<String> args) {
     String? flutter;
     String? iscc;
@@ -1284,6 +1329,7 @@ class _Options {
     bool bundlePlugins = false;
     bool skipPluginsBuild = false;
     String? pluginsDir;
+    final List<String> bundleUi = <String>[];
     for (int i = 0; i < args.length; i++) {
       String value() => i + 1 < args.length ? args[++i] : '';
       switch (args[i]) {
@@ -1314,6 +1360,8 @@ class _Options {
           pluginsDir = value();
         case '--skip-plugins-build':
           skipPluginsBuild = true;
+        case '--bundle-ui':
+          bundleUi.add(value());
         case '--help':
         case '-h':
           throw const _UsageError(0);
@@ -1335,6 +1383,7 @@ class _Options {
       bundlePlugins: bundlePlugins,
       pluginsDir: pluginsDir,
       skipPluginsBuild: skipPluginsBuild,
+      bundleUi: bundleUi,
     );
   }
 }
