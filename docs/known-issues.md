@@ -3143,9 +3143,9 @@ M6 已修：时间衰减改全局乘数、embedding 按模型分槽并接入检�
 
 ---
 
-## #56 MCP 工具在 UI / agent 工具表里长期缺项（数据根没注入 + 20s 握手超时）
+## #56 MCP 工具在 UI / agent 工具表里长期缺项（数据根没注入 + 20s 握手超时 + 订阅只试一次）
 
-**状态**：**已修复**（2026-11-25；核心 `plugin_host` 注入 `TREE_DATA_ROOT`、mcp 插件 0.4.1）。
+**状态**：**已修复**（2026-11-25；核心 `plugin_host` 注入 `TREE_DATA_ROOT`、mcp 插件 0.4.2）。
 
 ### 现象
 
@@ -3172,6 +3172,15 @@ M6 已修：时间衰减改全局乘数、embedding 按模型分槽并接入检�
 窗口，但**没有后台重试**——连接只由启动 / GET / `tools/call` 三处触发，用户不打开 MCP 配置页
 就再没人试。
 
+### 根因 3（插件）：收集站订阅只试一次，核心启动顺序一颠倒就整世不贡献工具
+
+收集站 `plugin.tree.agent.collect.tools` 由 tree.agent 注册，核心启动时两个插件的就绪顺序
+不固定。实测（2026-11-25 22:58 重启）mcp 比 tree.agent 早约 1 秒，订阅回「站点不存在」，
+而代码只调一次 `station/subscribe`、失败仅记一行日志 ⇒ 这一世进程再也不会贡献工具：
+`models-info.tool_catalog` 只剩 4 个 MCP 元工具，三个 `mcp__web-search__*` 一条都没有，
+只能热重启 mcp 插件或打开 MCP 配置页才恢复。旧版侥幸能用的那一轮，是碰巧 mcp 晚于
+tree.agent 就绪。
+
 ### 修复
 
 1. `PluginHost.start(dataRoot:)` 注入 `TREE_DATA_ROOT`（空 = 不写这个键），`PluginBus._spawn`
@@ -3180,9 +3189,14 @@ M6 已修：时间衰减改全局乘数、embedding 按模型分槽并接入检�
    （先关进程，再翻译成可读错误），错误里附子进程 stderr 末段。
 3. mcp 插件：失败按 30s→60s→120s→240s→300s 退避**后台重试**，`close()` / 停用 / 删服务即取消。
 4. mcp 插件：收集站订阅移到连接之前（订阅毫秒级、连接几十秒级），连接改后台补齐。
+5. mcp 插件 0.4.2：收集站订阅失败按 0.5s→1s→2s→4s→(封顶 5s) 退避重试 8 次（约 28s，盖住
+   核心启动窗口），成功即停；订阅与连接都放后台，上线本身不等待它们。
 
 ### 验证
 
 - `cd plugins/mcp && dart analyze && dart test`（22 passed，新增 3 例：握手超时带 stderr、
   握手窗口解析、后台重试）。
 - `cd packages/tree_core && dart test test/plugin_test.dart`（7 passed，新增数据根注入用例）。
+- 0.4.2 装机验证：热重启后日志「订阅 tree.agent 收集站：成功（第 1 次）」；整机重启 Tree
+  后无需任何手动操作，`models-info` 目录 **26 条**、三个 `mcp__web-search__*` 均
+  `enabled: true`。
