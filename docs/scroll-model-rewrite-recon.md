@@ -287,6 +287,19 @@ UI 入口 [api_service.dart L629-L707](../plugins/tree.ui.default/lib/io/api_ser
 | `test/message_scrollbar_test.dart` | 保留几何互逆；删平滑限速相关断言 |
 | `test/message_panel_window_work_test.dart` | 改为 `before` 单链 + 尾巴冻结；删 `splitGapAtViewportTop` 用例 |
 
+### 4.2 R2/R3 真机验收热修（2026-11-25，用户视频 + 截图报告）
+
+真机反馈四症状「卡顿、跳动、滚到一半没法继续滚、贴底没做好」+「左栏点会话每次都弹
+临时员工锁定提示」。根因与处置（R7 提前并入本次）：
+
+| # | 症状 | 根因 | 处置 |
+|---|---|---|---|
+| H1 | 每次都弹锁定提示 | `SessionListBridge.publish(locked:)` 误传 `_modeLocked`（运行模式锁，agent 有历史即为真），左栏按"子代理视角锁"消费 | 改传 `_viewSubagentId.isNotEmpty`（与标题栏 SessionPicker 同口径） |
+| H2 | 滚到一半没法继续滚 | 补页只由末尾哨兵触发 = 零前瞻；页 51 条还受服务端字节预算截短，网络一来回用户已撞墙 | `_onWindowChanged` 里"视口最旧可见行距已加载最旧 **< 一页**"即前瞻调度 `_loadOlder`（哨兵保留兜底；严格小于：裁剪稳态恰好留"视口 + 一页"，`<=` 会让贴底每帧白启一轮补页） |
+| H3 | 跳动（甩回底部） | `appendOlder` 连续性校验失败直接 `_reloadTail` ⇒ 窗口重置 + jumpTo(0) | 失败先保位自愈：`at=` 重锚当前最旧那条 + 按 id 落回视口；仍失败才 `_reloadTail` |
+| H4 | 贴底没做好 | 贴底判据 `pixels<=1 && atTail`：缓冲非空时 `atTail` 恒假 ⇒ 滚到底也不合并缓冲、不恢复跟随 | 新增 `MessageFeed.atTailIgnoringBuffer`（忽略缓冲的贴尾判据）替换该处 |
+| H5 | 卡顿 | 每条 `msg_chunk` 整面板 setState ⇒ MessageList 全重建 + Markdown 重排（= R7 未做） | R7 最小版落地：`ChatMessage.contentVersion` + `appendContent()`；气泡/思考行监听自重建；msg_chunk 分支不再 setState（右栏详情快照改帧后自排，同帧去重） |
+
 ---
 
 ## 5. 风险与不变量核对
@@ -313,6 +326,9 @@ UI 入口 [api_service.dart L629-L707](../plugins/tree.ui.default/lib/io/api_ser
 - **2026-11-22 用户拍板路线 2**：反向 ListView + 向上分页 + 锚点保持；
   **取消**全局槽位表、全局 `maxScrollExtent` 估算、补偿层（`padAboveStamp` / `contentShiftStamp` /
   实测锚点 / 帧后重试）。EXTREME 合成滚动用例已退役（插件仓 `3d87d8c`）。
+- **2026-11-25 R2/R3 真机验收不通过**（四症状 + 锁定误报，见 §4.2）：热修 H1~H4 并**提前落地
+  R7**（流式隔离）；R4/R5/R6/R8 维持原序。前瞻补页阈值取"一页"（`kMessageWindowRadius`），
+  连续性失败先保位自愈再重载末尾页。
 - **本期不动的既有能力**：折叠（含至多 2 组展开、工作期底部 5 张豁免）、显示/详细两分、
   临时员工零高度、滚动阻尼、内联卡片。
 
