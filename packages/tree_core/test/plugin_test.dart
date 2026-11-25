@@ -82,7 +82,7 @@ void main() {
     expect(await host.ping(), isTrue);
   });
 
-  test('宿主：注入 TREE_DATA_ROOT（与 UI 插件同口径）；未接线时不注入', () async {
+  test('宿主：注入 TREE_DATA_ROOT（与 UI 插件同口径）；未接线时置空而不继承', () async {
     // 现场回归：mcp 插件启动时读不到数据根 ⇒ `config/mcp.yaml` 加载推迟到第一条
     // 带 `data_dir` 的委派请求，启动期贡献的工具表因此缺项（UI 的 agent 工具目录里
     // 看不到 MCP 工具）。无头插件与 UI 插件必须同一口径注入。
@@ -122,7 +122,8 @@ void main() {
     expect(
       plain['TREE_DATA_ROOT'],
       isEmpty,
-      reason: '未接线时不注入（插件读到的是"没接线"，不是一个空串路径）',
+      reason: '未接线时置空：Process.start 默认继承父环境，只“不写键”会让插件'
+          '继承到核心自己都没接线的数据根（本机 shell 里设过的就会漏进来）',
     );
   });
 

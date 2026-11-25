@@ -436,7 +436,10 @@
 36. **核心数据根 `TREE_DATA_ROOT` 对无头插件也注入（与 UI 插件同口径）**（2026-11-25，
     [plugin_host.dart](plugin_host.dart)、[plugin_bus.dart](plugin_bus.dart)）：
     `PluginHost.start(dataRoot:)` 在 `Process.start` 的环境里注入 `TREE_DATA_ROOT`
-    （空串 = 未接线，**不写这个键**，老插件照旧工作），`PluginBus._spawn` 传
+    （空串 = 未接线，**照样写这个键并置空**——`Process.start` 默认
+    `includeParentEnvironment: true`，只“不写键”挡不住父进程的那个变量：核心要是从
+    登录 shell / 启动器 / 开发脚本继承了它，插件就会认一个核心根本没接线的数据根，
+    去读别人的 `config/*.yaml`。`UiHost.start` 同口径），`PluginBus._spawn` 传
     `dataDir`。此前只有 [ui_host.dart](ui_host.dart) 注入，无头插件只能等第一条带
     `data_dir` 的委派请求才绑得上配置根——现场后果是 `mcp` 插件启动时读不到
     `<数据根>/config/mcp.yaml`，它启动期贡献的工具表只剩 4 个元工具，UI 的 agent

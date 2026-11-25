@@ -921,8 +921,9 @@ class PluginBus {
     PluginConfig config, {
     String resumeDumpId = '',
   }) async {
-    if (_hosts.containsKey(config.id) || _uiHosts.containsKey(config.id))
+    if (_hosts.containsKey(config.id) || _uiHosts.containsKey(config.id)) {
       return;
+    }
     // **代际在拉起之前**就定下来：快照的索引键靠它，而「这一世是谁」必须在进程还
     // 没起来时就确定（否则转储与取回会各自猜一个号，两边对不上）。
     final int generation = (_generations[config.id] ?? 0) + 1;

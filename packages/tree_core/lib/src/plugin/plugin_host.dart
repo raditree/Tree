@@ -94,8 +94,14 @@ class PluginHost {
           // 核心替它设不了）。没读这个变量的老插件照旧工作。
           kAppUserModelIdEnv: kAppUserModelId,
           // 数据根：与 UI 插件同一口径（`TREE_DATA_ROOT`，不接受 config.env 覆盖）。
-          // 空 = 未接线，键不注入（老插件照旧工作，不会读到一个空串路径）。
-          if (dataRoot.trim().isNotEmpty) 'TREE_DATA_ROOT': dataRoot.trim(),
+          //
+          // **空也必须写**（显式置空）：`Process.start` 默认
+          // `includeParentEnvironment: true`，只「不写这个键」并不能让插件读不到——
+          // 核心进程自己若从父进程（登录 shell / 启动器 / 开发脚本）继承了
+          // `TREE_DATA_ROOT`，插件会照单全收一个**核心并不认识**的数据根，比读到空串
+          // 更危险（会去读别人的 `config/*.yaml`）。置空串即插件侧的"未接线"，
+          // 老插件照旧工作。
+          'TREE_DATA_ROOT': dataRoot.trim(),
         },
         runInShell: Platform.isWindows && _needsShell(config.command),
       );
