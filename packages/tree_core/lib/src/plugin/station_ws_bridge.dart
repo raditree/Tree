@@ -94,6 +94,13 @@ class StationWsBridge {
   final Map<String, Set<WsStationSubscriberChannel>> _channelsByStation =
       <String, Set<WsStationSubscriberChannel>>{};
 
+  /// 挂起握手：`pluginId#windowId` → 等 ack 的那一格。
+  ///
+  /// 只在 [requestSuspend] 的生命周期里存在；ack 到达 / 超时 / 连接断开都会被摘掉
+  /// （摘掉之后的重复 ack 按「首条生效」丢弃并记一行，见 `_handleSuspendAck`）。
+  final Map<String, _PendingSuspend> _pendingSuspend =
+      <String, _PendingSuspend>{};
+
   /// UI 插件 id → 它在本进程里注册的自建站（最后一个窗口断开时整批注销）。
   final Map<String, Set<String>> _ownedStations =
       <String, Set<String>>{};
@@ -120,6 +127,9 @@ class StationWsBridge {
       case WsInboundType.stationUnregister:
       case WsInboundType.stationTrigger:
         _handleStationFrame(connection, frame);
+        return true;
+      case WsInboundType.pluginSuspendAck:
+        _handleSuspendAck(connection, frame);
         return true;
       default:
         return false;
@@ -294,6 +304,14 @@ class StationWsBridge {
       _forgetChannel(channel);
     }
     state.channels.clear();
+    // 挂起握手里还在等这条连接的窗口：连接断了就不会再有 ack，当场判缺片
+    // （不让调用方干等到宽限到点——那是「等事件」而不是「等时长」）。
+    for (final String key in _pendingSuspend.keys.toList()) {
+      final _PendingSuspend? pending = _pendingSuspend[key];
+      if (pending == null || pending.connectionId != connection.id) continue;
+      _pendingSuspend.remove(key);
+      if (!pending.completer.isCompleted) pending.completer.complete(null);
+    }
     final _UiBond? bond = state.bond;
     if (bond == null) return;
     final bool hasOther = _connections.values.any(
@@ -414,6 +432,209 @@ class StationWsBridge {
       branding: branding?.call(),
     );
   }
+
+  // ── 生命周期握手（UI 热重启续跑，`ui-hot-restart-recon.md` §4.3）──────
+
+  /// 支持生命周期握手的连接，按 `window_id` 索引（同窗口多条时取先到的一条）。
+  ///
+  /// **判据是能力、不是文件**：只有 `ui.hello.capabilities` 明确含
+  /// `ui.lifecycle` 的连接才会被指名收 `plugin.suspend`。一个窗口现在有 2~3 条
+  /// WS 连接（业务 / 站点 / 插件监控），只有一条能拿到视图状态；用能力指名，
+  /// 核心就不用猜「发给谁」。
+  Map<String, WsConnection> lifecycleConnectionsOf(String pluginId) {
+    final Map<String, WsConnection> out = <String, WsConnection>{};
+    for (final _UiConnectionState state in _connections.values) {
+      final _UiBond? bond = state.bond;
+      if (bond == null || bond.pluginId != pluginId) continue;
+      if (!_hasLifecycleCapability(bond.capabilities)) continue;
+      if (!state.connection.isOpen) continue;
+      out.putIfAbsent(bond.windowId, () => state.connection);
+    }
+    return out;
+  }
+
+  /// 请求挂起：每个窗口发一条 `plugin.suspend`，等各自的 ack。
+  ///
+  /// 等的三样东西都是**事件**（没有心跳可等，UI 的活性只有进程退出）：
+  /// ack 到了 / 连接断了 / [exited] 完成。整体最多等 [grace]——它是**退出宽限**
+  /// 而不是判活时钟：到点只是不再等这一轮握手，调用方照常继续收尾，
+  /// 已收到的切片仍然有效（见计划 §4.4「ack 超时」一行）。
+  ///
+  /// 缺失的窗口进 [UiSuspendAcks.missing]：该窗口下一世按冷启动，其余窗口续上。
+  Future<UiSuspendAcks> requestSuspend(
+    String pluginId, {
+    required Set<String> windowIds,
+    required int generation,
+    required Duration grace,
+    Map<String, Future<void>> exited = const <String, Future<void>>{},
+  }) async {
+    final Map<String, WsConnection> targets = lifecycleConnectionsOf(pluginId);
+    final Map<String, Map<String, dynamic>> acks =
+        <String, Map<String, dynamic>>{};
+    final Set<String> missing = <String>{};
+    final Set<String> noConnection = <String>{};
+    final List<Future<void>> waits = <Future<void>>[];
+    for (final String windowId in windowIds) {
+      // 窗口号对不上时退回「没带窗口号」的连接（老版本 UI 的 hello 没有该字段）。
+      final WsConnection? connection = targets[windowId] ?? targets[''];
+      if (connection == null) {
+        missing.add(windowId);
+        noConnection.add(windowId);
+        continue;
+      }
+      final String key = _suspendKey(pluginId, windowId);
+      final Completer<Map<String, dynamic>?> waiter =
+          Completer<Map<String, dynamic>?>();
+      _pendingSuspend[key] = _PendingSuspend(
+        completer: waiter,
+        connectionId: connection.id,
+        windowId: windowId,
+      );
+      connection.send(<String, dynamic>{
+        'type': WsOutboundType.pluginSuspend,
+        'data': <String, dynamic>{
+          'reason': 'hot_restart',
+          'generation': generation,
+          'plugin_id': pluginId,
+          'window_id': windowId,
+        },
+      });
+      // **每个窗口各等自己的退出**：一个窗口先退不能提前给其它窗口下结论
+      // （否则多窗口里「快的那个」会把「还在写切片的那个」判成缺片）。
+      final Future<void>? dead = exited[windowId];
+      final Future<Map<String, dynamic>?> waited = dead == null
+          ? waiter.future
+          : Future.any<Map<String, dynamic>?>(<Future<Map<String, dynamic>?>>[
+              waiter.future,
+              dead.then<Map<String, dynamic>?>((void _) => null),
+            ]);
+      waits.add(
+        waited.then((Map<String, dynamic>? payload) {
+          if (payload == null) {
+            missing.add(windowId);
+          } else {
+            acks[windowId] = payload;
+          }
+        }),
+      );
+    }
+    if (waits.isNotEmpty) {
+      // 宽限到点只是「这一轮不再等」：还在路上的 ack 由 finally 摘掉并记一行。
+      await Future.wait(waits)
+          .then<void>((List<void> _) {})
+          .timeout(grace, onTimeout: () {});
+    }
+    // 收尾：把这一轮所有未决的等待摘掉（迟到的 ack 会被 `_handleSuspendAck`
+    // 按「首条已生效 / 本轮不再等」丢弃并记一行，不会串到下一次重启）。
+    for (final String windowId in windowIds) {
+      _pendingSuspend.remove(_suspendKey(pluginId, windowId));
+    }
+    missing.addAll(
+      windowIds.difference(acks.keys.toSet()).difference(missing),
+    );
+    final String reason;
+    if (acks.isEmpty) {
+      reason = noConnection.length == windowIds.length
+          ? '没有窗口声明 ui.lifecycle（旧构建 / 未接握手）⇒ 无从转储'
+          : '窗口 ${missing.join('、')} 在 ${grace.inSeconds}s 内没有交出切片'
+                '（ack 超时或连接断开）';
+    } else if (missing.isEmpty) {
+      reason = '${acks.length} 个窗口已交出视图状态切片';
+    } else {
+      reason = '${acks.length} 个窗口已交出切片；'
+          '${missing.join('、')} 缺片（该窗口按冷启动）';
+    }
+    log?.call('插件 $pluginId 的挂起握手：$reason');
+    return UiSuspendAcks(acks: acks, missing: missing, reason: reason);
+  }
+
+  /// 新世取回：把这一窗口的切片（或 `has_snapshot:false`）推给它的连接。
+  ///
+  /// 返回是否送达。**只发给声明了 `ui.lifecycle` 的连接**：旧构建收到未知帧本来
+  /// 也只是忽略，但这里仍然不猜——送达与否是调用方判 `resumed` 的证据之一。
+  bool pushResume(
+    String pluginId,
+    String windowId,
+    Map<String, dynamic> data,
+  ) {
+    final Map<String, WsConnection> targets = lifecycleConnectionsOf(pluginId);
+    // **只发给声明了 `ui.lifecycle` 的连接**，不做「任意绑定连接」兜底。
+    //
+    // 为什么不能兜底（2026-11-26 验收发现）：一个窗口有 2~3 条 WS 连接，只有承载
+    // 生命周期握手的那条能把 payload 交给状态注册表；发给业务 / 插件监控连接时
+    // 帧会被当成未知类型丢掉，而调用方却会把这当成「已送达」⇒ 切片被标记取走、
+    // 真正该续的窗口永远拿不到（静默丢状态）。宁可这一轮不送达（切片留在槽里，
+    // 下一次 hello 还能再推），也不把「发出去了」当成「续上了」。
+    final WsConnection? connection = targets[windowId] ?? targets[''];
+    if (connection == null) {
+      log?.call(
+        '插件 $pluginId 的窗口 ${windowId.isEmpty ? '(未命名)' : windowId} '
+        '没有声明 ui.lifecycle 的连接，plugin.resume 暂未送达（切片保留，'
+        '等下一次 ui.hello 再推）',
+      );
+      return false;
+    }
+    connection.send(<String, dynamic>{
+      'type': WsOutboundType.pluginResume,
+      'data': data,
+    });
+    return true;
+  }
+
+  /// `plugin.suspendAck`：校验 bond → 去重（首条生效）→ 交给等待方。
+  void _handleSuspendAck(
+    WsConnection connection,
+    Map<String, dynamic> frame,
+  ) {
+    final _UiBond? bond = _requireBond(connection, '回挂起应答');
+    if (bond == null) return;
+    final Map<String, dynamic> data = _data(frame);
+    final String rawWindow = (data['window_id'] ?? '').toString().trim();
+    final String windowId = rawWindow.isEmpty ? bond.windowId : rawWindow;
+    final String key = _suspendKey(bond.pluginId, windowId);
+    final _PendingSuspend? pending = _pendingSuspend.remove(key);
+    if (pending == null) {
+      // 首条 ack 生效：重复 / 迟到（本轮已按超时收尾）的应答只记一行，不改结论。
+      log?.call(
+        '丢弃插件 ${bond.pluginId} 窗口 ${windowId.isEmpty ? '(未命名)' : windowId} '
+        '重复或迟到的 plugin.suspendAck（首条已生效 / 本轮握手已收尾）',
+      );
+      return;
+    }
+    final bool ok = data['ok'] != false;
+    final bool dumped = data['dumped'] != false;
+    final String error = (data['error'] ?? '').toString().trim();
+    final Object? raw = data['payload'];
+    Map<String, dynamic>? payload;
+    if (raw is Map) {
+      payload = raw.map(
+        (Object? k, Object? v) => MapEntry(k.toString(), v),
+      );
+    }
+    if (!ok || !dumped || payload == null) {
+      log?.call(
+        '插件 ${bond.pluginId} 窗口 ${windowId.isEmpty ? '(未命名)' : windowId} '
+        '的挂起应答没有可用切片'
+        '${error.isEmpty ? (payload == null ? '（payload 缺失或不是 JSON 对象）' : '') : '：$error'}',
+      );
+      if (!pending.completer.isCompleted) pending.completer.complete(null);
+      return;
+    }
+    if (!pending.completer.isCompleted) pending.completer.complete(payload);
+  }
+
+  /// 挂起握手的索引键（插件 id 允许带点，用 `#` 分隔避免撞键）。
+  String _suspendKey(String pluginId, String windowId) =>
+      '$pluginId#$windowId';
+
+  /// 连接自报的能力里有没有 [uiLifecycleCapability]。
+  bool _hasLifecycleCapability(List<Object?> capabilities) => capabilities.any(
+    (Object? capability) =>
+        capability?.toString().trim() == uiLifecycleCapability,
+  );
+
+  /// UI 侧「支持生命周期握手」的能力名（与 `protocol_contract.dart` 同值）。
+  static const String uiLifecycleCapability = 'ui.lifecycle';
 
   // ── 上行处理 ────────────────────────────────────────────────────────
 
@@ -1215,4 +1436,42 @@ class _UiBond {
   /// 窗口 id（多窗口时由核心经 `TREE_UI_WINDOW_ID` 注入，UI 在 hello 里带回）。
   /// 空串 = 单窗口口径 / 老版本 UI。
   final String windowId;
+}
+
+/// 挂起握手里「等某个窗口 ack」的那一格。
+class _PendingSuspend {
+  const _PendingSuspend({
+    required this.completer,
+    required this.connectionId,
+    required this.windowId,
+  });
+
+  final Completer<Map<String, dynamic>?> completer;
+
+  /// 发出去的那条连接（连接断开时据此把还在等的窗口判成缺片）。
+  final String connectionId;
+
+  final String windowId;
+}
+
+/// 一轮挂起握手的结果（[StationWsBridge.requestSuspend]）。
+///
+/// 语义：**缺片不是失败**——每个窗口各自决定续跑还是冷启动（计划 §4.4「多窗口」）；
+/// [reason] 必须能直接进日志 / 回包，且不能把「没声明能力」说成「没在跑」。
+class UiSuspendAcks {
+  const UiSuspendAcks({
+    required this.acks,
+    required this.missing,
+    required this.reason,
+  });
+
+  /// 交出切片的窗口：`window_id → payload`（载荷对核心不透明）。
+  final Map<String, Map<String, dynamic>> acks;
+
+  /// 没交出切片的窗口（没声明能力 / ack 超时 / 连接断开 / 应答里没有 payload）。
+  final Set<String> missing;
+
+  final String reason;
+
+  bool get isEmpty => acks.isEmpty;
 }

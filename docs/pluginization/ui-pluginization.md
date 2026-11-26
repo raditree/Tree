@@ -99,6 +99,9 @@
 | `station/unregister`  | 上行 | 注销自建站                                                                                                                                        |
 | `station/trigger`     | 上行 | **仅用于向 UI 自建的广播站发布事件**；不得触发收集站或执行站——UI 的功能调用一律走 REST                                                                                         |
 | `station_delivery`    | 下行 | 站点投递给 WS 订阅者：`{station_id, point, topic?, payload, scope, origin_plugin_id, state}`；`state` 取值 `data` \| `closed`（站点注销/插件下线时终止订阅，附 `reason`） |
+| `plugin.suspend`      | 下行 | 请求挂起（**不是广播**，有明确目标与回执）：`{reason, generation, plugin_id, window_id}`；只发给 `ui.hello.capabilities` 含 `ui.lifecycle` 的连接（2026-11-26，见 §6.2.1） |
+| `plugin.suspendAck`   | 上行 | 挂起应答 + 本窗口视图状态切片：`{ok, dumped, window_id, plugin_id, bytes?, payload?, error?}`；同 `(plugin_id, window_id)` **首条生效** |
+| `plugin.resume`       | 下行 | 新世取回：`{has_snapshot, generation, dump_id?, window_id, payload?, reason?}`；每次 `ui.hello` 之后都推一条（冷启动 `has_snapshot:false`） |
 
 ### 3.3 插件 RPC 新增
 
@@ -416,9 +419,25 @@
 与 `PluginHost` 同级，职责极窄：
 
 1. `Process.start`，注入 `TREE_CORE_URL`（`ws://127.0.0.1:<port>` 基址）、`TREE_CORE_TOKEN`；
-2. **不做 stdio 握手**、不接 `tools/list`、不注册站点、不参与状态池与热重启续跑；
+2. **不参与 stdio 握手与工具面**、不接 `tools/list`、不注册站点；**生命周期握手与视图状态
+   快照例外**（见 §6.2.1：这是 2026-11-26 放开的唯一一条，其余仍不参与状态池）；
 3. 判活 = 进程退出事件 + 该插件的 WS 连接是否在场；
 4. 退出后按既有 `lifecycle` 置 `stopped`；被配置停用则不再拉起。
+
+#### 6.2.1 生命周期握手与视图状态（2026-11-26）
+
+UI 插件**不能**下 `station/command`，因此 stdio 那套「`suspend` → `plugin.stateDump` →
+退出 → 新世 `plugin.stateFetch`」在 UI 上没有入口。热重启为 UI 补的是**同语义、不同传输**
+的一条：`plugin.suspend` / `plugin.suspendAck` / `plugin.resume` 三条 WS 帧
+（见 [ui-hot-restart-recon.md](ui-hot-restart-recon.md) §4.2）。
+
+边界（只放开这些，别顺手扩大）：
+
+- **只有视图状态**：窗口几何、选中项、滚动锚点、展开态、草稿、右栏页签。消息正文、
+  工具结果、轮次状态、提问答案等**领域事实**一律不进出快照；
+- 载荷对核心**不透明**：核心只校验「是 JSON 对象 + 字节上限」，不认识任何字段名；
+- 快照只在核心内存（`PluginStatePool`，一份只喂一世、有 TTL，不落盘）；
+- 连接计数、scope、订阅权限的口径**不变**（仍是 §6.4 那张表）。
 
 `PluginBus._startOne` 按 `runtime` 分叉：`ui` 走 `UiHost`，`headless` 路径**逐字不变**。任何语言 / 执行形态都在 `headless` 这一档内，只由 `command` / `args` 决定启动方式，不参与分叉，核心代码里也不出现语言判断。
 

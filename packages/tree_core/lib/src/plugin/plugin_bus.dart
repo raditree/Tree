@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:path/path.dart' as p;
 import 'package:tree_protocol/tree_protocol.dart'
@@ -25,6 +26,7 @@ import 'plugin_state_pool.dart';
 import 'plugin_tool_definition.dart';
 import 'ui_branding.dart';
 import 'ui_host.dart';
+import 'ui_resume_slots.dart';
 import 'station_ids.dart';
 import 'station_channel.dart';
 import 'station_instance.dart';
@@ -33,6 +35,7 @@ import 'station_runtime.dart';
 import 'station_schema.dart';
 import 'station_scope.dart';
 import 'station_store.dart';
+import 'station_ws_bridge.dart';
 import 'stations.dart';
 
 /// 站点四元组的**运行期**解析器：插件配置 + 调用点上下文 → 四元组。
@@ -82,6 +85,7 @@ class PluginBus {
     this.connectTimeout = const Duration(seconds: 20),
     this.uiHelloWindow = const Duration(seconds: 30),
     this.uiExitGrace = const Duration(seconds: 1),
+    this.uiSuspendGrace = const Duration(seconds: 5),
     this.heartbeatInterval = LivenessTracker.defaultInterval,
     this.missThreshold = LivenessTracker.defaultMaxMisses,
     this.coreVersion = '',
@@ -133,6 +137,17 @@ class PluginBus {
   /// 不是为了“按时长判活”：它只覆盖两类同拍竞态——`closeAllUiWindows` 的
   /// REST 回包还没写完、以及窗口刚退出又紧接着重新拉起。窗口一出现就取消。
   final Duration uiExitGrace;
+
+  /// **退出宽限**（热重启专用，默认 5s；测试可注入）。
+  ///
+  /// **这不是判活时钟**：UI 没有心跳，唯一的活性事件是 `UiHost.exited`。这个值只
+  /// 回答一个问题——「旧世交出切片之后，等它自己退要等多久才放弃、直接 kill」。
+  /// 到点被 kill 不影响已收到的切片（下一世照常续）。
+  ///
+  /// 为什么不能省掉这步直接 kill：托盘归属（`TrayService.claimTrayOwner`）、飞书
+  /// 单实例锁、sidecar、`TREE_UI_WINDOW_ID` 都要求「旧的一世真的没了」才成立；
+  /// kill 之后立刻拉起等于把这些都交给运气（计划 §4.1）。
+  final Duration uiSuspendGrace;
 
   /// 核心对插件暴露的 ws 基址（`ws://127.0.0.1:<port>`）。
   ///
@@ -337,7 +352,32 @@ class PluginBus {
       <String, Map<String, UiHost>>{};
 
   /// 每个插件已用过的窗口序号（只增，避免关掉 `w2` 后新窗口复用同名）。
+  ///
+  /// **热重启是唯一例外**：重启会带「原窗口号列表」重拉（`w1` 还是 `w1`），
+  /// 否则按窗口号存的状态与面板读数每世都对不上（计划 §4.1）。复用时只把序号
+  /// 水位推回不小于该号（[_reserveUiWindowId]），保证后来新开的窗口不撞名。
   final Map<String, int> _uiWindowSeq = <String, int>{};
+
+  /// UI 插件的**站点桥**（核心接线时注入）。热重启用它发 `plugin.suspend`、
+  /// 新世 hello 后推 `plugin.resume`。
+  ///
+  /// 总线只把桥当成「一条按能力寻址的传输」：**不认识状态池与领域**，快照内容
+  /// 由桥原样带回、由总线放进状态池（计划 §4.3）。
+  StationWsBridge? stationBridge;
+
+  /// 把 UI 站点桥接上（幂等；核心在建桥后调用）。
+  void bindStationWsBridge(StationWsBridge bridge) => stationBridge = bridge;
+
+  /// 待新世取走的视图状态切片：`pluginId` → 世代 + `windowId` → 切片。
+  ///
+  /// 生命周期只有「一次重启」那么长：新世每个窗口的 `ui.hello` 到达后取走自己那一片
+  /// 并推 `plugin.resume`；没被取走的随快照池的 TTL 自然过期（不手工删，避免
+  /// 「删了但日志说续上了」）。
+  final Map<String, UiResumeSlots> _resumeSlices = <String, UiResumeSlots>{};
+
+  /// 等「新世取走切片」的等待者（`_hotRestartUi` 用它把 `resumed` 说成事实）。
+  final Map<String, Completer<void>> _uiResumeWaiters =
+      <String, Completer<void>>{};
 
   /// 同一 UI 插件最多同时开多少个窗口（防跑飞；不是功能限制）。
   int maxUiWindowsPerPlugin = 8;
@@ -920,6 +960,7 @@ class PluginBus {
   Future<void> _startOne(
     PluginConfig config, {
     String resumeDumpId = '',
+    List<String> uiWindowIds = const <String>[],
   }) async {
     if (_hosts.containsKey(config.id) || _uiHosts.containsKey(config.id)) {
       return;
@@ -954,7 +995,12 @@ class PluginBus {
       // 片 D：按**归一化 runtime** 分叉。只有 ui 走 UiHost；其余（含 legacy 的
       // binary / python / 未知值）逐字走原 stdio 路径。
       if (config.runtimeKind == PluginRuntimeKind.ui) {
-        await _startUiOne(config, generation: generation);
+        await _startUiOne(
+          config,
+          generation: generation,
+          windowIds: uiWindowIds,
+          resumeDumpId: resumeDumpId,
+        );
         return;
       }
       final PluginHost host = await _spawn(config, resumeDumpId: resumeDumpId);
@@ -1009,14 +1055,43 @@ class PluginBus {
   Future<void> _startUiOne(
     PluginConfig config, {
     required int generation,
+    List<String> windowIds = const <String>[],
+    String resumeDumpId = '',
   }) async {
-    final String windowId = _nextUiWindowId(config.id);
-    await _spawnUiWindow(
-      config,
-      windowId: windowId,
-      generation: generation,
-      primary: true,
-    );
+    if (windowIds.isEmpty) {
+      final String windowId = _nextUiWindowId(config.id);
+      await _spawnUiWindow(
+        config,
+        windowId: windowId,
+        generation: generation,
+        primary: true,
+      );
+      return;
+    }
+    // 热重启：**同一批窗口号**整批重拉（窗口身份跨世不变）。
+    //
+    // 逐个 await 而不是并发：每个窗口各自抢单实例锁 / 托盘归属，并发拉起会让
+    // 「谁是主窗口」变成竞态；顺序也保证 `_uiHosts` 落在第一个窗口上。
+    for (int i = 0; i < windowIds.length; i++) {
+      final String windowId = windowIds[i];
+      _reserveUiWindowId(config.id, windowId);
+      await _spawnUiWindow(
+        config,
+        windowId: windowId,
+        generation: generation,
+        primary: i == 0,
+      );
+    }
+  }
+
+  /// 复用窗口号时把序号水位推回不小于它（否则下次 `_nextUiWindowId` 会撞名）。
+  void _reserveUiWindowId(String pluginId, String windowId) {
+    final RegExpMatch? match = RegExp(r'^w(\d+)$').firstMatch(windowId);
+    final int number = int.tryParse(match?.group(1) ?? '') ?? 0;
+    if (number <= 0) return;
+    if (number > (_uiWindowSeq[pluginId] ?? 0)) {
+      _uiWindowSeq[pluginId] = number;
+    }
   }
 
   /// 下一个窗口 id（`w1`、`w2`…；序号只增不复用）。
@@ -1272,6 +1347,11 @@ class PluginBus {
       _uiDegraded[config.id] = reason;
       log?.call(reason);
       _emitStatus(config, 'registered', degraded: true, reason: reason);
+      // 等切片的新世如果始终没 hello，也要让等待方拿到结论（否则热重启的
+      // REST 回包会挂到调用方超时）。这里复用**同一个**建连窗口，不新增时长判据。
+      if (_resumeSlices.containsKey(config.id)) {
+        _pushResumeIfAny(config.id, host.windowId);
+      }
     });
   }
 
@@ -1282,6 +1362,16 @@ class PluginBus {
   void noteUiHello(String pluginId, {String windowId = ''}) {
     if (!_uiHosts.containsKey(pluginId) &&
         !(_uiWindows[pluginId]?.isNotEmpty ?? false)) {
+      return;
+    }
+    // 只认**当前世代活窗口表里**的窗口号：热重启后旧连接迟到的 hello 不能洗白
+    // 新实例（窗口号会被复用，`w1` 两世同名，因此判据是「现在这一刻窗口表里有它」）。
+    if (windowId.isNotEmpty &&
+        _uiWindows[pluginId]?[windowId] == null) {
+      log?.call(
+        '忽略 UI 插件 $pluginId 的迟到 hello：窗口 $windowId 不在当前世代的活窗口表里'
+        '（旧进程还没退干净 / 窗口号对不上）',
+      );
       return;
     }
     final String resolvedWindow = windowId.isNotEmpty
@@ -1304,6 +1394,62 @@ class PluginBus {
         _emitStatus(config, 'registered', degraded: false);
       }
     }
+    // 生命周期握手：每次 hello 之后**都推一条** `plugin.resume`（有快照带切片，
+    // 没快照也推 `has_snapshot:false`）。界面用它做「首帧前先等一等」的确定性信号，
+    // 因此冷启动也必须发——不然界面只能靠定时器等，那是被禁止的形状。
+    _pushResumeIfAny(pluginId, resolvedWindow);
+  }
+
+  /// 推 `plugin.resume`（有切片就带切片，没有也发一条 `has_snapshot:false`）。
+  ///
+  /// 载荷对总线**不透明**：这里只从信封里取出 `ui` 那一层原样转发，不认识任何
+  /// 视图字段（草稿 / 滚动 / 会话）——那是界面自己的语言（计划 §8-②）。
+  void _pushResumeIfAny(String pluginId, String windowId) {
+    final int generation = generationOf(pluginId);
+    UiResumeSlots? slots = _resumeSlices[pluginId];
+    if (slots != null && slots.generation != generation) {
+      // 世代变了（例如中途又重启了一次）：上一批切片不再属于这一世。
+      log?.call(
+        '丢弃插件 $pluginId 的视图状态切片：世代已从 ${slots.generation} 变为 $generation',
+      );
+      _resumeSlices.remove(pluginId);
+      slots = null;
+    }
+    final UiResumeSlice? slice = slots?.slices[windowId];
+    final bool hasSnapshot = slice != null;
+    final Map<String, dynamic> data = <String, dynamic>{
+      'has_snapshot': hasSnapshot,
+      'generation': generation,
+      'window_id': windowId,
+      if (slots != null) 'dump_id': slots.dumpId,
+      if (slice != null) 'payload': slice.payload,
+      if (!hasSnapshot)
+        'reason': slots == null
+            ? '没有待恢复的视图状态（冷启动）'
+            : '本窗口没有切片（其余窗口的切片不受影响）',
+    };
+    final bool delivered =
+        stationBridge?.pushResume(pluginId, windowId, data) ?? false;
+    if (hasSnapshot && delivered) {
+      slots!.slices.remove(windowId);
+      slots.taken.add(windowId);
+      log?.call(
+        '插件 $pluginId 的窗口 $windowId 已取走视图状态切片'
+        '（${slice.bytes} 字节，第 $generation 代）',
+      );
+    }
+    // 只有**真的送达**才算这个窗口有了结论：没送到（例如 hello 是在业务连接上
+    // 到达的、生命周期连接还没建起来）就继续等它——否则等待方会以「没续上」收尾，
+    // 而切片其实还在槽里，下一次 hello 还能取（2026-11-26 验收发现）。
+    if (slots != null && delivered) {
+      slots.pending.remove(windowId);
+      if (slots.pending.isEmpty) _completeResumeWaiter(pluginId);
+    }
+  }
+
+  void _completeResumeWaiter(String pluginId) {
+    final Completer<void>? waiter = _uiResumeWaiters.remove(pluginId);
+    if (waiter != null && !waiter.isCompleted) waiter.complete();
   }
 
   /// UI 窗口进程退出收尾。
@@ -2570,6 +2716,13 @@ class PluginBus {
       );
     }
     _setLifecycle(pluginId, PluginLifecycleState.restarting);
+    // 片 D（2026-11-26）：UI 插件**另走一条同语义、不同传输**的热重启。
+    // 为什么必须分叉：UI 宿主在 [_uiHosts] / [_uiWindows]，请求挂起与转储走的是
+    // WS 帧（UI 不能下 `station/command`），而且必须「等旧进程退出 → 同一批窗口号
+    // 重拉」。stdio 路径**逐字未改**（下游这段代码与改动前一致）。
+    if (pluginConfig.runtimeKind == PluginRuntimeKind.ui) {
+      return _hotRestartUi(pluginConfig, keepState: keepState);
+    }
     final PluginHost? host = _hosts[pluginId];
     String dumpId = '';
     String reason = '';
@@ -2609,8 +2762,219 @@ class PluginBus {
     );
   }
 
-  /// 等一份快照落池：与「进程确认退出」「心跳判失活」赛跑，**不与时长赛跑**（D8）。
+  /// UI 插件的热重启：`plugin.suspend` → 切片入池 → 等旧世退出 → 同一批窗口号重拉
+  /// → 新世 hello 后推 `plugin.resume`。
   ///
+  /// 与 stdio 路径的差异只有**传输**与**宿主表**，语义逐条对齐
+  /// （`docs/pluginization/ui-hot-restart-recon.md` §4.1 / §4.4）：
+  /// - 转储走 WS 握手（UI 不能下 `station/command`），载荷对核心不透明；
+  /// - 拉起前必须等到旧进程退出事件（托盘归属 / 单实例锁 / sidecar / 窗口号）；
+  /// - 窗口号跨世复用（`w1` 还是 `w1`），否则按窗口存的状态与面板读数全对不上；
+  /// - `resumed` 只按「切片被新世取走」记，不按「进程起来了」记。
+  Future<PluginHotRestartResult> _hotRestartUi(
+    PluginConfig cfg, {
+    required bool keepState,
+  }) async {
+    final String pluginId = cfg.id;
+    final int oldGeneration = generationOf(pluginId);
+    // 1) **先取快照再断开**：断开会把窗口表整批摘掉，之后就没有窗口号可复用了。
+    final Map<String, UiHost> windows = Map<String, UiHost>.of(
+      _liveUiWindowsOf(pluginId),
+    );
+    final List<String> windowIds = windows.keys.toList()..sort();
+    String dumpId = '';
+    String reason;
+
+    if (windows.isEmpty) {
+      // 说清事实：UI 没在跑就说「没活窗口」，不要沿用 stdio 那句「实例本来不在跑」
+      // 在 UI 语境下的假话（面板曾据此显示错原因）。
+      reason = '插件没有活着的窗口 ⇒ 直接按冷启动拉起（无得可转储）';
+    } else if (!keepState) {
+      reason = '调用方显式不要状态（keep_state=false）⇒ 冷重启';
+    } else if (!cfg.canSuspend) {
+      reason =
+          '插件 $pluginId 没声明 suspension: keep（默认不可挂起）⇒ 本次按冷启动重启，不做转储';
+    } else if (stationBridge == null) {
+      reason = '核心未接线 UI 站点桥 ⇒ 无法下发 plugin.suspend，按冷启动重启';
+    } else {
+      final Duration grace = uiSuspendGrace;
+      final UiSuspendAcks acks = await stationBridge!.requestSuspend(
+        pluginId,
+        windowIds: windowIds.toSet(),
+        generation: oldGeneration,
+        grace: grace,
+        // 「某个窗口已经退了」也是事件：进程没了就没有 ack 了，不必等满宽限。
+        // **逐窗口**传：一个窗口先退不能提前给其它窗口下结论。
+        exited: <String, Future<void>>{
+          for (final MapEntry<String, UiHost> entry in windows.entries)
+            entry.key: entry.value.exited.then<void>((int _) {}),
+        },
+      );
+      if (acks.acks.isEmpty) {
+        reason = acks.reason;
+      } else {
+        // 2) 信封（计划 §5.1）：核心只认识这一层，`ui` 原样透传、不解释字段。
+        final Map<String, dynamic> envelope = <String, dynamic>{
+          'schema': 1,
+          'windows': <String, dynamic>{
+            for (final MapEntry<String, Map<String, dynamic>> entry
+                in acks.acks.entries)
+              entry.key: <String, dynamic>{
+                'plugin_id': pluginId,
+                'window_id': entry.key,
+                'saved_at': DateTime.now().millisecondsSinceEpoch,
+                'ui': entry.value,
+              },
+          },
+        };
+        final PluginStatePutResult put = statePool.put(
+          pluginId: pluginId,
+          generation: oldGeneration,
+          payload: envelope,
+          scope: _scopeOf(cfg),
+        );
+        if (put.accepted) {
+          dumpId = put.dumpId ?? '';
+          reason = '${acks.reason}；快照已入池（$dumpId）';
+        } else {
+          // 超限 / 非 JSON：**不截断、不落盘**，本次按冷启动（原因原样带回）。
+          reason = '${acks.reason}；但快照入池被拒 ⇒ 冷重启：${put.error}';
+        }
+      }
+    }
+
+    // 3) 旧世退出：先等它自己退（宽限 = uiSuspendGrace），到点才 kill。
+    await _disconnect(pluginId, gracefulFirst: true);
+    for (final MapEntry<String, UiHost> entry in windows.entries) {
+      // 纪律：**旧进程未退出前不得拉起新进程**（托盘 / 单实例锁 / sidecar 归属）。
+      // kill 之后 exit 事件通常立刻到；真到不了就如实记一行，继续拉起（作业对象兜底）。
+      if (!await entry.value.awaitExit(uiSuspendGrace)) {
+        log?.call(
+          'UI 插件 $pluginId 的窗口 ${entry.key} 被强杀后仍未确认退出，'
+          '仍按热重启推进（进程作业对象会在核心退出时兜底）',
+        );
+      }
+    }
+
+    // 4) 一次 take、切成每窗口切片（一片只喂一世；必须在拉起**之前**建好切片表，
+    //    否则新世 hello 可能先于建表到达，那一轮就会按「没有快照」答）。
+    final int nextGeneration = oldGeneration + 1;
+    if (dumpId.isNotEmpty) {
+      final PluginStateSnapshot? snapshot = statePool.take(
+        pluginId: pluginId,
+        generation: oldGeneration,
+        scope: _scopeOf(cfg),
+      );
+      final Map<String, UiResumeSlice> slices = <String, UiResumeSlice>{};
+      if (snapshot != null) {
+        final Object? rawWindows = snapshot.payload['windows'];
+        if (rawWindows is Map) {
+          for (final MapEntry<Object?, Object?> entry in rawWindows.entries) {
+            final Object? value = entry.value;
+            if (value is! Map) continue;
+            final Map<String, dynamic> window = value.map(
+              (Object? k, Object? v) => MapEntry(k.toString(), v),
+            );
+            slices[entry.key.toString()] = UiResumeSlice(
+              payload: window['ui'],
+              bytes: jsonEncode(window['ui'] ?? const <String, dynamic>{}).length,
+            );
+          }
+        }
+      }
+      if (slices.isEmpty) {
+        reason = '$reason；但信封里没有可用的窗口切片 ⇒ 新世按冷启动';
+      } else {
+        _resumeSlices[pluginId] = UiResumeSlots(
+          generation: nextGeneration,
+          dumpId: dumpId,
+          slices: slices,
+          pending: <String>{...slices.keys},
+        );
+      }
+    }
+
+    // 5) 同一批窗口号重拉（等待者先就位：hello 可能在拉起返回后立刻到达）。
+    final Future<void> resumed = _prepareResumeWaiter(pluginId, windowIds);
+    await _startOne(cfg, resumeDumpId: dumpId, uiWindowIds: windowIds);
+
+    final int newGeneration = generationOf(pluginId);
+    final bool started = _liveUiWindowsOf(pluginId).isNotEmpty;
+    if (!started) {
+      // 新世没起来：把刚消费掉的快照退回去（与 stdio 路径同口径），
+      // 让下一次重启还能取到它（TTL 内）。
+      if (dumpId.isNotEmpty) {
+        _resumeSlices.remove(pluginId);
+        statePool.release(dumpId);
+        reason = '$reason；但新世没有窗口起来（快照已退回）';
+      }
+      _completeResumeWaiter(pluginId);
+    }
+
+    // 6) 等「新世取走切片」这个**事件**（由 hello 触发；没 hello 由既有建连窗口收尾）。
+    if (started) await resumed;
+
+    final bool ok = _hasInstance(pluginId);
+    // **槽位不在这里摘掉**（2026-11-26 验收发现）：`plugin.resume` 可能因为
+    // 「生命周期连接比业务连接晚到」而在这一次响应之后才送达；提前 remove 会让
+    // 后一次 hello 只拿到 `has_snapshot:false`，切片静默丢失。槽位因此活到
+    // 「世代变了」（`_pushResumeIfAny` 自带校验）或插件下线（`_disconnect` 清）。
+    final UiResumeSlots? slots = _resumeSlices[pluginId];
+    final Set<String> taken = slots?.taken ?? const <String>{};
+    final String outcome = ok
+        ? 'UI 插件 $pluginId 已热重启至第 $newGeneration 代'
+        : 'UI 插件 $pluginId 热重启后没能就绪（按失败隔离处理，不牵连其它插件）';
+    log?.call(
+      '$outcome：$reason'
+      '${slots != null && slots.slices.isNotEmpty ? '（还有窗口未取走切片，'
+                '等它的 ui.hello）' : ''}',
+    );
+    return PluginHotRestartResult(
+      pluginId: pluginId,
+      ok: ok,
+      resumed: ok && taken.isNotEmpty,
+      dumpId: dumpId,
+      generation: newGeneration,
+      lifecycle: lifecycleOf(pluginId).wire,
+      reason: reason.isEmpty ? outcome : '$outcome（$reason）',
+      windows: <Map<String, dynamic>>[
+        for (final String windowId in windowIds)
+          <String, dynamic>{
+            'window_id': windowId,
+            'resumed': taken.contains(windowId),
+            'bytes': slots?.bytesOf(windowId) ?? 0,
+          },
+      ],
+    );
+  }
+
+  /// 布置「等新世取走切片」的等待者。
+  ///
+  /// 等的是 hello 触发的事件，不是时长；唯一的兜底是既有的**建连窗口**
+  /// （[uiHelloWindow]：窗口内没 hello 只降级、不杀进程，同一条判据也在这里
+  /// 收尾等待者）。没有窗口可等时当场完成。
+  Future<void> _prepareResumeWaiter(
+    String pluginId,
+    List<String> windowIds,
+  ) {
+    if (!_resumeSlices.containsKey(pluginId) || windowIds.isEmpty) {
+      return Future<void>.value();
+    }
+    final Completer<void> waiter = Completer<void>();
+    _uiResumeWaiters[pluginId] = waiter;
+    return waiter.future.timeout(
+      uiHelloWindow,
+      onTimeout: () {
+        _uiResumeWaiters.remove(pluginId);
+        log?.call(
+          'UI 插件 $pluginId 的新世在 ${uiHelloWindow.inSeconds}s 内没有完成 '
+          'ui.hello ⇒ 切片视为未被取走（界面后续 hello 仍会收到 plugin.resume）',
+        );
+      },
+    );
+  }
+
+  /// 等一份快照落池：与「进程确认退出」「心跳判失活」赛跑，**不与时长赛跑**（D8）。  ///
   /// 为什么不需要定时轮询也不用超时：三个事件里任何一个都能给出确定结论——
   /// 快照到了（成功）、进程退了（不会有了）、心跳判死（不再等）。插件“装死”最多
   /// 拖到连续 N 拍无入站证据，而真在忙（还在发东西）的插件永远不会被误判。
@@ -3103,16 +3467,17 @@ class PluginBus {
       };
     }
     final PluginHost? host = _hosts[pluginId];
+    // UI 插件的「在跑」按**活窗口**算（[_isRunning] 同一份口径）：
+    // 旧口径只看 [_hosts]，对 UI 恒为 false，是一条既有假读数（计划 §4.3）。
+    final bool running = _isRunning(pluginId);
     final Map<String, dynamic> health = healthOf(pluginId);
     return <String, dynamic>{
       'ok': true,
       'plugin_id': pluginId,
       'name': cfg.name,
       'enabled': cfg.enabled,
-      'running': host != null && !host.isClosed,
-      'status': host != null && !host.isClosed && cfg.enabled
-          ? 'registered'
-          : 'disabled',
+      'running': running,
+      'status': running && cfg.enabled ? 'registered' : 'disabled',
       'lifecycle': lifecycleOf(pluginId).wire,
       'generation': generationOf(pluginId),
       'suspendable': cfg.canSuspend,
@@ -6173,7 +6538,13 @@ class PluginBus {
     }
   }
 
-  Future<void> _disconnect(String pluginId, {bool awaitExit = false}) async {
+  Future<void> _disconnect(
+    String pluginId, {
+    bool awaitExit = false,
+    // 热重启专用：先等旧世自己退（宽限 [uiSuspendGrace]），到点才 kill。
+    // 其余调用方（停用 / 重启 / 卸载 / 换文件）行为逐字不变。
+    bool gracefulFirst = false,
+  }) async {
     final PluginHost? host = _hosts.remove(pluginId);
     // 执行器插件下线 / 卸载 ⇒ 撤掉它挂到执行站的命令。
     // 否则 100 优先级的挂载会永久压住核心实现，卸载即坏。
@@ -6192,6 +6563,10 @@ class PluginBus {
       (String key) => key.startsWith('$pluginId#'),
     );
     _uiDegraded.remove(pluginId);
+    // 待取走的视图状态切片属于「上一世 → 下一世」那一次换世：断开（停用 / 卸载 /
+    // 改配置）就不再成立，留着只会让下一次 hello 收到一份过期切片。
+    _resumeSlices.remove(pluginId);
+    _completeResumeWaiter(pluginId);
     // 实例没了 ⇒ "上次按什么参数起来的"这条记录也失效（重启会重新记）
     _spawnedConfigs.remove(pluginId);
     _queueDepth[pluginId] = 0;
@@ -6222,7 +6597,12 @@ class PluginBus {
     for (final UiHost window in uiTargets) {
       try {
         // UI 插件没有 stdio shutdown：只能发信号。awaitExit 只给“要看到退出码”的场景。
-        await window.close(waitForExit: awaitExit);
+        // `gracefulFirst` 只给热重启：先让旧世把状态交完、自己退，宽限到点才 kill。
+        await window.close(
+          waitForExit: awaitExit,
+          gracefulFirst: gracefulFirst,
+          grace: gracefulFirst ? uiSuspendGrace : null,
+        );
       } catch (error) {
         log?.call('关闭 UI 插件 $pluginId 的窗口 ${window.windowId} 失败：$error');
       }
@@ -6328,6 +6708,7 @@ class PluginHotRestartResult {
     this.generation = 0,
     this.lifecycle = 'stopped',
     this.reason = '',
+    this.windows = const <Map<String, dynamic>>[],
   });
 
   final String pluginId;
@@ -6350,6 +6731,12 @@ class PluginHotRestartResult {
   /// 可读结论（含降级原因）。
   final String reason;
 
+  /// **UI 插件按窗口的结论**（只增键；stdio 插件为空数组）。
+  ///
+  /// 每项 `{window_id, resumed, bytes}`：多窗口时哪个窗口续上了、哪个窗口冷启动，
+  /// 面板与 agent tool 不该只看到一个笼统的 `resumed`（计划 §4.3 第 8 步）。
+  final List<Map<String, dynamic>> windows;
+
   Map<String, dynamic> toJson() => <String, dynamic>{
     'ok': ok,
     'plugin_id': pluginId,
@@ -6358,6 +6745,7 @@ class PluginHotRestartResult {
     'generation': generation,
     'lifecycle': lifecycle,
     'reason': reason,
+    if (windows.isNotEmpty) 'windows': windows,
   };
 }
 

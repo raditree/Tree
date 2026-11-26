@@ -331,6 +331,7 @@ Map<String, dynamic> _manifest({
           'api': '>=1.0 <2.0',
           'plugins': kUiPluginDependencies,
         };
+  final String suspension = _suspensionOf(source);
   return <String, dynamic>{
     'id': pluginId,
     'name': pluginName,
@@ -346,10 +347,26 @@ Map<String, dynamic> _manifest({
         ? source['scope']
         : <String, dynamic>{},
     'requires': requires,
+    // 挂起声明**必须透传**：只在源清单里写 `suspension: keep`、装出来的条目却没有
+    // 这个键，装机端的热重启就会一直是冷启动（计划 §3.2-⑥）。
+    // 口径与 `build_plugins.dart` 同一条：只允许空 / `keep`，其余值丢弃并提示。
+    if (suspension.isNotEmpty) 'suspension': suspension,
     'files': source['files'] is List
         ? source['files']
         : <String>['**'],
   };
+}
+
+/// 源清单里的 `suspension`（只认 `keep`；留空 = 不可挂起）。
+String _suspensionOf(Map<String, dynamic> source) {
+  final String value = '${source['suspension'] ?? ''}'.trim();
+  if (value.isEmpty) return '';
+  if (value == 'keep') return value;
+  stderr.writeln(
+    '[package-ui] 忽略未知的 suspension 取值「$value」（只允许空 / keep，'
+    '与 plugins.yaml 同口径）',
+  );
+  return '';
 }
 
 /// 校验 zip 里**必须有**界面可执行体与 `plugin.json`，且**不能有**被排除项。

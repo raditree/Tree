@@ -793,6 +793,34 @@ dart run tool/build_plugins.dart --only <id> --install-dir "<安装目录>/plugi
 “两世”跑一遍）。转储与取回的管道（`suspend` 分支、`plugin.stateDump` / `plugin.stateFetch` 的
 信封剥层）都在骨架 `plugins/_kit/plugin_kit.dart` 里，插件侧只交“这一世要留什么”。
 
+#### 6.5.2 UI 插件的那一条传输（`plugin.suspend` / `plugin.suspendAck` / `plugin.resume`）
+
+UI 插件（`runtime: ui`）**不能**下 `station/command`，所以上面那套 stdio 管道对它没有入口。
+2026-11-26 起，UI 的热重启走**同语义、不同传输**的一条 WS 握手
+（完整设计见 [pluginization/ui-hot-restart-recon.md](pluginization/ui-hot-restart-recon.md)）：
+
+| 方向 | 帧 | 你要做的事 |
+| --- | --- | --- |
+| 核心 → UI | `plugin.suspend` | 停下输入/动画，采一份**视图状态**（窗口几何、选中项、滚动锚点、展开态、草稿、右栏页签），回 ack，然后**自己退** |
+| UI → 核心 | `plugin.suspendAck` | `{ok, dumped, window_id, plugin_id, payload, bytes?}`；`payload` 对核心不透明 |
+| 核心 → UI | `plugin.resume` | 每次 `ui.hello` 之后都会来一条（冷启动也来，`has_snapshot:false`）：用它做「首帧前先等一等」的确定性信号，**不要用定时器等** |
+
+要参与，两处都得到位：
+
+1. `plugins.yaml` / `plugin.json` 条目声明 `suspension: keep`（打包链现在会透传它）；
+2. `ui.hello.capabilities` 里带 `ui.lifecycle`（未声明的连接收不到 `plugin.suspend`）。
+
+三条边界（与 stdio 版一致，别扩大）：
+
+* **只有视图状态**，不搬领域事实（消息、工具结果、轮次状态、提问答案重新从核心/agent 拉）；
+* 快照**只在核心内存**（一份只喂一世、有 TTL），UI 侧也不许自己落盘兜底；
+* 挂起退出**不许**复用「退出应用」那条路（它会调 `closeAllUiWindows` ⇒ 核心整体收尾）；
+  自己的收尾（sidecar / 单实例锁 / 托盘归属）要在 ack 之后、`exit(0)` 之前做完。
+
+核心侧的行为：先取活窗口表 → 发 `plugin.suspend` → 收切片入池 → **等旧进程退出**
+（宽限 `uiSuspendGrace`，默认 5s；到点才 kill，已收到的切片仍有效）→ 以**同一批窗口号**
+重拉 → 新世 hello 后推 `plugin.resume`。多窗口时每个窗口各自续 / 各自冷启动。
+
 ### 6.6 重启窗口里对外保持正常状态（保活与暂存）
 
 上面那套“转储→退出→取回”中间有几百毫秒你不在。这段时间**核心不会把失败扔给会话**：

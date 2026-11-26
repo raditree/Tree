@@ -491,6 +491,9 @@ class CoreServer {
     );
     bus.stations.onStationRemoved = bridge.onStationRemoved;
     bus.onPluginOffline = bridge.onPluginOffline;
+    // UI 热重启：总线要用同一条桥发 `plugin.suspend` / 推 `plugin.resume`
+    // （桥只做「按能力寻址的传输」，快照内容归状态池——两边不互相认识领域）。
+    bus.bindStationWsBridge(bridge);
     // UI 全部退出是**进程生命周期事件**，不是插件事件：总线判定所有闸门都过了
     // 才上报，核心只负责把它翻成“本次进程该退了”。CLI 会把它接到 stdin 的
     // shutdown 同一条收尾链路上（见 tree_core.dart）。
@@ -739,6 +742,10 @@ class CoreServer {
       case WsInboundType.stationRegister:
       case WsInboundType.stationUnregister:
       case WsInboundType.stationTrigger:
+      // 生命周期握手（UI 热重启续跑）：`plugin.suspendAck` 与站点帧同属
+      // 「已 ui.hello 的连接才有意义」，因此走同一个桥；未启用插件系统时同样
+      // 给可读拒绝，而不是让挂起方等到超时。
+      case WsInboundType.pluginSuspendAck:
         final StationWsBridge? bridge = _stationWsBridge;
         if (bridge == null) {
           connection.send(<String, dynamic>{

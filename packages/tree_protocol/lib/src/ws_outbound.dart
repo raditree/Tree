@@ -116,6 +116,24 @@ abstract final class WsOutboundType {
   /// 行格式与 [stationDelivery] 同为平铺 snake_case。
   static const String stationAck = 'station_ack';
 
+  // ── UI 插件 · 生命周期握手（热重启续跑，2026-11-26）──────────────────
+  // 与上行 `plugin.suspendAck` 是同一条握手的两个方向（见 `ws_inbound.dart`
+  // 同一处的注释与 `docs/pluginization/ui-hot-restart-recon.md` §4.2）。
+  // **上/下行集合不得相交**：三条名字互不相同，也不得与既有帧重名。
+
+  /// 请求挂起（核心 → 指定窗口的连接；**不是广播**，有明确目标与回执）。
+  ///
+  /// 帧形状：`{type, data: {reason, generation, plugin_id}}`。
+  /// 只发给 `ui.hello.capabilities` 含 `ui.lifecycle` 的连接。
+  static const String pluginSuspend = 'plugin.suspend';
+
+  /// 新世取回（核心 → UI，每次 `ui.hello` 之后**都推一条**）。
+  ///
+  /// 帧形状：`{type, data: {has_snapshot, generation, dump_id?, window_id,
+  /// payload?, reason?}}`。没有快照也推（`has_snapshot:false` + 可读 `reason`），
+  /// UI 用它做「首帧前先等一等」的**确定性信号**，不得改用定时器等待。
+  static const String pluginResume = 'plugin.resume';
+
   // ── 集成终端（Ctrl+J） ────────────────────────────────────────────────
   // 值复用 [TerminalOutboundType.*]（**别名**，不重复字面量），见 terminal.dart。
 
@@ -156,6 +174,8 @@ abstract final class WsOutboundType {
     pluginConfigChanged,
     stationDelivery,
     stationAck,
+    pluginSuspend,
+    pluginResume,
     terminalReady,
     terminalOutput,
     terminalExit,

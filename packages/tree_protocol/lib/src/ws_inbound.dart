@@ -69,6 +69,24 @@ abstract final class WsInboundType {
   /// 向**自己注册的**自建广播站发布事件（不得触发收集站 / 执行站）。
   static const String stationTrigger = PluginRpcMethods.stationTrigger;
 
+  // ── UI 插件 · 生命周期握手（热重启续跑，2026-11-26）──────────────────
+  // 为什么这三个名字不带 `station/`：它们不是站点事务（没有订阅 / 回执码），
+  // 而是**生命周期原语**在 WS 侧的那条传输——与 stdio 插件的 `suspend` /
+  // `plugin.stateDump` / `plugin.stateFetch` 同义，只是 UI 不能下
+  // `station/command`（UI 只做 API 消费者），所以换一条同样有明确目标与回执的路。
+  //
+  // 契约（`docs/pluginization/ui-hot-restart-recon.md` §4.2）：
+  // 1. 只对**已完成 `ui.hello`** 的连接有效；
+  // 2. `plugin.suspend` 只发给 `ui.hello.capabilities` 含 `ui.lifecycle` 的连接；
+  // 3. 同 `(plugin_id, window_id)` 的**首条 ack 生效**，重复 ack 丢弃并记一行；
+  // 4. 未声明能力的旧构建收不到 `plugin.suspend` ⇒ 核心按冷重启处理，不是错误。
+
+  /// 挂起应答 + 本窗口的视图状态切片（UI → 核心）。
+  ///
+  /// 帧形状：`{type, data: {ok, dumped, window_id, plugin_id, bytes?, payload?, error?}}`。
+  /// [payload] 对核心**不透明**（只校验是 JSON 对象与字节上限），核心不解释字段。
+  static const String pluginSuspendAck = 'plugin.suspendAck';
+
   /// 全部上行类型（完备性测试与文档用）。
   static const Set<String> all = <String>{
     heartbeat,
@@ -86,5 +104,6 @@ abstract final class WsInboundType {
     stationRegister,
     stationUnregister,
     stationTrigger,
+    pluginSuspendAck,
   };
 }

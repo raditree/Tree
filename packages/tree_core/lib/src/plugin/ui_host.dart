@@ -161,6 +161,21 @@ class UiHost {
   /// 最近的标准错误（截断口径与 [PluginHost.stderrTail] 一致：尾部 2000 字符）。
   String get stderrTail => _stderr.tail();
 
+  /// 只等**进程退出事件**，超时返回 false（**不 kill**）。
+  ///
+  /// 这是热重启的「等旧世真的没了」那一步：托盘归属、单实例锁、sidecar、
+  /// `TREE_UI_WINDOW_ID` 都必须等这一事件，不能靠「杀完就拉起」赌运气。
+  /// [grace] 是**退出宽限**，不是判活时钟（UI 没有心跳）；到点由调用方决定 kill。
+  Future<bool> awaitExit(Duration grace) async {
+    if (_exitCode != null) return true;
+    try {
+      await _exited.future.timeout(grace);
+      return true;
+    } on TimeoutException {
+      return false;
+    }
+  }
+
   /// 请求正常停止。
   ///
   /// UI 插件没有 stdio shutdown，只能发终止信号；Windows 上 [Process.kill] 即
@@ -188,7 +203,24 @@ class UiHost {
   }
 
   /// 停止并（可选）等待进程退出。
-  Future<void> close({bool waitForExit = true}) async {
+  ///
+  /// [gracefulFirst] 只给热重启：先**等它自己退**（宽限 [grace]），到点才 kill。
+  /// 其余调用方行为逐字不变（默认 `stop()` → 等 3s → kill）。
+  ///
+  /// 为什么多这一档：`stop()` 在 Windows 上是 `Process.kill()`，界面拿不到任何
+  /// 收尾机会——草稿、sidecar、单实例锁、托盘归属全都没有落地时刻。热重启必须
+  /// 先让旧世自己把状态交出来再退（计划 §4.4）。
+  Future<void> close({
+    bool waitForExit = true,
+    bool gracefulFirst = false,
+    Duration? grace,
+  }) async {
+    if (gracefulFirst && _exitCode == null) {
+      final Duration window = grace ?? const Duration(seconds: 5);
+      if (await awaitExit(window)) return;
+      await kill('挂起后 ${window.inSeconds}s 内未退出（已交出切片则会话仍续上）');
+      return;
+    }
     await stop();
     if (!waitForExit || _exitCode != null) return;
     try {
