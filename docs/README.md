@@ -37,6 +37,7 @@
 | [pluginization/session-auto-title-plan.md](pluginization/session-auto-title-plan.md) | **会话自动命名（TITLE-AUTO）方案**：路线 3 两段式（首条消息规则即时出标题 → 首轮收尾 LLM 精修一次）；复用 `session.rename` 写库 + `session_renamed` 广播，核心/协议零改动；哨兵值 + pending 值双判据保护手动改名；默认会话、配置面、T1~T3 切片与 TC-TITLE-01~14，D1~D4 待拍板 |
 | [pluginization/agent-context-handover-and-snapshot-recon.md](pluginization/agent-context-handover-and-snapshot-recon.md) | **上下文 handover 与系统提示词快照留档（车道 R）**：`prompts.jsonl` 版本化留档（含摘要的 `effective_system`、sha256 去重、REST 历史/版本查询）；`handover` 工具写 pending、轮边界显式摘要 + 显式切点重建（同一模型，不换模型）；不做 head；S1~S3 切片、切点算法与测试清单 |
 | [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) | **SSH 执行器「中转站」协议**：core ⇄ ssh_executor 插件 ⇄ tree_agent 三层的消息面、错误码、分块帧、版本协商、后台任务落盘台账与 PTY 契约（中转站 =「处理拓展点位」：首选 `ssh.execute` 点位投递、`tunnel.*` 作兼容层） |
+| [scroll-jitter-fix-plan.md](scroll-jitter-fix-plan.md) | **中栏对话页滚动问题根治计划（SCROLL-FIX，S1~S7 分期，待逐期实施）**：把位置收成「视口锚点事务」+「目标制滚动推进器」两根梁，删掉补白帧后猜 / sticky 跳底布尔 / `maxScrollExtent` 当判据三套机制；冻结 P-1~P-7 不变量与 7 条补丁红线、TC-SC-01~16 验收用例、改前改后量化门槛（单帧位移 ≤8px、连续位移帧 ≥60%、锚点位移 ≤0.5px）、各期范围/规模/风险/回滚与 5 条待拍板 |
 | [known-issues.md](known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证 / 遗留），按发现顺序编号 |
 | [../CHANGELOG.md](../CHANGELOG.md) | 版本变更记录（自首个开源版本 1.0.0 起） |
 
