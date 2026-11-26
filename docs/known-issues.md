@@ -3200,3 +3200,46 @@ tree.agent 就绪。
 - 0.4.2 装机验证：热重启后日志「订阅 tree.agent 收集站：成功（第 1 次）」；整机重启 Tree
   后无需任何手动操作，`models-info` 目录 **26 条**、三个 `mcp__web-search__*` 均
   `enabled: true`。
+
+---
+
+## #57 流式揭时时钟在**帧外**读 `currentFrameTimeStamp`：debug 断言炸、release 用陈旧基准
+
+**状态**：未处理（2026-11-26 发现；建议随 SCROLL-FIX S7「流式渲染成本」一起修，或独立小修）。
+**影响**：插件仓全量 `flutter test` 偶发红（门禁噪声）；release 下首拍基准偏旧，第一帧可能多吐一截字。
+
+### 现象 / 证据
+
+插件仓全量测试（并行多 isolate + 机器满负载）时，`test/message_panel_inflight_resume_test.dart`
+的「在途段在切走期间收尾：重切回来以历史页为准，缓冲不复活旧副本」偶发失败：
+
+```
+══╡ EXCEPTION CAUGHT BY FOUNDATION LIBRARY ╞══
+The following assertion was thrown while dispatching notifications for ValueNotifier<int>:
+'package:flutter/src/scheduler/binding.dart': Failed assertion: line 1133 pos 12:
+'_currentFrameTimeStamp != null': is not true.
+#2  SchedulerBinding.currentFrameTimeStamp (scheduler/binding.dart:1133)
+#3  _MessageBubbleState._syncReveal (ui/widgets/message_cards.dart:281)
+```
+
+同一文件单独跑稳定全绿（2026-11-26 实测 2/2 通过）⇒ **与并发负载相关**，不是那条用例的逻辑错。
+
+### 根因
+
+`_MessageBubbleState._syncReveal`（`message_cards.dart:281`）在**帧外**读
+`SchedulerBinding.instance.currentFrameTimeStamp` 当揭示时钟（reveal ticker）的基准：
+
+- 该 getter 在 debug 下断言"当前正在出帧"；release 下返回**上一次**帧时间戳（可能很旧）；
+- `_syncReveal` 由 `ChatMessage.contentVersion` 的 `ValueNotifier` 监听 / `didUpdateWidget`
+  触发，这些路径可以发生在微任务里（此刻没有正在出帧）⇒ 负载高时踩中的概率上升。
+
+### 修复方向
+
+基准交给 ticker 自己的首拍（`_lastElapsed == Duration.zero` 已经是"只记基准不出字"的语义）：
+
+1. 删掉 `_lastElapsed = SchedulerBinding.instance.currentFrameTimeStamp`，让 `_onTick` 的
+   首拍自己取 `elapsed`（改动 1 行，最省）；
+2. 或按 `SchedulerBinding.instance.schedulerPhase` 判断：不在帧内就留 `Duration.zero`。
+
+验证方式：`flutter test test/message_panel_inflight_resume_test.dart` 反复跑 +
+全量并行跑不再复现该断言。
