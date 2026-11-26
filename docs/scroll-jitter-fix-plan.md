@@ -1,6 +1,9 @@
 # 中栏对话页滚动问题根治计划（SCROLL-FIX，S1~S7 分期）
 
 > 状态：**计划定稿，待逐期实施**（2026-11-26）。本期**只出计划，零代码改动**。
+> 2026-11-26 二次核对（工作区又前进 `96a04a3` / `51d603d` 两步，后者动过
+> `message_list.dart` / `message_panel.dart`）：**S1 未开工**、既有因素全部仍成立、
+> 坐标已按当前工作区刷新（§附），并**新增 1 条因素 2-11 + TC-SC-17**（见 §10）。
 > 上游：因素清单 [conversation-scroll-jitter-recon.md](conversation-scroll-jitter-recon.md)
 > （P0~P5，40+ 条，含 2026-11-26 视频取证补记）与滚动模型方案
 > [scroll-model-rewrite-recon.md](scroll-model-rewrite-recon.md)（I-1~I-8）。
@@ -244,6 +247,7 @@
 | 14 | `total` 领先窗口 3 | 滑块/定位/裁剪映射不偏 | S6 |
 | 15 | 定位到某条（at=） | 一次收敛（无 300ms 动画 + 校正叠加） | S4 |
 | 16 | 2000 行 + 200 张工具卡滚动 | 帧 p95 ≤ 8ms | S7 |
+| 17 | UI 热重启（挂起续跑）时人在历史深处 | 落回**原阅读位置**、锚点位移 ≤ 0.5px、**无动画滚动**；贴底时 `following` 为真、新消息照常进视口（见 §10 / 因素 2-11） | S5 |
 
 ---
 
@@ -313,25 +317,61 @@ S1 度量 ──┬─ S2 锚点事务 ──┬─ S3 补白（可并行，互�
 - **D3 "可滚高度被吃光"的取向**：A「按像素补页」（本计划，纯行为，不改视觉，推荐）／
   B「折叠组给最小高度」（看得见但改视觉）／C「窗口常驻 N 屏」（内存换稳定）。
 - **D4 期节奏**：每期一个安装包做真机验收，还是攒 2~3 期一起？
-- **D5 S5 是否同意删掉 3 个跨帧布尔**（会动面板 19 处赋值，虽然净删代码）。
+- **D5 S5 是否同意删掉 3 个跨帧布尔**（会动面板 **17 处**赋值，虽然净删代码）。
 
 ---
 
-## 附：本档引用的代码坐标（按 2026-11-26 工作区）
+## 10. 二次核对（2026-11-26，只读，未动代码）
+
+计划落档后仓库又前进两步：`96a04a3`（随包 UI 插件改 archive 分发，不动代码）与
+`51d603d`（**UI 插件热重启改挂起续跑**，动了 `message_list.dart` / `message_panel.dart`）。
+开工前按当前工作区核了一遍：
+
+1. **S1 仍未开工**：`plugins/tree.ui.default/test/` 里没有 `scroll_probe.dart` /
+   `scroll_invariants_test.dart`；TC-SC-01~17 一条都还没落。
+2. **既有因素全部仍成立**（逐条按代码复核，行为未变）：4-05 的 `_clearWindow`（`:834`）
+   与 `trimOlder` 后 `_scrollRevision++`（`:1422`）**仍然不复位 `_bottomJump`**；
+   1-14 的 `_updateBottomFill` 仍以 `maxScrollExtent > 0.5` 为守卫（`:635`）；
+   5-07 仍零插值（`:275`）；5-01 的 `_thumb` 传 `visibleCount`（`:244`）而 `_seek`
+   不传（`:436-454`）。
+3. **新增 1 条因素 2-11（P2）+ 验收用例 TC-SC-17**：挂起续跑的快照锚点是
+   `feed.loadedList.first.id`（窗口**最新**那一行，不是视口首个可见行），`following`
+   存了但没人读；恢复时先跳底、再用 `ensureVisible(300ms)` 定位 ⇒ 阅读位置丢失 +
+   动画叠加 + `following` 落成假导致新消息进缓冲不显示。详见因素清单 §2-11。
+   **归期建议**：并入 S5（跟随语义 token 化）——它和 4-01/4-02 是同一族问题，
+   S5 的"`following` 由位置推导"一旦落地，这条自动收口；只额外需要
+   "续跑锚点取视口首个可见行 + 恢复不带动画"两小步。
+4. **计划引用的探针源已不在工作区**：`.self/probe/insert_probe_test.dart` 不存在
+   （`.self/probe/` 现有的是 `sliver_seek_probe_test.dart` 等），S1 需按因素清单
+   §9.1 的表格**重建**，别按"复用现成文件"排期。
+5. **坐标已按当前工作区刷新**（见下方附录），面板侧漂移最大（`_clearWindow`
+   定义从 :3615 区移到 :834）。
+
+---
+
+## 附：本档引用的代码坐标（按 2026-11-26 二次核对后的工作区）
 
 - 列表与位置：[message_list.dart](../plugins/tree.ui.default/lib/ui/widgets/message_list.dart)
-  —— `:275` `pointerScroll`、`:398` `didUpdateWidget`（`bottomJump` 判据）、
-  `:426` `_scheduleJumpToBottom`、`:449` `_flushCoordinate`（`assertPixels`）、
-  `:626` `_updateBottomFill`、`:653` `_setBottomFill`、`:715` `_onScrollNotification`、
-  `:982` `ensureVisible`、`:1128` 折叠组员零高度。
+  —— `:275` `pointerScroll`、`:281` `applyContentDimensions`（`correctPixels` 分支）、
+  `:398` `didUpdateWidget`（`bottomJump` 判据）、`:426` `_scheduleJumpToBottom`、
+  `:449` `_flushCoordinate`（`assertPixels`）、`:626` `_updateBottomFill`、
+  `:635` 补白守卫（`maxScrollExtent > 0.5`）、`:653` `_setBottomFill`、
+  `:702` `_pixelsForTopOf`、`:715` `_onScrollNotification`、`:750` `_jumpTo`、
+  `:892` `_armAnchor`、`:978` `ensureVisible`、`:1117`/`:1129` 折叠组员零高度。
 - 窗口模型：[message_feed.dart](../plugins/tree.ui.default/lib/ui/services/message_feed.dart)
-  —— `_nextGlobal` / `localOfGlobal` / `atTailIgnoringBuffer` / `trimOlder` / `mergeBuffered`。
+  —— `_nextGlobal` / `localOfGlobal` / `atTailIgnoringBuffer` / `trimOlder` / `mergeBuffered`；
+  `:223` `following`、`:232` `jumpStamp`（跳底意图的既有计数器，S5 可直接承接）。
 - 面板：[message_panel.dart](../plugins/tree.ui.default/lib/ui/widgets/message_panel.dart)
-  —— `:189` `_bottomJump` 字段、`:1414` `trimOlder` 后 `revision++`、`:3462` 落库替换、
-  `:3615`/`:3638`/`:3743` `_clearWindow`。
+  —— `:189` `_bottomJump` 字段、`:834` `_clearWindow`（**不复位 `_bottomJump`**）、
+  `:1402`/`:1410` `_trimFeed`、`:1422` `trimOlder` 后 `_scrollRevision++`、
+  `:3469` `_reconcileTail` / `:3493` `replacePersisted`、
+  `:2262`/`:3648`/`:3673`/`:3778` `_clearWindow` 调用点、
+  `:354`/`:1085-1105` 热重启续跑锚点（`:3870-3886` 快照、`:3877` 未消费的 `following`）。
 - 输入与阻尼：[scroll_damping_service.dart](../plugins/tree.ui.default/lib/ui/scroll_damping_service.dart)、
   [message_scrollbar.dart](../plugins/tree.ui.default/lib/ui/widgets/message_scrollbar.dart)
-  （`_seek` 漏传 `visibleCount`）。
+  —— `:244` `_thumb`（传 `visibleCount`）、`:436-454` `_seek`（**漏传** `visibleCount`）、
+  `:265` `_smoothTop`。
 - 因素清单与取证：
-  [conversation-scroll-jitter-recon.md](conversation-scroll-jitter-recon.md)（§9 视频取证、§9.1 探针）；
-  探针源 `.self/probe/insert_probe_test.dart`。
+  [conversation-scroll-jitter-recon.md](conversation-scroll-jitter-recon.md)（§9 视频取证、§9.1 探针、
+  §10 二次核对与坐标对照）；探针源 `.self/probe/insert_probe_test.dart`（**当前工作区已不存在，S1 需重建**）。
+

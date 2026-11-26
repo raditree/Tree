@@ -1,6 +1,7 @@
 # 侦查：默认 UI 对话页滚动抖动 / 跳动 / 滚不动的因素清单（P0~P5）
 
-> 状态：**只收集、不修改**（2026-11-26；同日按真机视频取证补记 6 条，见 §9）。范围：`plugins/tree.ui.default` 中栏对话页
+> 状态：**只收集、不修改**（2026-11-26；同日按真机视频取证补记 6 条，见 §9；
+> 同日二次核对当前工作区再补记 1 条 §2-11，并刷新失效的代码坐标，见 §10）。范围：`plugins/tree.ui.default` 中栏对话页
 > （`message_list.dart` / `message_feed.dart` / `message_panel.dart` / `message_scrollbar.dart`
 > / `message_cards.dart` / `markdown_view.dart` / `scroll_damping_service.dart`）
 > 与它依赖的帧路径（`websocket_service.dart` / `frame_router.dart`）。
@@ -80,6 +81,7 @@
 | 2-08 | **P3** | A | **`_detachedById` / `_captureInFlight` / `_restoreInFlight` 的整窗作废路径**：切换会话/重锚/自愈时把在途段摘出来再接回；接回时按 id 插回窗口，若这一页不含该段，它留在缓冲并继续收 chunk，用户切回时可能一次补齐很长一段（高度突增）。 | `message_panel.dart:1039-1060`、`:1258-1280` |
 | 2-09 | **P3** | C | **`_loadOlder` 的 `finally` 里 `setState`**：每次补页结束都重建面板；若用户连续上滑触发多轮（`_loadingOlder` 只为当前轮守卫），`revision` 连增，配合 §1-05 的遍历成本会放大掉帧。 | `message_panel.dart:1290-1305` |
 | 2-10 | **P4** | B | **`_scrollToMessage` 用 `ensureVisible(duration: 300ms)`**：定位到消息时有一个动画滚动；若同一帧用户也在滚动，两个滚动源叠加（`ScrollPosition` 的 ballistic 活动与用户拖拽竞争）⇒ 短促抖动。 | `message_list.dart:1032-1050` |
+| 2-11 | **P2** | B/D | **挂起续跑（UI 热重启）把阅读位置拽回窗口最新端，并把 `following` 落成假**（2026-11-26 二次核对新增）。续跑快照 `_MiddleStatePart.snapshot()` 存 `anchor_id = feed.loadedList.first.id`——那是**窗口最新那一行**（局部下标 0，屏上最底），不是"视口首个可见行"；同时存了 `following`，但恢复侧 `_restoreViewState()` **只读 `anchor_id` 与 `expanded_runs`**，`following` 写了没人读（死字段）。恢复流程：`_applyTailPage` 先 `_bottomJump = true` + `_scrollRevision++` 跳底，再把锚点交给 `_scrollToMessage` ⇒ 走 `ensureVisible(alignment: 0.2, duration: 300ms)`。三条后果：① 用户在历史深处热重启 ⇒ **先落底、再动画滚一次**（两级位移，正是 TC-SC-15 要消灭的"动画 + 校正叠加"）；② 锚点本身就是最新端，`ensureVisible` 只能把 `pixels` 拉回 0 ⇒ **阅读位置丢失、回到底部**；③ `_scrollToMessage` 自己置 `_feed.following = false` / `_userDetached = true`，且**不走** `_setUserDetached`（不合并尾巴缓冲）；锚点已在视口内时 `ensureVisible` 不发 `ScrollUpdateNotification` ⇒ 没有滚动通知把 `following` 改回真 ⇒ 用户明明贴底，新消息却进缓冲不显示（与 4-01/4-02 同一类"贴底但不动"）。触碰 I-4 / I-5。 | `message_panel.dart:3870-3886`（`_MiddleStatePart`）、`:354-366`（只取 `anchor_id`）、`:1085-1105`（跳底 + 锚点定位）；`message_list.dart:978`（300ms `ensureVisible`）、`:995-1000`（`following=false`）、`:715-728`（只有 `ScrollUpdateNotification` 改 `following`） |
 
 ---
 
@@ -150,6 +152,10 @@
    1-14（补白守卫两帧回弹，内容正好一屏上下时必现）+ 1-13（插入同帧顶掉一行，
    卡片本身零过渡）⇒ 观感就是"飞上来"；配合 5-07（滚轮零插值）与 4-05
    （被拽回底部），任何一次位移都只能整级跳。
+5. **"热重启后续跑，人还在历史里读，界面回到底部、新消息还不冒头"**（2026-11-26
+   二次核对新增）：2-11（续跑快照锚点取"窗口最新一行"+ 走 300ms `ensureVisible`
+   + `following` 被落成假且没有滚动通知改回来）⇒ 位置丢失与"贴底但不动"同时出现；
+   与 4-01/4-02 同一族（`following` 与真实位置不同步）。
 
 ---
 
@@ -168,6 +174,8 @@
    `134 → 104 → 256 → 134`（`viewportDimension` 448 → 600 → 478）。
    现成探针：`.self/probe/insert_probe_test.dart`（P1/P2 短内容、P4 长会话）；
    复跑方式：把它拷进 `plugins/tree.ui.default/test/` 后 `flutter test test/<名字>.dart`。
+   ⚠ 2026-11-26 二次核对：该探针文件**已不在当前工作区**（见 §10.4），要按 §9.1 的
+   表格重建，别再按"复用现成文件"排期。
 
 ---
 
@@ -213,3 +221,44 @@
 
 > 本文只登记因素，不含修复方案；修复取舍见 `docs/scroll-model-rewrite-recon.md` §4.2
 > 与后续切片。
+
+---
+
+## 10. 二次核对当前工作区（2026-11-26，只读）
+
+触发：`docs/scroll-jitter-fix-plan.md` 落档后仓库又前进了两步（`96a04a3` 随包 UI 插件按
+archive 分发、`51d603d` UI 插件热重启改挂起续跑），其中 `51d603d` **改到了
+`message_list.dart` / `message_panel.dart`**，所以按计划开工前先把坐标与结论核一遍。
+
+### 10.1 结论
+
+1. **既有因素全部仍然成立**，没有一条因为热重启改造而消失：4-05（`bottomJump` 跨事件残留）、
+   1-14（补白两帧回弹）、5-07（滚轮零插值）、5-01（`_thumb` 传 `visibleCount` / `_seek` 不传）
+   逐条按代码复核，行为未变，只是行号漂移（见 10.2）。
+2. **新增 1 条因素 §2-11**（P2）：挂起续跑把阅读位置拽回窗口最新端，并把 `following`
+   落成假——这是 `51d603d` 新引入的路径，原清单写于该提交之前。
+3. **S1 尚未开工**：`plugins/tree.ui.default/test/` 里没有 `scroll_probe.dart` /
+   `scroll_invariants_test.dart`（与滚动相关的只有既有的 `scroll_damping_service_test.dart`、
+   `message_list_*_test.dart`）。
+4. **计划引用的探针源已不在工作区**：`.self/probe/insert_probe_test.dart` 找不到（当前
+   `.self/probe/` 里只有 `sliver_seek_probe_test.dart` / `keepalive_probe_test.dart` 等），
+   S1 需要**按 §9.1 的表格重建**这个探针，别指望"复用现成文件"。
+
+### 10.2 坐标刷新（旧值 → 当前工作区）
+
+| 对象 | 旧坐标 | 当前坐标 |
+| --- | --- | --- |
+| `message_list.dart` `pointerScroll` / `applyContentDimensions` / `didUpdateWidget` | :275 / :281 / :398 | 不变 |
+| `_scheduleJumpToBottom` / `_flushCoordinate` / `_onScrollNotification` | :426 / :449 / :715 | 不变 |
+| `_updateBottomFill` / `_setBottomFill` / `_jumpTo` / `_armAnchor` | :626 / :653 / :750 / :892 | 不变 |
+| 定位动画 `Scrollable.ensureVisible` | :982 | **:978** |
+| 折叠组员零高度（两处 `SizedBox.shrink`） | :1128 | **:1117 / :1129** |
+| 面板 `_bottomJump` 字段 / `_trimFeed` 里的 `trimOlder` | :189 / :1414 | :189 / **:1422**（`_trimFeed` 定义在 **:1410**） |
+| 面板 `_clearWindow`（仍未复位 `_bottomJump`） | 定义 :3615 区、调用 :3638/:3743 | 定义 **:834**，调用 **:2262 / :3648 / :3673 / :3778** |
+| 面板落库替换 `replacePersisted` | :3462 | **:3493**（`_reconcileTail` 在 **:3469**） |
+| 面板 `_bottomJump` 赋值点数 | 19 处 | **17 处**（3 处置 true：:1089/:1220/:3267；14 处置 false） |
+| 滑块 `_seek`（漏传 `visibleCount`） | :496-520 | **:436-454** |
+| 滑块 `_thumb`（传 `visibleCount`） | :330-345 | **:244** |
+
+> 后续改这两份文档时，**先按上表校准再引用行号**——roll 一次热重启改造就能让
+> `message_panel.dart` 的坐标整体漂移 20~50 行。
