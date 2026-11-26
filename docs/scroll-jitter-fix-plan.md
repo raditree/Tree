@@ -156,6 +156,26 @@
 - **风险**：`SliverPadding` 在反向列表里的前后语义容易搞反（"bottom" = leading edge）
   → 先用 S1 的探针把"视觉上顶对齐"钉死，再改。
 - **规模**：`message_list.dart` 约 −60/+80。**1~2 天。**
+- **实施笔记（2026-11-26，试做一次后回退，代码未入库）**：
+  1. **外框缩高确实是 1-14 的根**：把补白从 `Padding(bottom: fill)`（缩外框）挪进
+     `ListView.padding` 的 leading 侧后，`viewportDimension` **逐帧恒定**，补白单调收敛
+     （319 → 236 → 153 → 70 → 0），"先清 0 再重算"的自激消失。
+  2. **口径坑（已实测确认）**：`RenderSliverList.childScrollOffset` 是**列表内部**坐标，
+     **不含** `SliverPadding` 的补白与内边距。所以判据必须用纯内容高
+     `=_outerHeight − _listPadding.vertical − extent`；若再减一次补白会**自激**
+     （实测补白每帧 +331 线性暴涨、`pumpAndSettle` 超时）。
+  3. **补丁本身还不够（关键）**：帧后测量 + `setState` 必然**滞后一帧** ⇒ 插入一行时
+     "内容先整体上移 h（帧 A）→ 补白再减 h 把内容推回（帧 B）"，只是从"两帧 150px 回弹"
+     缩成"两帧一行高"。TC-SC-02 的「锚点零反向」仍红（TC 清单里继续红，别删）。
+  4. **下一步方案（推荐，待拍板）**：**短内容不靠补白数学**——内容不足一屏时渲染
+     "顶对齐 `Column` + 不可滚动的 `SingleChildScrollView`"（天然向下生长、插入零位移），
+     内容跨过一屏后切回现有反向 `ListView`。切换判据用上一帧实测内容高；跨越那一帧
+     有一次原生上移（聊天里正常，S4 用 driver 过渡）。这样彻底不需要"帧后猜补白"。
+  5. 本次试做补丁留存 `.self/s3-wip.patch`（未入库）；回退后门禁恢复绿
+     （`scroll_invariants` 18 + `message_collapse` 7 = 25 全绿）。
+     另：`message_collapse_test` 里「内容不足一屏」用例量的是**外框高度**（断言 <500），
+     它锁的是旧机制而非用户可见行为 —— 改机制时要同步改成量"第一条消息的屏幕 y"。
+
 
 ### S4 目标制滚动推进器（梁 2）
 
