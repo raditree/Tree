@@ -40,6 +40,7 @@
 | [pluginization/agent-context-handover-and-snapshot-recon.md](pluginization/agent-context-handover-and-snapshot-recon.md) | **上下文 handover 与系统提示词快照留档（车道 R）**：`prompts.jsonl` 版本化留档（含摘要的 `effective_system`、sha256 去重、REST 历史/版本查询）；`handover` 工具写 pending、轮边界显式摘要 + 显式切点重建（同一模型，不换模型）；不做 head；S1~S3 切片、切点算法与测试清单 |
 | [ssh-tunnel-protocol.md](ssh-tunnel-protocol.md) | **SSH 执行器「中转站」协议**：core ⇄ ssh_executor 插件 ⇄ tree_agent 三层的消息面、错误码、分块帧、版本协商、后台任务落盘台账与 PTY 契约（中转站 =「处理拓展点位」：首选 `ssh.execute` 点位投递、`tunnel.*` 作兼容层） |
 | [scroll-jitter-fix-plan.md](scroll-jitter-fix-plan.md) | **中栏对话页滚动问题根治计划（SCROLL-FIX，S1~S7 分期）**：把位置收成「视口锚点事务」+「目标制滚动推进器」两根梁，删掉补白帧后猜 / sticky 跳底布尔 / `maxScrollExtent` 当判据三套机制；冻结 P-1~P-7 不变量与 7 条补丁红线、TC-SC-01~17 验收用例、改前改后量化门槛（单帧位移 ≤8px、连续位移帧 ≥60%、锚点位移 ≤0.5px）、各期范围/规模/风险/回滚；**D1~D5 已拍板**（S4 缓动推进 + 临界阻尼、S6 按像素补页、每期一个验收包、S5 删 3 个跨帧布尔、2-11 并入 S5）；**S1 已落地**：`test/scroll_probe.dart`（逐帧探针 + 已知红门禁）+ `test/scroll_invariants_test.dart`（TC-SC-00~17，基线红 12 / 绿 5） |
+| [message-render-plan.md](message-render-plan.md) | **消息渲染重写计划（中栏纯文本 + 自研 Markdown + 自研 LaTeX）**：取消工具/内容卡片与复制按钮、用户消息留轻底与代码块留浅底、工具行「标识 名称 内容 >」、折叠组「运行命令×12 · 编辑×8 · 读取×3 · 思考×13 >」与展开树形 `│`/`V`、系统提示（notice）与半途消息（无气泡时间线段）、自研引擎结构（block/inline AST + 记忆化 + 定居分块）、首批 9 项 Markdown 语法、LaTeX 首批符号、跨行框选口径（视觉优先，公式可 WidgetSpan）、M1~M4 分期与红线、与 SCROLL-FIX 的耦合；**R-D1~R-D8 已拍板** |
 | [known-issues.md](known-issues.md) | 已知问题台账（现象 / 根因 / 修复 / 验证 / 遗留），按发现顺序编号 |
 | [../CHANGELOG.md](../CHANGELOG.md) | 版本变更记录（自首个开源版本 1.0.0 起） |
 
